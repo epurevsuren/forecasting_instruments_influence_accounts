@@ -1,0 +1,7 @@
+# Ignore specific folders
+__pycache__/
+.venv/
+finbert_nlp_xgb_models/
+market_data_cache/
+
+# Ignor
