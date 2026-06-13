@@ -74,14 +74,30 @@ TEMPORAL_AMBIGUOUS = {
     r"this evening":   (18, 24),
     r"tonight":        (18, 24),
 }
-TEMPORAL_DAMP = 0.15   # multiplier applied when a post is judged stale/priced-in
+TEMPORAL_DAMP = 0.15   # default multiplier when a post is judged stale/priced-in
+                       # (used when post_hour is unknown, i.e. no --time given)
+
+# Graduated damping for explicit PAST-time phrases ("last night", "overnight",
+# etc.), based on WHEN (NY local, from --time) the post lands relative to the
+# US cash-equity session (9:30-16:00 ET). Trump often sleeps through overnight
+# events and only posts hours later -- how stale that is depends on whether the
+# market has already had a chance to trade on it:
+#   - before the open  -> not yet digested by cash equities; premarket/futures
+#                          may still react -> partial damp
+#   - during the session -> already traded through the morning -> fully stale
+#   - after the close    -> cash closed, but FX/crypto/futures trade overnight
+#                          -> partial damp
+TEMPORAL_PAST_DAMP_PREMARKET  = 0.5    # post_hour < 9   (before the open)
+TEMPORAL_PAST_DAMP_SESSION    = 0.15   # 9 <= post_hour < 16 (market open)
+TEMPORAL_PAST_DAMP_AFTERHOURS = 0.3    # post_hour >= 16 (after the close)
 
 
 def temporal_factor(text, post_hour=None):
     """Return (factor, label) for the predict-time temporal gate.
 
     post_hour: 0-23 local hour the post was made (from --time), or None if
-    unknown. Only used to resolve TEMPORAL_AMBIGUOUS phrases.
+    unknown. Used to resolve TEMPORAL_AMBIGUOUS phrases, and to grade how
+    stale an explicit PAST-time phrase is relative to market hours.
     """
     t = text.lower()
     has_future_time = any(re.search(p, t) for p in TEMPORAL_FUTURE_PHRASES)
@@ -89,7 +105,13 @@ def temporal_factor(text, post_hour=None):
     has_past_time    = any(re.search(p, t) for p in TEMPORAL_PAST_PHRASES)
 
     if has_past_time and not (has_future_time or has_breaking):
-        return TEMPORAL_DAMP, "past/stale"
+        if post_hour is None:
+            return TEMPORAL_DAMP, "past/stale"
+        if post_hour < 9:
+            return TEMPORAL_PAST_DAMP_PREMARKET, "past/stale (posted premarket -- not yet traded by cash equities)"
+        if post_hour < 16:
+            return TEMPORAL_PAST_DAMP_SESSION, "past/stale (posted during session -- already traded)"
+        return TEMPORAL_PAST_DAMP_AFTERHOURS, "past/stale (posted after close -- only FX/crypto/futures react overnight)"
     if has_future_time or has_breaking:
         return 1.0, "future/new-info"
 
@@ -206,40 +228,4 @@ def show(text, r, signal, gate, tfactor, tlabel):
     else:
         print(f"   ✅ TOTAL ×{total_mult:.2f} — FULL MOVE — TRADEABLE")
     print("─"*64)
-    print("📊 PREDICTED 1-HOUR MARKET IMPACT (FinBERT+NLP→XGBoost):")
-    for inst, emoji, name in LABELS:
-        v = r.get(inst, 0.0)
-        arrow = "▲" if v>0 else ("▼" if v<0 else "─")
-        bar = "█"*min(int(abs(v)*4),20)
-        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}")
-    print("─"*64+"\n")
-
-def main():
-    ap = argparse.ArgumentParser(description="Interactive FinBERT+NLP+XGBoost predictor.")
-    ap.add_argument("--time", metavar="yyyymmddhhmm",
-                    help="NY local time the post was made; only used to resolve "
-                         "ambiguous time-of-day phrases (this morning/tonight/etc.) "
-                         "in the temporal gate. Optional.")
-    args = ap.parse_args()
-    post_ts = parse_stamp(args.time) if args.time else None
-
-    cfg, models, nlp, sbert = load()
-    print("="*64)
-    print("  🤖 FinBERT + 📊 NLP + 🌲 XGBoost — 23 instruments")
-    print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")
-    if post_ts is not None:
-        print(f"  Post time: {post_ts} (used for ambiguous time-of-day phrases)")
-    print("="*64+"\n")
-    while True:
-        try:
-            t = input("📝 Enter post: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not t: continue
-        if t.lower() in ('quit','exit','q'): break
-        r, sig, gate, tfactor, tlabel = predict(t, cfg, models, nlp, sbert, post_ts=post_ts)
-        show(t, r, sig, gate, tfactor, tlabel)
-
-
-if __name__ == '__main__':
-    main()
+    print("📊 PREDICTED 1-HOUR M
