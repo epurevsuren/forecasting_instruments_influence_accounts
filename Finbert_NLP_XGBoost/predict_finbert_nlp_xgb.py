@@ -8,12 +8,15 @@ fixing FinBERT's endorsement-hallucination (Rick Allen → NatGas +5% nonsense).
 Requires signal_scorer.py + scorer_config.json in this folder.
 Run:  uv run python predict_finbert_nlp_xgb.py
 """
-import os, re, json
+import os, re, json, argparse, datetime
 import numpy as np
+import pandas as pd
 import torch
 import xgboost as xgb
 import signal_scorer as ss
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+NY = 'America/New_York'
 
 OUT_DIR = "finbert_nlp_xgb_models"
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -36,16 +39,20 @@ GATE_MID     = 0.45   # signal midpoint where gate = 0.5
 # Priority order:
 #   1. explicit FUTURE time/intent phrases -> full move (new information)
 #   2. explicit PAST time phrases, no future cue -> damp (stale/priced-in)
-#   3. anything else (incl. "breaking"/present-perfect announcements like
+#   3. AMBIGUOUS time-of-day phrases ("this morning"/"tonight"/etc.) -> resolved
+#      using --time (the post's own timestamp), if given; if "now" has already
+#      passed that part of the day relative to the post, it's past/stale,
+#      otherwise it's future/neutral. Without --time, treated as neutral.
+#   4. anything else (incl. "breaking"/present-perfect announcements like
 #      "I have just been informed") -> full move (default)
 TEMPORAL_PAST_PHRASES = [
-    r"last night", r"yesterday", r"this morning", r"earlier today",
+    r"last night", r"yesterday", r"earlier today",
     r"overnight", r"earlier this week", r"last week", r"last month",
     r"a (?:few|couple of) (?:hours|days) ago", r"this past (?:weekend|week)",
 ]
 TEMPORAL_FUTURE_PHRASES = [
-    r"tomorrow", r"tonight", r"next week", r"next month", r"next year",
-    r"this weekend", r"later today", r"this afternoon", r"this evening",
+    r"tomorrow", r"next week", r"next month", r"next year",
+    r"this weekend", r"later today",
     r"soon", r"shortly", r"upcoming", r"in the coming (?:days|weeks|months)",
 ]
 TEMPORAL_FUTURE_INTENT = [
@@ -57,11 +64,22 @@ TEMPORAL_BREAKING = [
     r"\bbreaking\b", r"\bjust announced\b", r"\bmoments ago\b", r"\bright now\b",
     r"\bhappening now\b", r"\bas we speak\b",
 ]
+# phrase -> (start_hour, end_hour) of the day it refers to (24h, local post time)
+TEMPORAL_AMBIGUOUS = {
+    r"this morning":   (5, 12),
+    r"this afternoon": (12, 18),
+    r"this evening":   (18, 24),
+    r"tonight":        (18, 24),
+}
 TEMPORAL_DAMP = 0.15   # multiplier applied when a post is judged stale/priced-in
 
 
-def temporal_factor(text):
-    """Return (factor, label) for the predict-time temporal gate."""
+def temporal_factor(text, post_hour=None):
+    """Return (factor, label) for the predict-time temporal gate.
+
+    post_hour: 0-23 local hour the post was made (from --time), or None if
+    unknown. Only used to resolve TEMPORAL_AMBIGUOUS phrases.
+    """
     t = text.lower()
     has_future_time   = any(re.search(p, t) for p in TEMPORAL_FUTURE_PHRASES)
     has_future_intent = any(re.search(p, t) for p in TEMPORAL_FUTURE_INTENT)
@@ -72,6 +90,14 @@ def temporal_factor(text):
         return 1.0, "future/new-info"
     if has_past_time:
         return TEMPORAL_DAMP, "past/stale"
+
+    if post_hour is not None:
+        for phrase, (start, end) in TEMPORAL_AMBIGUOUS.items():
+            if re.search(phrase, t):
+                if post_hour >= end:      # that part of the day has already passed
+                    return TEMPORAL_DAMP, f"past/stale ('{phrase.strip()}' already over at post time)"
+                return 1.0, f"future/ongoing ('{phrase.strip()}' still ahead at post time)"
+
     return 1.0, "neutral"
 
 
@@ -104,28 +130,4 @@ def load():
     nlp   = ss.load_spacy()
     sbert = ss.load_sbert()
     print(f"✅ FinBERT + NLP scorer + {len(models)} XGBoost models\n")
-    return cfg, models, nlp, sbert
-
-def finbert_embed(text):
-    """CLS + mean pooling — must match training v2."""
-    enc = _tok([str(text)[:512]], return_tensors="pt", padding=True,
-               truncation=True, max_length=256).to(DEVICE)
-    with torch.no_grad():
-        out = _bert(**enc)
-    last = out.hidden_states[-1]
-    cls  = last[:, 0, :]
-    mask = enc['attention_mask'].unsqueeze(-1).float()
-    mean = (last*mask).sum(1)/mask.sum(1).clamp(min=1e-9)
-    return torch.cat([cls, mean], dim=1).cpu().numpy()
-
-def predict(text, cfg, models, nlp, sbert):
-    feats = ss.score_single_post(text, nlp=nlp, sbert=sbert)
-    nlp_vec = np.array([[float(feats.get(c,0.0)) for c in cfg['nlp_features']]])
-    X = np.hstack([finbert_embed(text), nlp_vec])
-
-    # NLP gate as a TRADE DECISION (not a position scaler):
-    #   gate >= 0.5  (signal >= GATE_MID) -> real post: take the FULL move (×1.0)
-    #   gate <  0.5                       -> noise: apply the tiny gate so the
-    #                                        damped move is too small to trade
-    import math
-    # Gate signal = the SAME formula as the nlp_sig
+    return cfg
