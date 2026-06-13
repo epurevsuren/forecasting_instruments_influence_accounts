@@ -8,7 +8,7 @@ fixing FinBERT's endorsement-hallucination (Rick Allen → NatGas +5% nonsense).
 Requires signal_scorer.py + scorer_config.json in this folder.
 Run:  uv run python predict_finbert_nlp_xgb.py
 """
-import os, json
+import os, re, json
 import numpy as np
 import torch
 import xgboost as xgb
@@ -25,6 +25,55 @@ DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 GATE_ENABLED = True
 GATE_K       = 16.0   # steepness — higher = sharper noise/signal cutoff
 GATE_MID     = 0.45   # signal midpoint where gate = 0.5
+
+# --------------------------------------------------------------- temporal gate
+# PREDICT-TIME ONLY — no training/CSV changes, no new columns. Based on the
+# "tense & horizon" finance-NLP finding that future-tense news produces a
+# market reaction ~4x larger than past-tense news (already-known/priced-in),
+# and that when a post mixes a past event with a future-looking action, the
+# future-looking part is the new information and dominates.
+#
+# Priority order:
+#   1. explicit FUTURE time/intent phrases -> full move (new information)
+#   2. explicit PAST time phrases, no future cue -> damp (stale/priced-in)
+#   3. anything else (incl. "breaking"/present-perfect announcements like
+#      "I have just been informed") -> full move (default)
+TEMPORAL_PAST_PHRASES = [
+    r"last night", r"yesterday", r"this morning", r"earlier today",
+    r"overnight", r"earlier this week", r"last week", r"last month",
+    r"a (?:few|couple of) (?:hours|days) ago", r"this past (?:weekend|week)",
+]
+TEMPORAL_FUTURE_PHRASES = [
+    r"tomorrow", r"tonight", r"next week", r"next month", r"next year",
+    r"this weekend", r"later today", r"this afternoon", r"this evening",
+    r"soon", r"shortly", r"upcoming", r"in the coming (?:days|weeks|months)",
+]
+TEMPORAL_FUTURE_INTENT = [
+    r"\bwill\b", r"\bgoing to\b", r"\bplan(?:s|ning)? to\b", r"\bset to\b",
+    r"\babout to\b", r"\bexpected to\b", r"\bscheduled to\b", r"\bintend(?:s)? to\b",
+    r"\bmust\b.{0,20}\brespond", r"\bgoing to respond\b",
+]
+TEMPORAL_BREAKING = [
+    r"\bbreaking\b", r"\bjust announced\b", r"\bmoments ago\b", r"\bright now\b",
+    r"\bhappening now\b", r"\bas we speak\b",
+]
+TEMPORAL_DAMP = 0.15   # multiplier applied when a post is judged stale/priced-in
+
+
+def temporal_factor(text):
+    """Return (factor, label) for the predict-time temporal gate."""
+    t = text.lower()
+    has_future_time   = any(re.search(p, t) for p in TEMPORAL_FUTURE_PHRASES)
+    has_future_intent = any(re.search(p, t) for p in TEMPORAL_FUTURE_INTENT)
+    has_breaking      = any(re.search(p, t) for p in TEMPORAL_BREAKING)
+    has_past_time     = any(re.search(p, t) for p in TEMPORAL_PAST_PHRASES)
+
+    if has_future_time or has_future_intent or has_breaking:
+        return 1.0, "future/new-info"
+    if has_past_time:
+        return TEMPORAL_DAMP, "past/stale"
+    return 1.0, "neutral"
+
 
 LABELS = [
     ('SPY','📈','S&P 500'),('QQQ','💻','Nasdaq'),('DIA','🏭','Dow'),
@@ -79,59 +128,4 @@ def predict(text, cfg, models, nlp, sbert):
     #   gate <  0.5                       -> noise: apply the tiny gate so the
     #                                        damped move is too small to trade
     import math
-    # Gate signal = the SAME formula as the nlp_signal/sample_weight column in
-    # truth_training_set_FINAL/TEST (build_final_training_set.compute_nlp_signal):
-    #   mean( policy_intensity/8 capped, hawkish_risk/5 capped, scorer sample_weight )
-    # The raw scorer sample_weight alone is on a much harsher scale (policy/25,
-    # hawkish/11) and was crushing genuinely hawkish posts that training trusted.
-    parts = []
-    if feats.get('policy_intensity_score') is not None:
-        parts.append(min(float(feats['policy_intensity_score']) / 8.0, 1.0))
-    if feats.get('hawkish_risk_score') is not None:
-        parts.append(min(float(feats['hawkish_risk_score']) / 5.0, 1.0))
-    if feats.get('sample_weight') is not None:
-        parts.append(float(feats['sample_weight']))
-    signal = float(np.mean(parts)) if parts else float(feats.get('raw_score', 0.5))
-    gate = 1.0/(1.0+math.exp(-GATE_K*(signal-GATE_MID))) if GATE_ENABLED else 1.0
-    mult = 1.0 if gate >= 0.5 else gate
-
-    out = {}
-    for inst,_,_ in LABELS:
-        if inst in models:
-            raw = float(models[inst].predict(X)[0])
-            out[inst] = raw * mult
-    return out, signal, gate
-
-def show(text, r, signal, gate):
-    print("\n" + "─"*64)
-    print(f"📝 {text[:120]}{'...' if len(text)>120 else ''}")
-    print(f"   NLP signal={signal:.3f}  gate×{gate:.2f}" +
-          ("  (real signal — FULL move)" if gate >= 0.5 else "  (noise — damped)"))
-    print("─"*64)
-    print("📊 PREDICTED 1-HOUR MARKET IMPACT (FinBERT+NLP→XGBoost):")
-    for inst, emoji, name in LABELS:
-        v = r.get(inst, 0.0)
-        arrow = "▲" if v>0 else ("▼" if v<0 else "─")
-        bar = "█"*min(int(abs(v)*4),20)
-        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}")
-    print("─"*64+"\n")
-
-def main():
-    cfg, models, nlp, sbert = load()
-    print("="*64)
-    print("  🤖 FinBERT + 📊 NLP + 🌲 XGBoost — 23 instruments")
-    print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")
-    print("="*64+"\n")
-    while True:
-        try:
-            t = input("📝 Enter post: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not t: continue
-        if t.lower() in ('quit','exit','q'): break
-        r, sig, gate = predict(t, cfg, models, nlp, sbert)
-        show(t, r, sig, gate)
-
-
-if __name__ == '__main__':
-    main()
+    # Gate signal = the SAME formula as the nlp_sig
