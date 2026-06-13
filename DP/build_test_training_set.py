@@ -59,7 +59,7 @@ import pandas as pd
 import build_final_training_set as B   # the labeling engine (shares UTF-8 fix)
 
 _HERE    = os.path.dirname(os.path.abspath(__file__))
-TEST_CSV = os.path.join(_HERE, "truth_training_set_TEST.csv")
+TEST_TABLE = "truth_training_set_TEST"
 
 NY  = 'America/New_York'
 BAR = pd.Timedelta(minutes=30)              # cache bar width
@@ -302,9 +302,9 @@ def main():
     scored = scored.sort_values('date')
 
     train_cols = B.train_columns(impact_cols)
-    scored[train_cols].to_csv(TEST_CSV, index=False, lineterminator='\n')
+    B.db.write_table(TEST_TABLE, scored[train_cols])
 
-    print(f"\n💾 Saved {TEST_CSV} ({len(scored)} rows)")
+    print(f"\n💾 Saved {TEST_TABLE} ({len(scored)} rows) -> {B.db.DB_PATH}")
     print(f"   window: {scored['date'].min()} → {scored['date'].max()}")
     print(f"   high-signal (sample_weight>0.5): {(scored['sample_weight'] > 0.5).sum()}")
     print(f"   VIX range [{scored['VIX_Impact'].min():.3f}, {scored['VIX_Impact'].max():.3f}]")

@@ -61,6 +61,9 @@ except ImportError:
 # module behaves identically whether it's run from DP/, from
 # Finbert_NLP_XGBoost/, or imported from anywhere. Override with SCORER_CONFIG.
 _HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import db  # DuckDB helper (DP/db.py) -> ../database.db
 
 def _resolve_config_path():
     env = os.environ.get("SCORER_CONFIG")
@@ -334,11 +337,10 @@ def main():
     print("="*60)
     print("  TRUMP POST SIGNAL SCORER (config-driven)")
     print(f"  Config: {CONFIG_PATH}  (version {CONFIG.get('version','?')})")
-    print("  Output: trump_truths_scored.csv")
+    print("  Output: trump_truths_scored (database.db)")
     print("="*60)
 
     in_csv  = os.path.join(_HERE, "trump_truths.csv")
-    out_csv = os.path.join(_HERE, "trump_truths_scored.csv")
     print(f"\n📂 Loading {in_csv}...")
     df = pd.read_csv(in_csv)
     df['post_type'] = df['text'].apply(classify_post)
@@ -396,8 +398,8 @@ def main():
         0.5*clean['raw_score'] + 0.3*clean['hawkish_risk_score_norm']
         + 0.2*clean['score_relative']/5.0, 0.05, 1.0)
 
-    clean.to_csv(out_csv, index=False)
-    print(f"\n💾 Saved {out_csv} ({len(clean)} rows)")
+    db.write_table("trump_truths_scored", clean)
+    print(f"\n💾 Saved trump_truths_scored ({len(clean)} rows) -> {db.DB_PATH}")
     print(f"   raw_score mean: {clean['raw_score'].mean():.3f}, "
           f">0.3: {(clean['raw_score']>0.3).sum()} posts")
 
@@ -430,26 +432,26 @@ def score_incremental(context_days=3, novelty_window=10):
     Normalized scores use scorer_config.json norm_divisors (stable across runs).
     """
     in_csv  = os.path.join(_HERE, "trump_truths.csv")
-    out_csv = os.path.join(_HERE, "trump_truths_scored.csv")
 
     print("=" * 60)
     print("  TRUMP POST SIGNAL SCORER — INCREMENTAL (daily)")
     print(f"  Config: {CONFIG_PATH}  (version {CONFIG.get('version','?')})")
     print("=" * 60)
 
-    if not os.path.exists(out_csv):
-        print("⚠️  No existing trump_truths_scored.csv — running FULL scoring instead.")
+    scored = db.read_table("trump_truths_scored")
+    if scored is None:
+        print("⚠️  No existing trump_truths_scored table — running FULL scoring instead.")
         return main()
+    scored['id'] = scored['id'].astype(str)
 
     clean = _load_clean_truths(in_csv)
-    scored = pd.read_csv(out_csv, dtype={'id': str})
     scored_cols = list(scored.columns)
     existing_ids = set(scored['id'].astype(str))
 
     new = clean[~clean['id'].astype(str).isin(existing_ids)].copy().reset_index(drop=True)
     print(f"\n📂 {in_csv}: {len(clean)} clean posts | already scored: {len(existing_ids)} | new: {len(new)}")
     if new.empty:
-        print("✅ Nothing new to score — trump_truths_scored.csv is up to date.")
+        print("✅ Nothing new to score — trump_truths_scored is up to date.")
         return 0
 
     # ---- recent context from the already-scored timeline ----
@@ -563,8 +565,8 @@ def score_incremental(context_days=3, novelty_window=10):
         if c not in new.columns:
             new[c] = 0
     out = new[scored_cols]
-    out.to_csv(out_csv, mode='a', header=False, index=False, lineterminator='\n')
-    print(f"\n💾 Appended {len(out)} new scored posts -> {out_csv} "
+    db.append_table("trump_truths_scored", out)
+    print(f"\n💾 Appended {len(out)} new scored posts -> trump_truths_scored "
           f"({len(scored) + len(out)} total)")
     print(f"   new raw_score mean: {out['raw_score'].mean():.3f}, "
           f">0.3: {(out['raw_score'] > 0.3).sum()} posts")

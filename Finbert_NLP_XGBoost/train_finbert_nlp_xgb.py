@@ -12,8 +12,9 @@ FinBERT embeddings + signal_scorer NLP features → XGBoost, with real upgrades:
   5. Feature importance: reports whether NLP flags or FinBERT dims drive each
      instrument (tells you if the NLP scorer is actually contributing)
 
-Inputs:  truth_training_set_FINAL.csv, trump_truths_scored.csv
-Outputs: finbert_nlp_xgb_models/  (+ eval_report.json)
+Inputs:  truth_training_set_TEST / trump_truths_scored (database.db tables)
+Outputs: finbert_nlp_xgb_models/ (XGBoost model jsons + config.json)
+         + finbert_embeddings_v2 / eval_report tables in database.db
 Run:     uv run python train_finbert_nlp_xgb.py
 """
 import os, json
@@ -24,11 +25,13 @@ import xgboost as xgb
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+import db  # DuckDB helper -> ../database.db
 
-LABEL_CSV  = "../DP/truth_training_set_TEST.csv"
-SCORED_CSV = "../DP/trump_truths_scored.csv"
+LABEL_TABLE  = "truth_training_set_TEST"
+SCORED_TABLE = "trump_truths_scored"
+EMB_TABLE    = "finbert_embeddings_v2"   # v2 = CLS+mean pooling
+EVAL_TABLE   = "eval_report"
 OUT_DIR    = "finbert_nlp_xgb_models"
-EMB_CACHE  = "finbert_embeddings_v2.npy"   # v2 = CLS+mean pooling
 FINBERT    = "ProsusAI/finbert"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -80,27 +83,29 @@ def embed_texts(texts):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     print("📂 Loading labels + NLP features...")
-    labels = pd.read_csv(LABEL_CSV); labels['text'] = labels['text'].fillna("")
-    # POINT-IN-TIME LOAD: trump_truths_scored.csv always holds the FULL history
-    # (through today), while the label csv ends at the backtest cutoff. Load
-    # scored rows ONLY up to the label window's end via duckdb — the file no
-    # longer needs to be cut manually before the test post (e.g. the 0.78-NLP
-    # Emir post), and nothing after the cutoff enters this process.
-    _bound_utc = pd.to_datetime(labels['date'], format='mixed', utc=True).max()
+    labels = db.read_table(LABEL_TABLE)
+    if labels is None:
+        raise FileNotFoundError(f"{LABEL_TABLE} table not found in {db.DB_PATH} — run build_test_training_set.py first")
+    labels['text'] = labels['text'].fillna("")
+    # Normalize 'date' to UTC tz-aware datetime — DuckDB round-trips TIMESTAMPTZ
+    # columns back as the local system tz (e.g. Australia/Sydney), while
+    # trump_truths_scored stores 'date' as plain strings. Both must match for
+    # the merge key below.
+    labels['date'] = pd.to_datetime(labels['date'], utc=True)
+    # POINT-IN-TIME LOAD: trump_truths_scored always holds the FULL history
+    # (through today), while the label table ends at the backtest cutoff. Load
+    # scored rows ONLY up to the label window's end — nothing after the cutoff
+    # enters this process.
+    _bound_utc = labels['date'].max()
     _bound_ny  = _bound_utc.tz_convert('America/New_York')
-    try:
-        import duckdb
-        feats = duckdb.sql(
-            f"SELECT * FROM read_csv_auto('{SCORED_CSV}', types={{'date': 'VARCHAR', 'id': 'VARCHAR'}}) "
-            f"WHERE CAST(date AS TIMESTAMPTZ) <= TIMESTAMPTZ '{_bound_utc.isoformat()}'").df()
-        print(f"  🦆 duckdb: scored csv loaded WHERE date <= {_bound_ny:%Y-%m-%d %H:%M %Z} "
-              f"(last labeled post; {len(feats)} rows)")
-    except ImportError:
-        feats = pd.read_csv(SCORED_CSV)
-        _d = pd.to_datetime(feats['date'], format='mixed', utc=True)
-        feats = feats[_d <= _bound_utc].copy()
-        print(f"  ⚠️  duckdb not installed (uv add duckdb) — pandas fallback, "
-              f"rows <= {_bound_ny:%Y-%m-%d %H:%M %Z}: {len(feats)}")
+    feats = db.read_table(SCORED_TABLE)
+    if feats is None:
+        raise FileNotFoundError(f"{SCORED_TABLE} table not found in {db.DB_PATH} — run signal_scorer.py first")
+    feats['id'] = feats['id'].astype(str)
+    feats['date'] = pd.to_datetime(feats['date'], format='mixed', utc=True)
+    feats = feats[feats['date'] <= _bound_utc].copy()
+    print(f"  🦆 {SCORED_TABLE} loaded WHERE date <= {_bound_ny:%Y-%m-%d %H:%M %Z} "
+          f"(last labeled post; {len(feats)} rows)")
     key = ['date','text'] if 'text' in feats.columns else ['date']
     df = labels.merge(feats, on=key, how='inner', suffixes=('','_sc'))
     print(f"  Merged rows: {len(df)}")
@@ -108,12 +113,21 @@ def main():
     use_nlp = [c for c in NLP_FEATURES if c in df.columns]
     X_nlp = df[use_nlp].fillna(0.0).values
 
-    if os.path.exists(EMB_CACHE) and len(np.load(EMB_CACHE)) == len(df):
-        print("💾 Loading cached embeddings (v2)...")
-        X_emb = np.load(EMB_CACHE)
+    emb_cached = db.read_table(EMB_TABLE)
+    if (emb_cached is not None and 'id' in df.columns
+            and set(emb_cached['id'].astype(str)) == set(df['id'].astype(str))):
+        print(f"💾 Loading cached embeddings ({EMB_TABLE})...")
+        emb_cached = emb_cached.set_index(emb_cached['id'].astype(str))
+        X_emb = np.vstack(emb_cached.loc[df['id'].astype(str), 'embedding'].values)
     else:
-        X_emb = embed_texts(df['text'].tolist()); np.save(EMB_CACHE, X_emb)
-        print(f"💾 Cached → {EMB_CACHE}")
+        X_emb = embed_texts(df['text'].tolist())
+        if 'id' in df.columns:
+            emb_df = pd.DataFrame({'id': df['id'].astype(str),
+                                    'embedding': [row.tolist() for row in X_emb]})
+            db.write_table(EMB_TABLE, emb_df)
+            print(f"💾 Cached → {EMB_TABLE}")
+        else:
+            print("  ⚠️  no 'id' column in merged df — embeddings not cached")
 
     X = np.hstack([X_emb, X_nlp])
     nlp_start = X_emb.shape[1]   # index where NLP features begin
@@ -165,13 +179,8 @@ def main():
         da = f"dir={dir_acc:.0%}" if dir_acc==dir_acc else "dir=n/a"
         print(f"  {flag} {inst:<10} R²={r2:+.3f}  {da}  noise|p|={noise_pred:.3f}  NLP={nlp_share:.0%}")
 
-    json.dump(report, open(f"{OUT_DIR}/eval_report.json","w"), indent=2)
+    eval_df = pd.DataFrame([{"instrument": k, **v} for k, v in report.items()])
+    db.write_table(EVAL_TABLE, eval_df)
     good = sum(1 for v in report.values() if v['r2']>0.1)
     dirs = [v['dir_acc'] for v in report.values() if v['dir_acc']]
-    print(f"\n  {good}/{len(report)} R²>0.1 | mean directional acc: {np.mean(dirs):.0%}")
-    print(f"  📋 eval_report.json saved — check 'noise_pred' (want LOW = endorsements quiet)")
-    print(f"     and 'nlp_share' (how much your scorer drives each instrument)")
-
-
-if __name__ == '__main__':
-    main()
+    

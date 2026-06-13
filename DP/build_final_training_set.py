@@ -78,11 +78,17 @@ for _stream in (sys.stdout, sys.stderr):
 # CONFIG / PATHS (resolve next to this file)
 # ==========================================
 _HERE       = os.path.dirname(os.path.abspath(__file__))
-SCORED_CSV  = os.path.join(_HERE, "trump_truths_scored.csv")
-FINAL_CSV   = os.path.join(_HERE, "truth_training_set_FINAL.csv")
-HS_CSV      = os.path.join(_HERE, "truth_training_set_HIGH_SIGNAL.csv")
-LABELED_CSV = os.path.join(_HERE, "trump_truths_labeled.csv")
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import db  # DuckDB helper (DP/db.py) -> ../database.db
+
 CACHE_DIR   = os.path.join(_HERE, "..", "IBKR", "market_data_cache")
+
+# DuckDB table names (replace the old trump_truths_scored.csv / FINAL/HS/LABELED csvs)
+SCORED_TABLE   = "trump_truths_scored"
+FINAL_TABLE    = "truth_training_set_FINAL"
+HS_TABLE       = "truth_training_set_HIGH_SIGNAL"
+LABELED_TABLE  = "trump_truths_labeled"
 
 # Baseline = simple average move of same instrument over prior 30 days.
 # Subtracted from actual move to get the abnormal (Trump-attributable) return.
@@ -163,12 +169,12 @@ def compute_nlp_signal(row):
 
 
 def load_scored():
-    print(f"\n📂 Loading {SCORED_CSV}...")
-    try:
-        scored = pd.read_csv(SCORED_CSV, dtype={'id': str})
-    except FileNotFoundError:
-        print("❌ Not found — run signal_scorer.py first")
+    print(f"\n📂 Loading {SCORED_TABLE} from {db.DB_PATH}...")
+    scored = db.read_table(SCORED_TABLE)
+    if scored is None:
+        print(f"❌ {SCORED_TABLE} table not found — run signal_scorer.py first")
         sys.exit(1)
+    scored['id'] = scored['id'].astype(str)
     scored['date'] = pd.to_datetime(scored['date'], format='mixed', utc=True).dt.tz_convert('America/New_York')
     scored = scored.sort_values('date').reset_index(drop=True)
     print(f"  Posts loaded: {len(scored)}")
@@ -593,15 +599,15 @@ def main_full():
         print(f"  {col}: {nonzero} meaningful (>0.05%), range [{s.min():.3f}, {s.max():.3f}]")
 
     train_cols = train_columns(impact_cols)
-    scored[train_cols].to_csv(FINAL_CSV, index=False)
-    print(f"\n💾 Saved {FINAL_CSV} ({len(scored)} rows)")
+    db.write_table(FINAL_TABLE, scored[train_cols])
+    print(f"\n💾 Saved {FINAL_TABLE} ({len(scored)} rows)")
 
     hs = scored[scored['sample_weight'] > 0.5][train_cols]
-    hs.to_csv(HS_CSV, index=False)
-    print(f"💾 Saved {HS_CSV} ({len(hs)} rows)")
+    db.write_table(HS_TABLE, hs)
+    print(f"💾 Saved {HS_TABLE} ({len(hs)} rows)")
 
-    scored.to_csv(LABELED_CSV, index=False)
-    print(f"💾 Saved {LABELED_CSV} (full metadata)")
+    db.write_table(LABELED_TABLE, scored)
+    print(f"💾 Saved {LABELED_TABLE} (full metadata)")
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
@@ -625,15 +631,15 @@ def relabel_since(since_str):
     """
     since = pd.Timestamp(since_str, tz='America/New_York')
     print(f"\n🧹 Relabel: purging rows dated >= {since} from outputs...")
-    for path in (FINAL_CSV, HS_CSV, LABELED_CSV):
-        if not os.path.exists(path):
+    for table in (FINAL_TABLE, HS_TABLE, LABELED_TABLE):
+        df = db.read_table(table)
+        if df is None:
             continue
-        df = pd.read_csv(path)
         dates = pd.to_datetime(df['date'], format='mixed', utc=True).dt.tz_convert('America/New_York')
         keep = df[dates < since]
         if len(keep) < len(df):
-            keep.to_csv(path, index=False, lineterminator='\n')
-        print(f"  {os.path.basename(path)}: removed {len(df) - len(keep)} rows ({len(keep)} kept)")
+            db.write_table(table, keep)
+        print(f"  {table}: removed {len(df) - len(keep)} rows ({len(keep)} kept)")
 
 
 # ==========================================
@@ -651,14 +657,16 @@ def main_incremental():
     print("  BUILD FINAL TRAINING SET — EVENT STUDY (INCREMENTAL, daily)")
     print("=" * 66)
 
-    if not (os.path.exists(LABELED_CSV) and os.path.exists(FINAL_CSV)):
-        print("⚠️  No existing labeled/FINAL csv — running FULL rebuild instead.")
+    labeled_df = db.read_table(LABELED_TABLE)
+    final_df = db.read_table(FINAL_TABLE)
+    if labeled_df is None or final_df is None:
+        print("⚠️  No existing labeled/FINAL table — running FULL rebuild instead.")
         return main_full()
 
     scored = load_scored()
-    labeled_cols = list(pd.read_csv(LABELED_CSV, nrows=0).columns)
-    labeled_ids = set(pd.read_csv(LABELED_CSV, usecols=['id'], dtype={'id': str})['id'])
-    final_cols = list(pd.read_csv(FINAL_CSV, nrows=0).columns)
+    labeled_cols = list(labeled_df.columns)
+    labeled_ids = set(labeled_df['id'].astype(str))
+    final_cols = list(final_df.columns)
 
     new = scored[~scored['id'].astype(str).isin(labeled_ids)].copy()
     print(f"\n  Already labeled: {len(labeled_ids)} | new to label: {len(new)}")
@@ -718,21 +726,21 @@ def main_incremental():
               f"appending with the EXISTING header order (missing cols filled 0). "
               f"Run --full to rebuild with the new schema.")
     out_final = new.reindex(columns=final_cols, fill_value=0)
-    out_final.to_csv(FINAL_CSV, mode='a', header=False, index=False, lineterminator='\n')
-    print(f"\n💾 Appended {len(out_final)} rows -> {FINAL_CSV}")
+    db.append_table(FINAL_TABLE, out_final)
+    print(f"\n💾 Appended {len(out_final)} rows -> {FINAL_TABLE}")
 
     hs = out_final[new['sample_weight'].values > 0.5]
     if len(hs):
-        hs.to_csv(HS_CSV, mode='a', header=False, index=False, lineterminator='\n')
-    print(f"💾 Appended {len(hs)} high-signal rows -> {HS_CSV}")
+        db.append_table(HS_TABLE, hs)
+    print(f"💾 Appended {len(hs)} high-signal rows -> {HS_TABLE}")
 
     out_labeled = new.copy()
     for c in labeled_cols:
         if c not in out_labeled.columns:
             out_labeled[c] = 0
     out_labeled = out_labeled[labeled_cols]
-    out_labeled.to_csv(LABELED_CSV, mode='a', header=False, index=False, lineterminator='\n')
-    print(f"💾 Appended {len(out_labeled)} rows -> {LABELED_CSV} (dedup ledger)")
+    db.append_table(LABELED_TABLE, out_labeled)
+    print(f"💾 Appended {len(out_labeled)} rows -> {LABELED_TABLE} (dedup ledger)")
 
     print(f"\n📊 New labels: VIX range [{new['VIX_Impact'].min():.3f}, {new['VIX_Impact'].max():.3f}], "
           f"high-signal: {len(hs)}")
