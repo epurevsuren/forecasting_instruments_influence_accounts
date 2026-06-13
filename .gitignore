@@ -11,3 +11,5 @@ market_data_cache/
 *.zip
 *.npy
 *.log
+*.db
+*.bak
