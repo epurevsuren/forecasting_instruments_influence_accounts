@@ -4,4 +4,10 @@ __pycache__/
 finbert_nlp_xgb_models/
 market_data_cache/
 
-# Ignor
+# Ignore file extensions
+*.csv
+*.txt
+*.7z
+*.zip
+*.npy
+*.log
