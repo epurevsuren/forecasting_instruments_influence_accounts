@@ -128,4 +128,118 @@ def load():
     for inst,_,_ in LABELS:
         p = f"{OUT_DIR}/{inst}_Impact.json"
         if os.path.exists(p):
-            m
+            m = xgb.XGBRegressor(); m.load_model(p); models[inst]=m
+    nlp   = ss.load_spacy()
+    sbert = ss.load_sbert()
+    print(f"✅ FinBERT + NLP scorer + {len(models)} XGBoost models\n")
+    return cfg, models, nlp, sbert
+
+def finbert_embed(text):
+    """CLS + mean pooling — must match training v2."""
+    enc = _tok([str(text)[:512]], return_tensors="pt", padding=True,
+               truncation=True, max_length=256).to(DEVICE)
+    with torch.no_grad():
+        out = _bert(**enc)
+    last = out.hidden_states[-1]
+    cls  = last[:, 0, :]
+    mask = enc['attention_mask'].unsqueeze(-1).float()
+    mean = (last*mask).sum(1)/mask.sum(1).clamp(min=1e-9)
+    return torch.cat([cls, mean], dim=1).cpu().numpy()
+
+def parse_stamp(s):
+    """yyyymmddhhmm, NY local time -> tz-aware Timestamp."""
+    return pd.Timestamp(datetime.datetime.strptime(s.strip(), "%Y%m%d%H%M"), tz=NY)
+
+
+def predict(text, cfg, models, nlp, sbert, post_ts=None):
+    feats = ss.score_single_post(text, nlp=nlp, sbert=sbert)
+    nlp_vec = np.array([[float(feats.get(c,0.0)) for c in cfg['nlp_features']]])
+    X = np.hstack([finbert_embed(text), nlp_vec])
+
+    # NLP gate as a TRADE DECISION (not a position scaler):
+    #   gate >= 0.5  (signal >= GATE_MID) -> real post: take the FULL move (×1.0)
+    #   gate <  0.5                       -> noise: apply the tiny gate so the
+    #                                        damped move is too small to trade
+    import math
+    # Gate signal = the SAME formula as the nlp_signal/sample_weight column in
+    # truth_training_set_FINAL/TEST (build_final_training_set.compute_nlp_signal):
+    #   mean( policy_intensity/8 capped, hawkish_risk/5 capped, scorer sample_weight )
+    # The raw scorer sample_weight alone is on a much harsher scale (policy/25,
+    # hawkish/11) and was crushing genuinely hawkish posts that training trusted.
+    parts = []
+    if feats.get('policy_intensity_score') is not None:
+        parts.append(min(float(feats['policy_intensity_score']) / 8.0, 1.0))
+    if feats.get('hawkish_risk_score') is not None:
+        parts.append(min(float(feats['hawkish_risk_score']) / 5.0, 1.0))
+    if feats.get('sample_weight') is not None:
+        parts.append(float(feats['sample_weight']))
+    signal = float(np.mean(parts)) if parts else float(feats.get('raw_score', 0.5))
+    gate = 1.0/(1.0+math.exp(-GATE_K*(signal-GATE_MID))) if GATE_ENABLED else 1.0
+    mult = 1.0 if gate >= 0.5 else gate
+
+    # Predict-time temporal gate (see TEMPORAL_* above): stale/already-priced
+    # posts get damped further, regardless of the NLP gate result.
+    post_hour = post_ts.hour if post_ts is not None else None
+    tfactor, tlabel = temporal_factor(text, post_hour=post_hour)
+    mult *= tfactor
+
+    out = {}
+    for inst,_,_ in LABELS:
+        if inst in models:
+            raw = float(models[inst].predict(X)[0])
+            out[inst] = raw * mult
+    return out, signal, gate, tfactor, tlabel
+
+def show(text, r, signal, gate, tfactor, tlabel):
+    print("\n" + "─"*64)
+    print(f"📝 {text[:120]}{'...' if len(text)>120 else ''}")
+    print(f"   NLP signal={signal:.3f}  gate×{gate:.2f}" +
+          ("  (real signal — FULL move)" if gate >= 0.5 else "  (noise — damped)"))
+    print(f"   temporal={tlabel}  factor×{tfactor:.2f}" +
+          ("  (last night/past, no future cue -> damped)" if tfactor < 1.0 else
+           "  (future/breaking/neutral -> no extra damping)"))
+    total_mult = gate * tfactor if gate < 0.5 else tfactor
+    if tfactor < 1.0:
+        print(f"   ⚠️  TOTAL ×{total_mult:.2f} — STALE / ALREADY PRICED IN — DON'T TRADE")
+    elif gate < 0.5:
+        print(f"   ⚠️  TOTAL ×{total_mult:.2f} — LOW-SIGNAL NOISE — DON'T TRADE")
+    else:
+        print(f"   ✅ TOTAL ×{total_mult:.2f} — FULL MOVE — TRADEABLE")
+    print("─"*64)
+    print("📊 PREDICTED 1-HOUR MARKET IMPACT (FinBERT+NLP→XGBoost):")
+    for inst, emoji, name in LABELS:
+        v = r.get(inst, 0.0)
+        arrow = "▲" if v>0 else ("▼" if v<0 else "─")
+        bar = "█"*min(int(abs(v)*4),20)
+        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}")
+    print("─"*64+"\n")
+
+def main():
+    ap = argparse.ArgumentParser(description="Interactive FinBERT+NLP+XGBoost predictor.")
+    ap.add_argument("--time", metavar="yyyymmddhhmm",
+                    help="NY local time the post was made; only used to resolve "
+                         "ambiguous time-of-day phrases (this morning/tonight/etc.) "
+                         "in the temporal gate. Optional.")
+    args = ap.parse_args()
+    post_ts = parse_stamp(args.time) if args.time else None
+
+    cfg, models, nlp, sbert = load()
+    print("="*64)
+    print("  🤖 FinBERT + 📊 NLP + 🌲 XGBoost — 23 instruments")
+    print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")
+    if post_ts is not None:
+        print(f"  Post time: {post_ts} (used for ambiguous time-of-day phrases)")
+    print("="*64+"\n")
+    while True:
+        try:
+            t = input("📝 Enter post: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not t: continue
+        if t.lower() in ('quit','exit','q'): break
+        r, sig, gate, tfactor, tlabel = predict(t, cfg, models, nlp, sbert, post_ts=post_ts)
+        show(t, r, sig, gate, tfactor, tlabel)
+
+
+if __name__ == '__main__':
+    main()
