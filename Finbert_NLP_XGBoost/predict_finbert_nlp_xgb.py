@@ -139,18 +139,21 @@ LABELS = [
 
 _tok = _bert = None
 
-def load():
+def load(model_dir=None):
     global _tok, _bert
-    cfg = json.load(open(f"{OUT_DIR}/config.json"))
+    model_dir = model_dir or OUT_DIR
+    cfg = json.load(open(f"{model_dir}/config.json"))
     print(f"📥 Loading FinBERT on {DEVICE}...")
     _tok = AutoTokenizer.from_pretrained(cfg['finbert'])
     _bert = AutoModelForSequenceClassification.from_pretrained(
         cfg['finbert'], output_hidden_states=True).to(DEVICE).eval()
     models = {}
     for inst,_,_ in LABELS:
-        p = f"{OUT_DIR}/{inst}_Impact.json"
+        p = f"{model_dir}/{inst}_Impact.json"
         if os.path.exists(p):
             m = xgb.XGBRegressor(); m.load_model(p); models[inst]=m
+    if model_dir != OUT_DIR:
+        print(f"  📂 Models loaded from {model_dir} (non-default --model-dir)")
     nlp   = ss.load_spacy()
     sbert = ss.load_sbert()
     print(f"✅ FinBERT + NLP scorer + {len(models)} XGBoost models\n")
@@ -228,4 +231,45 @@ def show(text, r, signal, gate, tfactor, tlabel):
     else:
         print(f"   ✅ TOTAL ×{total_mult:.2f} — FULL MOVE — TRADEABLE")
     print("─"*64)
-    print("📊 PREDICTED 1-HOUR M
+    print("📊 PREDICTED 1-HOUR MARKET IMPACT (FinBERT+NLP→XGBoost):")
+    for inst, emoji, name in LABELS:
+        v = r.get(inst, 0.0)
+        arrow = "▲" if v>0 else ("▼" if v<0 else "─")
+        bar = "█"*min(int(abs(v)*4),20)
+        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}")
+    print("─"*64+"\n")
+
+def main():
+    ap = argparse.ArgumentParser(description="Interactive FinBERT+NLP+XGBoost predictor.")
+    ap.add_argument("--time", metavar="yyyymmddhhmm",
+                    help="NY local time the post was made; only used to resolve "
+                         "ambiguous time-of-day phrases (this morning/tonight/etc.) "
+                         "in the temporal gate. Optional.")
+    ap.add_argument("--model-dir", default=None,
+                    help=f"Directory with <INST>_Impact.json + config.json "
+                         f"(default {OUT_DIR}). Point this at "
+                         f"finbert_nlp_xgb_models_live to use models fine-tuned "
+                         f"by backtest_simulator.py --fine-tune.")
+    args = ap.parse_args()
+    post_ts = parse_stamp(args.time) if args.time else None
+
+    cfg, models, nlp, sbert = load(args.model_dir)
+    print("="*64)
+    print("  🤖 FinBERT + 📊 NLP + 🌲 XGBoost — 23 instruments")
+    print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")
+    if post_ts is not None:
+        print(f"  Post time: {post_ts} (used for ambiguous time-of-day phrases)")
+    print("="*64+"\n")
+    while True:
+        try:
+            t = input("📝 Enter post: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not t: continue
+        if t.lower() in ('quit','exit','q'): break
+        r, sig, gate, tfactor, tlabel = predict(t, cfg, models, nlp, sbert, post_ts=post_ts)
+        show(t, r, sig, gate, tfactor, tlabel)
+
+
+if __name__ == '__main__':
+    main()
