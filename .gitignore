@@ -11,3 +11,9 @@ market_data_cache/
 *.zip
 *.npy
 *.log
+*.err
+*.migrated_bak
+
+# Local DuckDB database (all the data that used to be CSV/NPY/JSON)
+database.db
+database.db.wal
