@@ -29,6 +29,14 @@ GATE_ENABLED = True
 GATE_K       = 16.0   # steepness — higher = sharper noise/signal cutoff
 GATE_MID     = 0.45   # signal midpoint where gate = 0.5
 
+# TRADE/SKIP threshold — matches backtest_simulator.py's DIR_THRESHOLD_DEFAULT,
+# so the live predictor and the backtest agree on what counts as "tradeable".
+# A post is SKIP if EITHER its |predicted move| is below this threshold OR the
+# post was damped (gate/temporal mult != 1.0) -- damping means low-confidence/
+# stale, so it's never tradeable regardless of magnitude (see backtest_simulator
+# .run_backtest's `is_trade = (abs(raw_pred) >= trade_threshold) and not damped`).
+TRADE_THRESHOLD = 0.1
+
 # --------------------------------------------------------------- temporal gate
 # PREDICT-TIME ONLY — no training/CSV changes, no new columns. Based on the
 # "tense & horizon" finance-NLP finding that future-tense news produces a
@@ -65,7 +73,52 @@ TEMPORAL_FUTURE_PHRASES = [
 ]
 TEMPORAL_BREAKING = [
     r"\bbreaking\b", r"\bjust announced\b", r"\bmoments ago\b", r"\bright now\b",
-    r"\bhappening now\b", r"\bas we speak\b",
+    r"\bhappening now\b", r"\bas we speak\b", r"\bat this (?:very )?moment\b",
+    # Other classic "I'm telling you this for the first time, right now" markers.
+    r"\bat my direction\b", r"\bhereby announc(?:e|ing|ed)\b",
+    r"\bwe got (?:him|her|them)\b",
+    # First-person disclosure of something the President himself just did,
+    # said, decided, or finished (e.g. "This morning I ordered military air
+    # strikes...", "I have strongly requested to President Putin that...",
+    # "This morning I finalized an important Deal with Indonesia...") IS the
+    # breaking news itself — the market doesn't know it until THIS post, since
+    # it's not something he heard secondhand. This overrides BOTH an ambiguous
+    # time-of-day phrase ("this morning"/"tonight" already over by post time)
+    # AND an explicit past-time phrase elsewhere in the same post
+    # ("...yesterday, ... I have strongly requested...") — the post can recap
+    # yesterday's events as background while still disclosing brand-new
+    # action/decision/result in the same breath.
+    # NOTE: this is for THE PRESIDENT'S OWN actions/decisions/results only --
+    # things that literally cannot be known until he says so. It deliberately
+    # does NOT include passive "I have been informed/told/notified..." (he is
+    # just relaying something that happened TO the US/its forces, which he did
+    # not originate or control -- e.g. an adversary shooting down a US
+    # helicopter "last night"). For those, the market may already know via
+    # other channels (Pentagon briefings, wire reports, etc.) by the time he
+    # posts, so the explicit past-time phrase ("last night"/"yesterday"/etc.)
+    # should still govern damping -- it's context, not overridden.
+    r"\bi (?:have |'ve |am |will |just |now |already |strongly |"
+    r"formally |personally |immediately )*(?:ordered|directed|authorized|"
+    r"launched|requested|demanded|instructed|called|spoke|"
+    r"warned|signed|imposed|decided|asked|urged|pressed|"
+    r"communicated|made clear|made it clear|finalized|concluded|reached a|"
+    r"secured|completed|confirmed|announced)\b",
+    # A post whose body IS the verbatim text of a letter/statement Trump JUST
+    # sent/issued ("A LETTER SENT BY PRESIDENT DONALD J. TRUMP TO ALL NATO
+    # NATIONS...: 'I am ready to do major Sanctions on Russia when...'"). The
+    # letter's contents are themselves the brand-new disclosure -- the market
+    # has not seen this letter before this post, no matter what historical
+    # background ("7,118 lives lost last week, alone") it mentions in passing.
+    # Often posted premarket specifically so it's digested before the open.
+    r"\ba (?:letter|statement|message) (?:sent|addressed|delivered|issued)\b",
+    # A "but not anymore" / "not anymore" reversal marks a NEW policy decision
+    # or status change -- the actual news -- even though it's framed against
+    # "for many years"/"last week('s)" background describing the OLD status
+    # quo that just ended (e.g. "Cuba lived for many years on oil and money
+    # from Venezuela ... BUT NOT ANYMORE! ... THERE WILL BE NO MORE OIL OR
+    # MONEY GOING TO CUBA"). The reversal itself is what's new, not the
+    # history being reversed.
+    r"\bnot anymore\b",
 ]
 # phrase -> (start_hour, end_hour) of the day it refers to (24h, local post time)
 TEMPORAL_AMBIGUOUS = {
@@ -139,10 +192,28 @@ LABELS = [
 
 _tok = _bert = None
 
+# Per-instrument TRADE/SKIP "filtered accuracy" from the most recent
+# backtest_simulator.py run (written to <model_dir>/trade_accuracy.json by
+# write_trade_accuracy()). {instrument: {'trade_n':, 'trade_acc':, 'skip_n':,
+# 'skip_acc':}}. Empty if no backtest has been run against this model dir yet.
+TRADE_ACCURACY = {}
+
 def load(model_dir=None):
-    global _tok, _bert
+    global _tok, _bert, TRADE_ACCURACY
     model_dir = model_dir or OUT_DIR
     cfg = json.load(open(f"{model_dir}/config.json"))
+
+    acc_path = f"{model_dir}/trade_accuracy.json"
+    if os.path.exists(acc_path):
+        with open(acc_path, encoding='utf-8') as f:
+            acc_report = json.load(f)
+        TRADE_ACCURACY = acc_report.get('instruments', {})
+        win = acc_report.get('window', {})
+        print(f"  📊 Loaded TRADE/SKIP filtered accuracy from {acc_path} "
+              f"(backtest window {win.get('since','?')} -> {win.get('until','?')})")
+    else:
+        TRADE_ACCURACY = {}
+
     print(f"📥 Loading FinBERT on {DEVICE}...")
     _tok = AutoTokenizer.from_pretrained(cfg['finbert'])
     _bert = AutoModelForSequenceClassification.from_pretrained(
@@ -231,12 +302,34 @@ def show(text, r, signal, gate, tfactor, tlabel):
     else:
         print(f"   ✅ TOTAL ×{total_mult:.2f} — FULL MOVE — TRADEABLE")
     print("─"*64)
+    damped = total_mult != 1.0
     print("📊 PREDICTED 1-HOUR MARKET IMPACT (FinBERT+NLP→XGBoost):")
     for inst, emoji, name in LABELS:
         v = r.get(inst, 0.0)
         arrow = "▲" if v>0 else ("▼" if v<0 else "─")
         bar = "█"*min(int(abs(v)*4),20)
-        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}")
+        # SKIP if damped (low-confidence/stale, regardless of magnitude) OR
+        # |v| below TRADE_THRESHOLD -- same rule as backtest_simulator.
+        decision = "SKIP" if (damped or abs(v) < TRADE_THRESHOLD) else "TRADE"
+        # Historical "filtered accuracy" for this instrument from the last
+        # backtest run, so a live TRADE/SKIP call has context for how
+        # reliable that bucket has actually been.
+        hist = TRADE_ACCURACY.get(inst)
+        hist_str = ""
+        if hist:
+            if decision == "TRADE":
+                # Prefer the "filtered" accuracy (TRADE-flagged AND
+                # |actual|>=dir_threshold, i.e. excludes noise-sized moves) --
+                # this is the higher, more meaningful number. Fall back to the
+                # unfiltered TRADE accuracy if there's no meaningful subset yet.
+                if hist.get('trade_meaningful_acc') is not None:
+                    hist_str = (f"  (filtered acc {hist['trade_meaningful_acc']*100:.1f}%, "
+                                 f"n={hist['trade_meaningful_n']})")
+                elif hist.get('trade_acc') is not None:
+                    hist_str = f"  (hist TRADE acc {hist['trade_acc']*100:.1f}%, n={hist['trade_n']})"
+            elif decision == "SKIP" and hist.get('skip_acc') is not None:
+                hist_str = f"  (hist SKIP acc {hist['skip_acc']*100:.1f}%, n={hist['skip_n']})"
+        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}  {decision}{hist_str}")
     print("─"*64+"\n")
 
 def main():
@@ -254,6 +347,7 @@ def main():
     post_ts = parse_stamp(args.time) if args.time else None
 
     cfg, models, nlp, sbert = load(args.model_dir)
+    print("="*64)
     print("="*64)
     print("  🤖 FinBERT + 📊 NLP + 🌲 XGBoost — 23 instruments")
     print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")

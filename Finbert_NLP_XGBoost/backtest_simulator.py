@@ -327,6 +327,11 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         'skip_n': 0, 'skip_match': 0,
     } for inst in instruments}
 
+    # Per-post rows for the CSV export — wide format, one row per post with
+    # <INST>_pred / <INST>_actual / <INST>_match / <INST>_decision columns for
+    # every instrument, so all instruments for a post are visible side-by-side.
+    csv_rows = []
+
     for row_i, (idx, row) in enumerate(df.iterrows()):
         signal, gate, tfactor, tlabel, mult = gate_multiplier(row)
         near_tag = " [NEAR-CUTOFF, recomputed]" if row.get('is_near') else ""
@@ -336,6 +341,17 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         print(f"  NLP signal={signal:.3f}  gate×{gate:.2f}  temporal={tlabel} ×{tfactor:.2f}  "
               f"-> total mult ×{mult:.2f}")
 
+        csv_row = {
+            'id': row['id'],
+            'date': row['date_ny'].isoformat(),
+            'text': row['text'],
+            'nlp_signal': signal,
+            'gate': gate,
+            'temporal_label': tlabel,
+            'total_mult': mult,
+        }
+        damped = mult != 1.0
+
         print(f"  {'instrument':<10} {'pred':>9} {'actual':>9}  {'match':<6}  {'|err|':>7}  {'decision':<5}")
         for inst in instruments:
             if inst not in models:
@@ -343,7 +359,8 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
             col = f"{inst}_Impact"
             if col not in df.columns:
                 continue
-            raw_pred = float(preds[inst][row_i]) * mult
+            orig_pred = float(preds[inst][row_i])
+            raw_pred = orig_pred * mult
             actual = float(row[col]) if pd.notna(row[col]) else 0.0
             abs_err = abs(raw_pred - actual)
 
@@ -358,7 +375,10 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
                 match_str = "·"
 
             # TRADE/SKIP: would we have acted on this prediction at all?
-            is_trade = abs(raw_pred) >= trade_threshold
+            # A damped post (gate/temporal mult != 1.0) is by definition
+            # low-confidence/stale -- never trade it, even if the scaled
+            # |raw_pred| still happens to clear trade_threshold.
+            is_trade = (abs(raw_pred) >= trade_threshold) and not damped
             sign_match = (np.sign(raw_pred) == np.sign(actual)) if actual != 0 else False
             if is_trade:
                 td_stats[inst]['trade_n'] += 1
@@ -372,10 +392,18 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
             decision = "TRADE" if is_trade else "SKIP"
 
             emoji, name = label_meta.get(inst, ("", inst))
+            orig_str = f"  (orig {orig_pred:+.4f}%)" if damped else ""
             print(f"  {emoji} {inst:<8} {raw_pred:>+8.4f}% {actual:>+8.4f}%  "
-                  f"{match_str:<6}  {abs_err:>6.4f}  {decision:<5}")
+                  f"{match_str:<6}  {abs_err:>6.4f}  {decision:<5}{orig_str}")
 
-    return stats, td_stats
+            csv_row[f'{inst}_pred'] = raw_pred
+            csv_row[f'{inst}_actual'] = actual
+            csv_row[f'{inst}_match'] = (bool(match) if meaningful else None)
+            csv_row[f'{inst}_decision'] = decision
+
+        csv_rows.append(csv_row)
+
+    return stats, td_stats, csv_rows
 
 
 def print_summary(stats, dir_threshold):
@@ -454,6 +482,95 @@ def print_trade_skip_summary(td_stats, trade_threshold, dir_threshold):
           f"acc={overall_trade_m:6.1%})")
     print(f"           SKIP   n={tot['skip_n']:>5}  acc={overall_skip:6.1%}")
     print("=" * 78)
+
+
+def print_filtered_accuracy(td_stats, dir_threshold):
+    """Dedicated, clearly-labeled table for the "filtered accuracy" -- TRADE
+    calls whose actual move was also >= dir_threshold (i.e. excludes TRADE
+    calls on noise-sized moves). This is the same trade_meaningful_n/acc data
+    written to trade_accuracy.json, printed directly so you don't have to open
+    the JSON file to see it.
+    """
+    def acc(m, n):
+        return m / n if n else float('nan')
+
+    rows = []
+    tot_n, tot_m = 0, 0
+    for inst, s in td_stats.items():
+        n, m = s['trade_meaningful_n'], s['trade_meaningful_match']
+        if n == 0:
+            continue
+        rows.append((inst, n, m, acc(m, n)))
+        tot_n += n
+        tot_m += m
+
+    rows.sort(key=lambda r: -r[3])
+
+    print("\n" + "=" * 78)
+    print(f"  FILTERED ACCURACY  (TRADE calls AND |actual| >= {dir_threshold}% -- "
+          f"excludes noise-sized moves)")
+    print("=" * 78)
+    print(f"  {'instrument':<10} {'n':>6} {'acc':>7}")
+    for inst, n, m, a in rows:
+        print(f"  {inst:<10} {n:>6} {a:6.1%}")
+    print("-" * 78)
+    overall = acc(tot_m, tot_n)
+    print(f"  OVERALL    n={tot_n:>5}  acc={overall:6.1%}")
+    print("=" * 78)
+
+
+def write_trade_accuracy(td_stats, model_dir, trade_threshold, since, until):
+    """Persist per-instrument TRADE/SKIP "filtered accuracy" (the same numbers
+    print_trade_skip_summary prints) to <model_dir>/trade_accuracy.json, so
+    predict_finbert_nlp_xgb.py can show, alongside a live prediction's
+    TRADE/SKIP decision, how accurate that instrument's TRADE-flagged
+    predictions have historically been in this backtest window.
+    """
+    def acc(m, n):
+        return m / n if n else None
+
+    out = {
+        'window': {'since': since.isoformat(), 'until': until.isoformat()},
+        'trade_threshold': trade_threshold,
+        'instruments': {},
+    }
+    for inst, s in td_stats.items():
+        if s['trade_n'] == 0 and s['skip_n'] == 0:
+            continue
+        out['instruments'][inst] = {
+            'trade_n': s['trade_n'], 'trade_acc': acc(s['trade_match'], s['trade_n']),
+            # "Filtered" accuracy: TRADE-flagged AND |actual| >= dir_threshold
+            # (i.e. excludes TRADE calls on moves so small they're noise) --
+            # this is the higher, more meaningful number shown by
+            # print_trade_skip_summary's "(|actual|>=X% subset: ...)" column.
+            'trade_meaningful_n': s['trade_meaningful_n'],
+            'trade_meaningful_acc': acc(s['trade_meaningful_match'], s['trade_meaningful_n']),
+            'skip_n': s['skip_n'], 'skip_acc': acc(s['skip_match'], s['skip_n']),
+        }
+
+    path = os.path.join(model_dir, "trade_accuracy.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, indent=2)
+    print(f"  💾 Wrote TRADE/SKIP filtered accuracy -> {path}")
+
+
+def write_csv(csv_rows, csv_path, instruments):
+    """Write the per-post backtest rows to a CSV file (wide format: one row
+    per post, with <INST>_pred / <INST>_actual / <INST>_match / <INST>_decision
+    columns for every instrument, side-by-side). This is for inspection /
+    later charting only — NOT written to database.db, keeping the DB light.
+    """
+    import csv
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    fieldnames = ['id', 'date', 'text',
+                  'nlp_signal', 'gate', 'temporal_label', 'total_mult']
+    for inst in instruments:
+        fieldnames += [f'{inst}_pred', f'{inst}_actual', f'{inst}_match', f'{inst}_decision']
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print(f"\n  💾 Wrote {len(csv_rows)} row(s) to {csv_path}")
 
 
 # ============================================================================
@@ -547,6 +664,12 @@ def main():
                          "Use a SMALL number (e.g. 5-10) for short/hourly windows.")
     ap.add_argument("--fine-tune-out", default=LIVE_DIR,
                     help=f"Output dir for fine-tuned models (default {LIVE_DIR}).")
+    ap.add_argument("--csv-out", default=None, metavar="PATH",
+                    help="Write per-post/per-instrument backtest results (truth id, datetime, "
+                         "text, predicted/actual, match, decision) to this CSV file for "
+                         "inspection or charting. NOT written to database.db. Default: "
+                         "backtest_results/backtest_<until>.csv. Pass an empty string '' "
+                         "to skip CSV output.")
     args = ap.parse_args()
 
     until = parse_stamp(args.until, "until")
@@ -588,9 +711,18 @@ def main():
 
     trade_threshold = args.trade_threshold if args.trade_threshold is not None else args.dir_threshold
 
-    stats, td_stats = run_backtest(df, X, cfg, models, impact_cols, args.dir_threshold, trade_threshold)
+    stats, td_stats, csv_rows = run_backtest(df, X, cfg, models, impact_cols, args.dir_threshold, trade_threshold)
     print_summary(stats, args.dir_threshold)
     print_trade_skip_summary(td_stats, trade_threshold, args.dir_threshold)
+    print_filtered_accuracy(td_stats, args.dir_threshold)
+    write_trade_accuracy(td_stats, args.model_dir, trade_threshold, since, until)
+
+    if args.csv_out != "":
+        since_str = since.strftime("%Y%m%d%H%M")
+        until_str = until.strftime("%Y%m%d%H%M")
+        csv_path = args.csv_out or os.path.join(
+            _HERE, "backtest_results", f"backtest_{since_str}_to_{until_str}.csv")
+        write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
         fine_tune(df, X, cfg, args.model_dir, args.fine_tune_out, args.fine_tune_rounds, impact_cols)
