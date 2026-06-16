@@ -28,27 +28,35 @@ import pandas as pd
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_HERE, "..", "database.db")
 
-# Tables whose (platform, id) pair must be globally unique.
-# A UNIQUE INDEX is created/ensured after every write or append to these tables.
-_UNIQUE_KEY_TABLES: dict[str, tuple[str, ...]] = {
-    "unified_feed":           ("platform", "id"),
-    "posts_scored":           ("platform", "id"),
-    "posts_labeled":          ("platform", "id"),
-    "training_set_FINAL":     ("platform", "id"),
+# Tables that require a PRIMARY KEY on (platform, id).
+# write_table builds a proper CREATE TABLE ... PRIMARY KEY DDL so the key
+# appears in duckdb_constraints().  append_table uses ON CONFLICT DO NOTHING.
+_PK_TABLES: dict[str, tuple[str, ...]] = {
+    "unified_feed":             ("platform", "id"),
+    "posts_scored":             ("platform", "id"),
+    "posts_labeled":            ("platform", "id"),
+    "training_set_FINAL":       ("platform", "id"),
     "training_set_HIGH_SIGNAL": ("platform", "id"),
 }
 
 
-def _ensure_unique_index(table: str, con) -> None:
-    """Create UNIQUE INDEX on (platform, id) for tables that require it, if not present."""
-    cols = _UNIQUE_KEY_TABLES.get(table)
-    if not cols:
-        return
-    idx_name = f"ux_{table}_platform_id"
-    col_list = ", ".join(cols)
-    con.execute(
-        f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} ON {table} ({col_list})"
-    )
+def _create_with_pk(table: str, df: pd.DataFrame, con) -> None:
+    """
+    Drop-and-recreate `table` with a proper PRIMARY KEY constraint.
+    Schema is inferred from `df` via DuckDB's DESCRIBE; data is bulk-inserted.
+    The temporary view _tmp_pk_df must already be registered by the caller.
+    """
+    pk_cols = _PK_TABLES[table]
+
+    # Infer column types from the DataFrame via DuckDB
+    col_rows = con.execute("DESCRIBE SELECT * FROM _tmp_pk_df").fetchall()
+    # col_rows: (column_name, column_type, null, key, default, extra)
+    col_defs = ", ".join(f'"{r[0]}" {r[1]}' for r in col_rows)
+    pk_def = f"PRIMARY KEY ({', '.join(pk_cols)})"
+
+    con.execute(f"DROP TABLE IF EXISTS {table}")
+    con.execute(f"CREATE TABLE {table} ({col_defs}, {pk_def})")
+    con.execute(f"INSERT INTO {table} SELECT * FROM _tmp_pk_df")
 
 
 def get_connection():
@@ -85,38 +93,21 @@ def read_table(table, con=None):
 
 
 def write_table(table, df, con=None):
-    """Create or overwrite `table` with the contents of `df`."""
+    """Create or overwrite `table` with the contents of `df`.
+    Tables in _PK_TABLES get a real PRIMARY KEY constraint."""
     own = con is None
     con = con or get_connection()
     try:
-        con.register("_tmp_write_df", df)
-        con.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM _tmp_write_df")
-        con.unregister("_tmp_write_df")
-        _ensure_unique_index(table, con)
+        con.register("_tmp_pk_df", df)
+        if table in _PK_TABLES:
+            _create_with_pk(table, df, con)
+        else:
+            con.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM _tmp_pk_df")
+        con.unregister("_tmp_pk_df")
     finally:
         if own:
             con.close()
 
 
 def query(sql, con=None):
-    """Run arbitrary SQL and return a DataFrame (or None on error)."""
-    own = con is None
-    con = con or get_connection()
-    try:
-        return con.execute(sql).fetchdf()
-    except Exception:
-        return None
-    finally:
-        if own:
-            con.close()
-
-
-def rename_table(old_name, new_name, con=None):
-    """Rename a table; no-op if old_name doesn't exist or new_name already does."""
-    own = con is None
-    con = con or get_connection()
-    try:
-        if table_exists(old_name, con) and not table_exists(new_name, con):
-            con.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
-            return True
-       
+    """Run arbitrary SQL and return a DataF
