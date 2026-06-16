@@ -1,7 +1,7 @@
 """
 sync_unified_feed.py
 ====================
-Merges TruthSocial posts (trump_truths.csv) and English geopolitical tweets
+Merges TruthSocial posts (truth_social.csv) and English geopolitical tweets
 (x_tweets_en.csv) into the unified_feed DuckDB table, sorted by
 America/New_York time.
 
@@ -49,7 +49,7 @@ for _s in (sys.stdout, sys.stderr):
 
 # ------------------------------------------------------------------ paths ----
 ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
-TRUTHS_CSV    = os.path.join(_HERE, "trump_truths.csv")
+TRUTHS_CSV    = os.path.join(_HERE, "truth_social.csv")
 TWEETS_CSV    = os.path.join(_HERE, "x_tweets_en.csv")
 FEED_TABLE    = "unified_feed"
 TZ            = "America/New_York"
@@ -159,38 +159,107 @@ def _to_ny(series: pd.Series) -> pd.Series:
 
 # ---------------------------------------------------------- build sources ----
 
+def _load_primary_account_map() -> dict:
+    """
+    Build {handle_lower: {account, account_name, account_rank,
+                          entity_weight, event_weight}}
+    from geopolitical_entities.json primary_accounts.
+
+    Falls back to sensible defaults if an account is not in the JSON so that
+    truth_social.csv rows for any handle are always processable.
+    """
+    try:
+        with open(ENTITIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+
+    em = EventManager()
+    out: dict = {}
+    for acct in data.get("primary_accounts", []):
+        handle = acct.get("account", "")
+        if not handle:
+            continue
+        out[handle.lower()] = {
+            "account":      handle,
+            "account_name": acct.get("account_name", acct.get("name", handle)),
+            "account_rank": int(acct.get("rank", 0)),
+            "entity_weight": float(acct.get("entity_weight", 1.0)),
+            "event_weight":  em.get_account_multiplier(handle),
+        }
+    return out
+
+
 def _build_truths() -> pd.DataFrame:
-    """Load trump_truths.csv → unified schema rows."""
+    """
+    Load truth_social.csv → unified schema rows.
+
+    The CSV has an `account` column (TruthSocial handle) written by
+    daily_truths_retriever.py. Legacy files without that column default to
+    'realDonaldTrump' so existing data is never broken.
+
+    Per-account metadata (account_name, rank, entity_weight, event_weight) is
+    resolved from geopolitical_entities.json primary_accounts, making this
+    function automatically aware of any new account added to that file.
+    """
     if not os.path.exists(TRUTHS_CSV):
-        print(f"  ⚠️  {TRUTHS_CSV} not found — skipping Trump truths")
+        print(f"  ⚠️  {TRUTHS_CSV} not found — skipping TruthSocial posts")
         return pd.DataFrame(columns=UNIFIED_FEED_COLS)
 
     df = pd.read_csv(TRUTHS_CSV, dtype={"id": str})
-    # Filter noise (URL-only posts — keep originals and RT/quote)
+
+    # Load account metadata from geopolitical_entities.json (needed for legacy fallback too)
+    primary_map = _load_primary_account_map()
+
+    # Legacy files (single-account era) have no 'account' column —
+    # default to the rank-0 primary account from the JSON
+    if "account" not in df.columns:
+        rank0 = next(
+            (v["account"] for v in sorted(primary_map.values(),
+                                          key=lambda x: x.get("account_rank", 99))),
+            "us_president",
+        )
+        df["account"] = rank0
+
+    # Filter noise (URL-only posts)
     df["_type"] = df["text"].apply(_classify)
     df = df[df["_type"] != "url_only"].copy()
     df = df.drop(columns=["_type"])
 
+    # Default metadata for any handle not found in the JSON
+    _default = {
+        "account_name": "",
+        "account_rank": 0,
+        "entity_weight": 1.0,
+        "event_weight":  1.0,
+    }
+
+    def _meta(handle: str) -> dict:
+        return primary_map.get(handle.lower(), {**_default, "account_name": handle})
+
     rows = pd.DataFrame(index=df.index)
-    rows["id"]           = df["id"].astype(str)
-    rows["source"]       = "truthsocial"
-    rows["platform"]     = "truthsocial"
-    rows["account"]      = "realDonaldTrump"
-    rows["account_name"] = "Donald J. Trump"
-    rows["account_rank"] = 0
+    rows["id"]       = df["id"].astype(str)
+    rows["source"]   = "truthsocial"
+    rows["platform"] = "truthsocial"
+    rows["account"]  = df["account"]
+    rows["account_name"] = df["account"].map(
+        lambda h: _meta(h)["account_name"])
+    rows["account_rank"] = df["account"].map(
+        lambda h: _meta(h)["account_rank"])
     rows["mention_count"] = None
-    rows["entity_weight"] = 1.0
-    rows["event_weight"]  = 1.0
-    rows["date"]          = _to_ny(df["date"])
-    rows["text"]          = df["text"].apply(_clean_text)
-    rows["language"]      = "en"
-    # Truth Social post URL (construct from id if no url column)
-    if "url" in df.columns:
-        rows["url"] = df["url"].fillna(
-            "https://truthsocial.com/@realDonaldTrump/posts/" + df["id"].astype(str)
-        )
-    else:
-        rows["url"] = "https://truthsocial.com/@realDonaldTrump/posts/" + df["id"].astype(str)
+    rows["entity_weight"] = df["account"].map(
+        lambda h: _meta(h)["entity_weight"])
+    rows["event_weight"]  = df["account"].map(
+        lambda h: _meta(h)["event_weight"])
+    rows["date"]     = _to_ny(df["date"])
+    rows["text"]     = df["text"].apply(_clean_text)
+    rows["language"] = "en"
+    # Construct TruthSocial post URL from the account handle + post id
+    rows["url"] = df.apply(
+        lambda r: (r["url"] if ("url" in df.columns and pd.notna(r.get("url", None)))
+                   else f"https://truthsocial.com/@{r['account']}/posts/{r['id']}"),
+        axis=1,
+    )
     rows["favorites"] = df.get("favorites", pd.Series(0, index=df.index)).fillna(0).astype(int)
     rows["retweets"]  = df.get("retweets",  pd.Series(0, index=df.index)).fillna(0).astype(int)
     rows["replies"]   = df.get("replies",   pd.Series(0, index=df.index)).fillna(0).astype(int)
@@ -249,7 +318,7 @@ def sync(full: bool = False) -> int:
     print("=" * 64)
     print("  SYNC UNIFIED FEED")
     print(f"  {'FULL REBUILD' if full else 'INCREMENTAL'}: "
-          f"trump_truths.csv + x_tweets_en.csv → {FEED_TABLE}")
+          f"truth_social.csv + x_tweets_en.csv → {FEED_TABLE}")
     print("=" * 64)
 
     entity_map = _build_entity_map()

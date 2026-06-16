@@ -1,6 +1,6 @@
 {
   "description": "Geopolitical leaders, officials, and institutions monitored for market-moving posts across influence platforms (TruthSocial and X/Twitter). Entities are ranked by relevance (mention frequency + market-moving potential) with official platform handles and power-expiration dates (next election/term end; N/A if not subject to a competitive electoral term). The rank-0 primary influence account is listed separately under primary_accounts.",
-  "source": "trump_truths.csv (spaCy NER PERSON extraction over 7333 posts)",
+  "source": "truth_social.csv (spaCy NER PERSON extraction over 7333 posts)",
   "generated": "2026-06-16",
   "primary_accounts": [
     {
@@ -11,7 +11,8 @@
       "account_name": "Donald J. Trump",
       "entity_weight": 1.0,
       "event_weight": 1.0,
-      "note": "Rank-0 primary influence account. Currently 47th U.S. President, Republican/MAGA aligned. Posts on TruthSocial. Rank-0 status is assigned to whoever holds the primary influence position — future rank-0 may differ (e.g. next U.S. president regardless of party, or a successor candidate)."
+      "expiration_date": "2029-01-20",
+      "note": "Rank-0 primary influence account. Currently 47th U.S. President (term ends 2029-01-20). Rank-0 status is assigned to whoever holds the primary influence position — successor candidate or next president should replace this entry when term ends."
     }
   ],
   "entities": [

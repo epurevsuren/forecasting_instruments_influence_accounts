@@ -57,7 +57,7 @@ NLP_FEATURES = [
     'flag_stimulus','flag_tariff_trade','flag_interest_rate','flag_tax_policy',
     'flag_sanctions','flag_war_geopolitics','flag_energy_policy','flag_immigration_policy',
     'flag_industrial_policy','flag_deregulation','flag_financial_system','flag_supply_chain',
-    'flag_ai_chip_policy','flag_covid_relief',
+    'flag_ai_chip_policy','flag_pandemic_relief',
     # NER / linguistic counts
     'num_policy_verbs','num_policy_nouns','num_gpe','num_org','num_percent','num_money',
     'num_date','num_law','num_person','num_cardinal','num_event',
@@ -129,13 +129,10 @@ def main():
     feats = feats[feats['date'] <= _bound_utc].copy()
     print(f"  🦆 {SCORED_TABLE}: {len(feats)} rows  (≤ {_bound_ny:%Y-%m-%d %H:%M %Z})")
 
-    # Merge on (date, text): truth_training_set_FINAL has date/text from both
-    # TruthSocial and X/Twitter posts; posts_scored has the same pairs plus NLP features.
-    # Columns present in BOTH tables (source, platform, entity_weight, event_weight,
-    # account, account_rank) get no suffix from labels, _sc from feats — both hold
-    # identical values since they derive from the same unified_feed.
-    key = ['date', 'text'] if 'text' in feats.columns else ['date']
-    df = labels.merge(feats, on=key, how='inner', suffixes=('', '_sc'))
+    # Merge on id: unique post identifier present in both truth_training_set_FINAL
+    # and posts_scored. Columns present in BOTH tables get no suffix from labels,
+    # _sc from feats — values are identical since both derive from the same unified_feed.
+    df = labels.merge(feats, on='id', how='inner', suffixes=('', '_sc'))
     n_primary = int(df['is_primary'].sum()) if 'is_primary' in df.columns else '?'
     n_twitter = len(df) - (n_primary if isinstance(n_primary, int) else 0)
     print(f"  Merged rows: {len(df)}  (TruthSocial: {n_primary} | X/Twitter: {n_twitter})")

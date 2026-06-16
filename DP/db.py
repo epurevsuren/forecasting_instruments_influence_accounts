@@ -4,19 +4,20 @@ db.py
 Shared DuckDB helper for database.db at the project root
 (D:\\Coding\\forecasting_instruments_influence_accounts\\database.db).
 
-Replaces the old intermediate CSV/NPY/JSON artifacts (trump_truths_scored.csv,
+Replaces the old intermediate CSV/NPY/JSON artifacts (posts_scored.csv,
 truth_training_set_TEST/FINAL.csv, finbert_embeddings_v2.npy, eval_report.json)
-with tables in a single local DuckDB file. trump_truths.csv and
-IBKR/market_data_cache/*.csv stay as plain files.
+with tables in a single local DuckDB file. truth_social.csv (raw TruthSocial
+posts) and IBKR/market_data_cache/*.csv stay as plain files — they are the
+raw inputs that feed into the DuckDB pipeline.
 
 This is the canonical copy (DP/db.py). Finbert_NLP_XGBoost/db.py is a thin
 shim that imports this file, same pattern as signal_scorer.py.
 
 Usage:
     import db
-    df = db.read_table("trump_truths_scored")     # -> DataFrame or None if missing
-    db.write_table("trump_truths_scored", df)      # overwrite/create table
-    db.append_table("trump_truths_scored", new_df) # append rows (creates if missing)
+    df = db.read_table("posts_scored")     # -> DataFrame or None if missing
+    db.write_table("posts_scored", df)      # overwrite/create table
+    db.append_table("posts_scored", new_df) # append rows (creates if missing)
     if db.table_exists("eval_report"): ...
 """
 
@@ -74,7 +75,6 @@ def write_table(table, df, con=None):
             con.close()
 
 
-<<<<<<< HEAD
 def query(sql, con=None):
     """Run arbitrary SQL and return a DataFrame (or None on error)."""
     own = con is None
@@ -102,8 +102,6 @@ def rename_table(old_name, new_name, con=None):
             con.close()
 
 
-=======
->>>>>>> origin/main
 def append_table(table, df, con=None):
     """Append rows of `df` to `table`, creating it (with df's schema) if it
     doesn't exist yet. Column order/types follow `df`."""

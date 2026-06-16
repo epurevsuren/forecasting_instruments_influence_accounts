@@ -88,7 +88,7 @@ INSTRUMENTS = [
     ("XLF",   C_stock("XLF"), "TRADES"),   # financials — rates/dereg
     ("XLE",   C_stock("XLE"), "TRADES"),   # energy — oil/drilling posts
 
-    # ---- commodities that Trump posts actually move ----
+    # ---- commodities that US President posts actually move ----
     ("COPPER", C_contfut("HG", "COMEX"),  "TRADES"),  # tariffs, China demand
     ("NATGAS", C_contfut("NG", "NYMEX"),  "TRADES"),  # LNG/export policy
 

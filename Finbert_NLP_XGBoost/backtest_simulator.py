@@ -92,8 +92,6 @@ for _p in (_HERE, _DP):
 
 import db                              # DuckDB helper (shim) -> ../database.db
 import build_final_training_set as B   # TICKERS
-import build_test_training_set as BT   # pick_interval, _yf_intraday, truncate_intraday,
-                                        # short_reaction_move, fetch_fine, BAR
 import predict_finbert_nlp_xgb as PR   # LABELS, temporal_factor, GATE_*
 
 NY = 'America/New_York'
@@ -107,6 +105,88 @@ LIVE_DIR = os.path.join(_HERE, "finbert_nlp_xgb_models_live")   # fine-tuned, up
 
 FINBERT = "ProsusAI/finbert"
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
+
+_ENTITIES_FILE = os.path.join(_DP, "geopolitical_entities.json")
+
+
+def _rank0_handle() -> str:
+    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json."""
+    try:
+        import json
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = json.load(f).get("primary_accounts", [])
+        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
+                    key=lambda a: a.get("rank", 99))
+        return ts[0]["account"] if ts else "us_president"
+    except Exception:
+        return "us_president"
+
+
+# ============================================================ yfinance helpers ----
+# Inlined from the former build_test_training_set.py (deleted — no longer a separate file).
+# Used only by recompute_near_cutoff_actuals() to refresh partial reaction bars
+# for posts within --near-window-min of the --until cutoff.
+
+FINE_REACH_DAYS = 59   # yfinance fine intervals (≤30m) go back ~60 calendar days
+
+BAR = pd.Timedelta('30min')   # default fallback bar width
+
+
+def pick_interval(elapsed_min: float) -> str:
+    """Choose the finest yfinance interval that covers elapsed_min minutes."""
+    if elapsed_min <= 5:
+        return '1m'
+    if elapsed_min <= 15:
+        return '5m'
+    if elapsed_min <= 30:
+        return '15m'
+    return '30m'
+
+
+def fetch_fine(interval: str, until: pd.Timestamp) -> dict:
+    """
+    Fetch intraday bars at `interval` for all B.TICKERS up to `until`.
+    Returns {short_name: DataFrame} or {} on failure.
+    """
+    import yfinance as yf
+    lookback = 7 if interval == '1m' else 60   # yfinance 1m limit = 7 days
+    start = until - pd.Timedelta(days=lookback)
+    result = {}
+    for name, (yf_sym, _) in B.TICKERS.items():
+        try:
+            df = yf.download(yf_sym,
+                             start=start,
+                             end=until + pd.Timedelta(hours=1),
+                             interval=interval,
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                continue
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
+            df.index = df.index.tz_convert(NY)
+            result[name] = df
+        except Exception:
+            pass
+    return result
+
+
+def short_reaction_move(bars, width: pd.Timedelta,
+                        post_ts: pd.Timestamp, until: pd.Timestamp):
+    """
+    % price move starting at post_ts over `width`, truncated at `until`.
+    Returns None if no bars fall in the window.
+    """
+    if bars is None or (hasattr(bars, 'empty') and bars.empty):
+        return None
+    end = min(post_ts + width, until)
+    window = bars[(bars.index >= post_ts) & (bars.index <= end)]
+    if len(window) < 1:
+        return None
+    open_price  = float(window['Close'].iloc[0])
+    close_price = float(window['Close'].iloc[-1])
+    if open_price == 0:
+        return None
+    return (close_price - open_price) / open_price * 100.0
 
 DIR_THRESHOLD_DEFAULT = 0.1   # |actual| %% move must exceed this to count toward direction accuracy
 NEAR_WINDOW_DEFAULT   = 60    # minutes — matches the 1h reaction window baked into *_Impact
@@ -273,36 +353,36 @@ def recompute_near_cutoff_actuals(df, until, impact_cols, near_window_min):
           f"recomputing PARTIAL reaction with fine yfinance bars (truncated at --until)...")
 
     days_back = (pd.Timestamp.now(tz=NY) - until).days
-    fine_ok = days_back <= BT.FINE_REACH_DAYS
-    intervals_needed = sorted({BT.pick_interval(min(m, 60)) for m in elapsed_min[near_mask]})
+    fine_ok = days_back <= FINE_REACH_DAYS
+    intervals_needed = sorted({pick_interval(min(m, 60)) for m in elapsed_min[near_mask]})
 
     fine = {}
     fallback30 = None
     if fine_ok:
         for iv in intervals_needed:
-            fine[iv] = BT.fetch_fine(iv, until)
+            fine[iv] = fetch_fine(iv, until)
     else:
         print(f"   ⚠️  --until is {days_back} days back — beyond yfinance's "
-              f"~{BT.FINE_REACH_DAYS}-day fine-interval reach; using 30m bars only.")
+              f"~{FINE_REACH_DAYS}-day fine-interval reach; using 30m bars only.")
     # always have a 30m fallback ready (cheap single call per ticker, only fetched if needed)
     def get_fallback30():
         nonlocal fallback30
         if fallback30 is None:
-            fallback30 = BT.fetch_fine('30m', until)
+            fallback30 = fetch_fine('30m', until)
         return fallback30
 
     for idx in near.index:
         row = df.loc[idx]
         elapsed = min(elapsed_min[idx], 60)
-        iv = BT.pick_interval(elapsed)
+        iv = pick_interval(elapsed)
         width = pd.Timedelta(minutes=int(iv[:-1]))
         for col in impact_cols:
             name = col.replace('_Impact', '')
             bars = fine.get(iv, {}).get(name)
-            move = BT.short_reaction_move(bars, width, row['date_ny'], until)
+            move = short_reaction_move(bars, width, row['date_ny'], until)
             if move is None:
                 fb = get_fallback30().get(name)
-                move = BT.short_reaction_move(fb, BT.BAR, row['date_ny'], until)
+                move = short_reaction_move(fb, BAR, row['date_ny'], until)
             df.at[idx, col] = move if move is not None else 0.0
     return df
 
@@ -339,11 +419,11 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         # Source / account metadata — pulled from the merged df (HS + scored columns)
         src       = str(row.get('source', 'truthsocial'))
         platform  = str(row.get('platform', src))   # prefer explicit platform col
-        account   = str(row.get('account', 'realDonaldTrump'))
+        account   = str(row.get('account', _rank0_handle()))
         acct_name = str(row.get('account_name', account))
         is_primary = (platform == 'truthsocial') or bool(row.get('is_primary', False))
         src_emoji = "🇺🇸" if is_primary else "🌍"
-        src_label = (f"{src_emoji} @realDonaldTrump  (TruthSocial)"
+        src_label = (f"{src_emoji} @{account}  (TruthSocial)"
                      if is_primary
                      else f"{src_emoji} @{account} · {acct_name}  (X/Twitter)")
 

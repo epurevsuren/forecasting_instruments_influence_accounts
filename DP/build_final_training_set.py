@@ -81,20 +81,34 @@ _HERE       = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import db  # DuckDB helper (DP/db.py) -> ../database.db
+import json
 
-CACHE_DIR   = os.path.join(_HERE, "..", "IBKR", "market_data_cache")
+CACHE_DIR      = os.path.join(_HERE, "..", "IBKR", "market_data_cache")
+_ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
+
+
+def _rank0_handle() -> str:
+    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json.
+    Falls back to 'us_president' if the file is missing or has no primary accounts."""
+    try:
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = json.load(f).get("primary_accounts", [])
+        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
+                    key=lambda a: a.get("rank", 99))
+        return ts[0]["account"] if ts else "us_president"
+    except Exception:
+        return "us_president"
 
 # DuckDB table names
-# posts_scored   replaces trump_truths_scored (unified: Trump + geo tweets)
-# posts_labeled  replaces trump_truths_labeled
-# One-time migration runs automatically on first use (see _migrate_old_tables).
+# posts_scored   unified NLP-scored posts (TruthSocial primary accounts + X/Twitter geo)
+# posts_labeled  posts joined with market-impact labels for model training
 SCORED_TABLE   = "posts_scored"
 FINAL_TABLE    = "truth_training_set_FINAL"
 HS_TABLE       = "truth_training_set_HIGH_SIGNAL"
 LABELED_TABLE  = "posts_labeled"
 
 # Baseline = simple average move of same instrument over prior 30 days.
-# Subtracted from actual move to get the abnormal (Trump-attributable) return.
+# Subtracted from actual move to get the abnormal (US President-attributable) return.
 BASELINE_DAYS        = 30    # prior 30 calendar days for expected-return baseline
 DOMINANCE_WINDOW_HRS = 2
 NLP_FLOOR_MULT       = 0.05
@@ -119,7 +133,7 @@ TICKERS = {
 }
 # 23 instruments — exactly what IBKR cached with full 2024-11→2026-05 history.
 # Cut per user: USD_KRW + SILVER + all Asian/EU indices
-# (failed download / no subscription / no clean Trump transmission).
+# (failed download / no subscription / no clean US President transmission).
 
 # Realistic 1hr move ceilings — caps daily-data noise on old posts.
 IMPACT_CAP = {
@@ -171,58 +185,7 @@ def compute_nlp_signal(row):
     return float(np.mean(parts)) if parts else 0.0
 
 
-def _migrate_old_tables() -> None:
-    """
-    One-time migrations:
-      trump_truths_labeled → posts_labeled  (adds source/platform cols with rank-0 defaults)
-      posts_labeled / truth_training_set_FINAL: is_trump → platform, source 'trump_truth' → 'truthsocial'
-    posts_scored migration is handled by signal_scorer._migrate_db_schema().
-    """
-    # Step 1: migrate trump_truths_labeled → posts_labeled if needed
-    if not db.table_exists(LABELED_TABLE) and db.table_exists("trump_truths_labeled"):
-        print("🔄 One-time migration: trump_truths_labeled → posts_labeled ...")
-        old = db.read_table("trump_truths_labeled")
-        if old is not None:
-            old = old.copy()
-            for col, default in [("source", "truthsocial"), ("platform", "truthsocial"),
-                                  ("is_primary", True),
-                                  ("entity_weight", 1.0), ("event_weight", 1.0),
-                                  ("account", "realDonaldTrump"), ("account_rank", 0)]:
-                if col not in old.columns:
-                    old[col] = default
-            if "is_trump" in old.columns:
-                old = old.drop(columns=["is_trump"])
-            db.write_table(LABELED_TABLE, old)
-            print(f"  ✅ Migrated {len(old)} rows (trump_truths_labeled kept intact)")
-
-    # Step 2: migrate is_trump → platform in posts_labeled and truth_training_set_FINAL
-    for table in (LABELED_TABLE, FINAL_TABLE, HS_TABLE):
-        df = db.read_table(table)
-        if df is None:
-            continue
-        changed = False
-        if "is_trump" in df.columns and "platform" not in df.columns:
-            df["platform"] = df["is_trump"].apply(
-                lambda x: "truthsocial" if bool(x) else "x_twitter")
-            df = df.drop(columns=["is_trump"])
-            changed = True
-            print(f"  🔄 {table}: is_trump → platform")
-        if "source" in df.columns:
-            mask = df["source"] == "trump_truth"
-            if mask.any():
-                df.loc[mask, "source"] = "truthsocial"
-                changed = True
-                print(f"  🔄 {table}: source 'trump_truth' → 'truthsocial' ({mask.sum()} rows)")
-        if "platform" in df.columns and "is_primary" not in df.columns:
-            df["is_primary"] = (df["platform"] == "truthsocial")
-            changed = True
-        if changed:
-            db.write_table(table, df)
-            print(f"  ✅ {table}: schema migrated")
-
-
 def load_scored():
-    _migrate_old_tables()
     print(f"\n📂 Loading {SCORED_TABLE} from {db.DB_PATH}...")
     scored = db.read_table(SCORED_TABLE)
     if scored is None:
@@ -231,13 +194,8 @@ def load_scored():
     scored['id'] = scored['id'].astype(str)
     if 'source' not in scored.columns:
         scored['source'] = 'truthsocial'
-    # Ensure platform column (migrate is_trump if needed)
     if 'platform' not in scored.columns:
-        if 'is_trump' in scored.columns:
-            scored['platform'] = scored['is_trump'].apply(
-                lambda x: 'truthsocial' if bool(x) else 'x_twitter')
-        else:
-            scored['platform'] = 'truthsocial'
+        scored['platform'] = 'truthsocial'
     if 'is_primary' not in scored.columns:
         scored['is_primary'] = (scored['platform'] == 'truthsocial')
     if 'entity_weight' not in scored.columns:
@@ -624,7 +582,7 @@ def train_columns(impact_cols):
     # sample_weight already incorporates them, but explicit columns let the model
     # learn non-linear interactions (e.g. geo tweet + high event_weight → high impact).
     # is_primary is a bool (1.0 = TruthSocial/rank-0, 0.0 = X/Twitter geo account).
-    base = ['date', 'text', 'source', 'platform', 'is_primary',
+    base = ['id', 'date', 'text', 'source', 'platform', 'is_primary',
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']
     return base + impact_cols

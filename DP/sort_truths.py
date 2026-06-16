@@ -1,5 +1,5 @@
 r"""
-sort_truths.py  -  one-time utility: sort trump_truths.csv by date ASCENDING.
+sort_truths.py  -  one-time utility: sort truth_social.csv by date ASCENDING.
 
 Rewrites the file in place (after a .bak backup), keeping the exact same columns,
 the original date strings and the UTF-8 BOM encoding - only the ROW ORDER changes.
@@ -15,7 +15,7 @@ import shutil
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CSV = os.path.join(_HERE, "trump_truths.csv")
+DEFAULT_CSV = os.path.join(_HERE, "truth_social.csv")
 
 
 def sort_csv(path=DEFAULT_CSV):

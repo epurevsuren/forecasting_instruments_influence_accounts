@@ -19,7 +19,7 @@ USAGE
   python x_tweets_retriever.py --handles ZelenskyyUa,IDF --since 20260601
   python x_tweets_retriever.py --handles ZelenskyyUa --dry-run
 
-OUTPUT SCHEMA (mirrors trump_truths.csv + two extra columns)
+OUTPUT SCHEMA (mirrors truth_social.csv + two extra columns)
 -------------------------------------------------------------
   id, date, text, url, favorites, retweets, replies, account, account_name
 """

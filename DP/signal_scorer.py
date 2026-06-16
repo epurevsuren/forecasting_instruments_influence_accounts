@@ -4,7 +4,7 @@ signal_scorer.py  —  UNIFIED FEED SCORER (config-driven)
 Reads ALL posts from the unified_feed DuckDB table (TruthSocial posts +
 English geopolitical X/Twitter posts) and writes NLP scores to posts_scored.
 
-Rank-0 primary account (currently @realDonaldTrump on TruthSocial):
+Rank-0 primary account (currently the US President on TruthSocial):
   entity_weight=1.0, event_weight=1.0 — highest trust, uncapped sample_weight.
 Geo X/Twitter accounts are discounted:
     sample_weight_geo = base_weight × entity_weight × event_weight × SOURCE_DISCOUNT
@@ -33,11 +33,8 @@ CLI:
   python signal_scorer.py --full     → full rebuild
 
 MIGRATION:
-  First run auto-migrates:
-    trump_truths_scored → posts_scored (adds source, platform, entity_weight,
-    event_weight columns with rank-0 defaults).
-    unified_feed / posts_scored: is_trump column → platform string.
-    source 'trump_truth' → 'truthsocial'.
+MIGRATION NOTE:
+  No migrations needed — fresh database only. Old trump_truths_* tables are no longer supported.
 """
 
 import os, re, json, sys
@@ -67,7 +64,22 @@ SCORED_TABLE      = "posts_scored"
 SOURCE_DISCOUNT   = 0.7      # X/Twitter geo posts: sample_weight capped at 70% of primary max
 GEO_WEIGHT_CAP    = 0.70     # hard ceiling for X/Twitter geo post sample_weight
 PRIMARY_WEIGHT_CAP = 1.00    # hard ceiling for rank-0 primary account sample_weight
-TRUMP_WEIGHT_CAP  = PRIMARY_WEIGHT_CAP  # backward-compat alias
+
+_ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
+
+
+def _rank0_handle() -> str:
+    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json.
+    Falls back to 'us_president' if the file is missing or empty."""
+    try:
+        import json
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = json.load(f).get("primary_accounts", [])
+        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
+                    key=lambda a: a.get("rank", 99))
+        return ts[0]["account"] if ts else "us_president"
+    except Exception:
+        return "us_president"
 
 
 def _resolve_config_path():
@@ -109,7 +121,7 @@ NOISE_REFS         = CONFIG["noise_refs"]
 FALLBACK_FIN_KW    = CONFIG["fallback_financial_keywords"]
 FALLBACK_NOISE_KW  = CONFIG["fallback_noise_keywords"]
 
-POLICY_COLS = [f for f in POLICY_FLAGS.keys() if f != "flag_covid_relief"]
+POLICY_COLS = [f for f in POLICY_FLAGS.keys() if f != "flag_pandemic_relief"]
 
 
 # ========================================================= policy flags ----
@@ -272,15 +284,11 @@ def _apply_entity_event_weight(df: pd.DataFrame) -> pd.DataFrame:
                      then capped at GEO_WEIGHT_CAP (0.70).
     The primary account always beats any geo post: a perfect geo post reaches at most 0.70.
     """
-    # is_primary: TruthSocial posts (rank-0 primary account) get uncapped weight.
-    # Support both new 'platform' column and legacy 'is_trump' / 'is_primary' columns.
+    # is_primary: TruthSocial posts (rank-0 primary / US President account) get uncapped weight.
     if "is_primary" in df.columns:
         is_primary = df["is_primary"].astype(bool).values
-    elif "platform" in df.columns:
-        is_primary = (df["platform"] == "truthsocial").values
     else:
-        # Fallback for legacy tables that still have is_trump
-        is_primary = df.get("is_trump", pd.Series(False, index=df.index)).astype(bool).values
+        is_primary = (df["platform"] == "truthsocial").values
 
     ew  = df["entity_weight"].fillna(1.0).astype(float).values
     evw = df["event_weight"].fillna(1.0).astype(float).values
@@ -293,82 +301,11 @@ def _apply_entity_event_weight(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ============================================== one-time table migration ----
-def _migrate_old_scored_table() -> None:
-    """
-    If trump_truths_scored exists and posts_scored does not, copy it over and
-    add the new columns (source, platform, entity_weight, event_weight)
-    with rank-0 defaults. Runs at most once.
-    """
-    if db.table_exists(SCORED_TABLE):
-        return
-    if not db.table_exists("trump_truths_scored"):
-        return
-    print("🔄 One-time migration: trump_truths_scored → posts_scored ...")
-    old = db.read_table("trump_truths_scored")
-    if old is None:
-        return
-    old = old.copy()
-    old["source"]        = "truthsocial"
-    old["platform"]      = "truthsocial"
-    old["is_primary"]    = True
-    old["entity_weight"] = 1.0
-    old["event_weight"]  = 1.0
-    if "account" not in old.columns:
-        old["account"] = "realDonaldTrump"
-    if "account_rank" not in old.columns:
-        old["account_rank"] = 0
-    if "mention_count" not in old.columns:
-        old["mention_count"] = None
-    # Drop legacy is_trump if present
-    if "is_trump" in old.columns:
-        old = old.drop(columns=["is_trump"])
-    db.write_table(SCORED_TABLE, old)
-    print(f"  ✅ Migrated {len(old)} rows (trump_truths_scored kept intact)")
-
-
-def _migrate_db_schema() -> None:
-    """
-    One-time schema migration for existing unified_feed and posts_scored tables:
-      - is_trump (bool) column → platform ('truthsocial' | 'x_twitter')
-      - is_primary (bool) derived from platform, stored for XGBoost features
-      - source 'trump_truth' → 'truthsocial'
-    Safe to call repeatedly — skips tables that are already up to date.
-    """
-    for table in (FEED_TABLE, SCORED_TABLE):
-        df = db.read_table(table)
-        if df is None:
-            continue
-        changed = False
-        # Migrate is_trump → platform
-        if "is_trump" in df.columns and "platform" not in df.columns:
-            df["platform"] = df["is_trump"].apply(
-                lambda x: "truthsocial" if bool(x) else "x_twitter")
-            df = df.drop(columns=["is_trump"])
-            changed = True
-            print(f"  🔄 {table}: is_trump → platform")
-        # Fix old source value
-        if "source" in df.columns:
-            mask = df["source"] == "trump_truth"
-            if mask.any():
-                df.loc[mask, "source"] = "truthsocial"
-                changed = True
-                print(f"  🔄 {table}: source 'trump_truth' → 'truthsocial' ({mask.sum()} rows)")
-        # Add is_primary if missing (needed by XGBoost feature set)
-        if "platform" in df.columns and "is_primary" not in df.columns:
-            df["is_primary"] = (df["platform"] == "truthsocial")
-            changed = True
-        if changed:
-            db.write_table(table, df)
-            print(f"  ✅ {table}: schema up to date")
-
-
 # ========================================= single-post scoring (predict) ----
 def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
                       entity_weight: float = 1.0,
                       event_weight:  float = 1.0,
-                      is_primary:    bool  = True,
-                      is_trump:      bool  = None):   # legacy alias for is_primary
+                      is_primary:    bool  = True):
     """
     Score ONE post → dict of all numeric features.
     Used by prediction scripts (they share the exact training config).
@@ -376,14 +313,8 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
 
     entity_weight / event_weight / is_primary let the caller supply the post's
     geo-context so sample_weight is accurate even for prediction-path geo posts.
-    Defaults (1.0, 1.0, True) match rank-0 primary account (TruthSocial) behaviour.
-
-    is_trump is a legacy alias for is_primary and takes precedence if supplied.
+    Defaults (1.0, 1.0, True) match rank-0 primary account (US President / TruthSocial).
     """
-    # Backward-compat: is_trump overrides is_primary if explicitly passed
-    if is_trump is not None:
-        is_primary = bool(is_trump)
-
     norm_div = CONFIG.get("norm_divisors",
                           {"policy_intensity_score": 8.0,
                            "hawkish_risk_score": 5.0,
@@ -392,7 +323,7 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
     tc  = re.sub(r"https?://\S+", "", str(text)).strip()
     row = {
         "date": pd.Timestamp.now(tz="UTC"),
-        "text": text, "text_clean": tc,
+        "text": text,
         "favorites": 0, "retweets": 0, "replies": 0,
         "is_primary": is_primary,
         "platform":   "truthsocial" if is_primary else "x_twitter",
@@ -454,13 +385,8 @@ def _prepare_feed_df(feed: pd.DataFrame) -> pd.DataFrame:
     feed["id"]   = feed["id"].astype(str)
     feed["date"] = pd.to_datetime(feed["date"], format="mixed", utc=True).dt.tz_convert("America/New_York")
     feed = feed.sort_values("date").reset_index(drop=True)
-    # Derive platform from legacy is_trump if needed
     if "platform" not in feed.columns:
-        if "is_trump" in feed.columns:
-            feed["platform"] = feed["is_trump"].apply(
-                lambda x: "truthsocial" if bool(x) else "x_twitter")
-        else:
-            feed["platform"] = "truthsocial"   # safe default
+        feed["platform"] = "truthsocial"   # safe default
     # is_primary: used in _apply_entity_event_weight and stored in posts_scored for XGBoost
     if "is_primary" not in feed.columns:
         feed["is_primary"] = (feed["platform"] == "truthsocial")
@@ -604,8 +530,6 @@ def main():
     print(f"  {FEED_TABLE}  →  {SCORED_TABLE}")
     print("=" * 64)
 
-    _migrate_old_scored_table()
-    _migrate_db_schema()
 
     feed = db.read_table(FEED_TABLE)
     if feed is None:
@@ -625,7 +549,7 @@ def main():
     print("\n🚀 Scoring all layers across unified feed (chronological)...")
     feed = _score_batch(feed, nlp, sbert)   # full-rebuild: no ctx
 
-    db.write_table(SCORED_TABLE, feed)
+    db.write_table(SCORED_TABLE, feed.drop(columns=["text_clean"], errors="ignore"))
 
     primary_df = feed[feed["is_primary"].astype(bool)] if "is_primary" in feed.columns else feed[feed["platform"] == "truthsocial"]
     geo_df     = feed[~feed["is_primary"].astype(bool)] if "is_primary" in feed.columns else feed[feed["platform"] == "x_twitter"]
@@ -652,8 +576,6 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
     print(f"  Config: {CONFIG_PATH}  (version {CONFIG.get('version', '?')})")
     print("=" * 64)
 
-    _migrate_old_scored_table()
-    _migrate_db_schema()
 
     feed = db.read_table(FEED_TABLE)
     if feed is None:
@@ -696,9 +618,8 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
     if len(ctx_recent) < novelty_window:
         ctx_recent = ctx.tail(novelty_window)
 
-    ctx_texts = ctx_recent["text_clean"].fillna("").astype(str).tolist() \
-                if "text_clean" in ctx_recent.columns \
-                else ctx_recent["text"].fillna("").astype(str).tolist()
+    ctx_texts = ctx_recent["text"].fillna("").astype(str).apply(
+                    lambda t: re.sub(r"https?://\S+", "", t).strip()).tolist()
     ctx_dates = list(ctx_recent["date"])
     ctx_raw   = list(ctx_recent["raw_score"].astype(float))
     print(f"⏰  Context: {len(ctx_recent)} recent scored posts "
@@ -719,7 +640,7 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
             new[c] = 0
     out = new.reindex(columns=scored_cols, fill_value=0)
 
-    db.append_table(SCORED_TABLE, out)
+    db.append_table(SCORED_TABLE, out.drop(columns=["text_clean"], errors="ignore"))
 
     primary_new = new[new["is_primary"].astype(bool)] if "is_primary" in new.columns else new[new["platform"] == "truthsocial"]
     geo_new     = new[~new["is_primary"].astype(bool)] if "is_primary" in new.columns else new[new["platform"] == "x_twitter"]

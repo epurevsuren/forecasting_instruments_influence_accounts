@@ -18,6 +18,21 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 NY = 'America/New_York'
 
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+_ENTITIES_FILE = os.path.join(_HERE, "..", "DP", "geopolitical_entities.json")
+
+
+def _rank0_handle() -> str:
+    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json."""
+    try:
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = json.load(f).get("primary_accounts", [])
+        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
+                    key=lambda a: a.get("rank", 99))
+        return ts[0]["account"] if ts else "us_president"
+    except Exception:
+        return "us_president"
+
 OUT_DIR = "finbert_nlp_xgb_models"
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -160,17 +175,13 @@ def parse_stamp(s):
 def predict(text, cfg, models, nlp, sbert, post_ts=None,
             entity_weight: float = 1.0,
             event_weight:  float = 1.0,
-            is_primary:    bool  = True,
-            is_trump:      bool  = None):   # legacy alias for is_primary
+            is_primary:    bool  = True):
     """Predict 1-hour market impacts for a post.
 
     entity_weight / event_weight / is_primary: supply these for geo-account posts
     so the NLP scorer applies the correct source-context weight (the same values
-    used during training). Defaults (1.0, 1.0, True) match rank-0 TruthSocial behaviour.
-    is_trump is a legacy alias for is_primary and takes precedence if supplied.
+    used during training). Defaults (1.0, 1.0, True) match rank-0 US President / TruthSocial.
     """
-    if is_trump is not None:
-        is_primary = bool(is_trump)
     feats = ss.score_single_post(
         text, nlp=nlp, sbert=sbert,
         feature_cols=cfg['nlp_features'],
@@ -206,14 +217,14 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
 
 
 def show(text, r, signal, gate, tfactor, tlabel,
-         account=None, account_name=None, is_primary=True, is_trump=None,
+         account=None, account_name=None, is_primary=True,
          entity_weight=1.0, event_weight=1.0):
-    if is_trump is not None:
-        is_primary = bool(is_trump)
     print("\n" + "-"*64)
     # Source attribution line
     if is_primary:
-        print("@realDonaldTrump - Donald J. Trump  (TruthSocial)")
+        handle   = account or _rank0_handle()
+        aname    = account_name or handle
+        print(f"@{handle} - {aname}  (TruthSocial)")
     else:
         handle = account or "unknown"
         aname  = account_name or handle
@@ -266,16 +277,17 @@ def main():
                          f"to use fine-tuned models from backtest_simulator.py --fine-tune.")
     ap.add_argument("--entity-weight", type=float, default=1.0,
                     help="Entity weight for the post account (0-1). "
-                         "Default 1.0 (Trump). For geo accounts: mention_count/28 "
-                         "for leaders, or fixed institution weight (e.g. IDF=0.70).")
+                         "Default 1.0 (rank-0 primary account). "
+                         "For geo accounts: mention_count/28 for leaders, "
+                         "or fixed institution weight (e.g. IDF=0.70).")
     ap.add_argument("--event-weight", type=float, default=1.0,
                     help="Event weight for the post account (0-1.3). "
-                         "Default 1.0 (Trump / no active events). "
+                         "Default 1.0 (no active events). "
                          "Use EventManager.get_account_multiplier(handle) for geo posts.")
-    ap.add_argument("--no-trump", dest="is_primary", action="store_false", default=True,
+    ap.add_argument("--geo-account", dest="is_primary", action="store_false", default=True,
                     help="Pass when predicting for a geo X/Twitter account post. "
-                         "Tells the NLP scorer is_primary=False so sample_weight "
-                         "applies the SOURCE_DISCOUNT correctly.")
+                         "Sets is_primary=False so sample_weight applies "
+                         "SOURCE_DISCOUNT correctly.")
     ap.add_argument("--account", default=None, metavar="HANDLE",
                     help="Twitter/X handle of the posting account (e.g. ZelenskyyUa). "
                          "Display only -- shown in the source attribution line.")
@@ -292,11 +304,15 @@ def main():
     print(f"  NLP gate: {'ON' if GATE_ENABLED else 'OFF'}   Type 'quit' to exit")
     if post_ts is not None:
         print(f"  Post time: {post_ts} (used for ambiguous time-of-day phrases)")
-    if not args.is_primary:
+    if args.is_primary:
+        handle = args.account or _rank0_handle()
+        aname  = args.account_name or handle
+        print(f"  Source: @{handle} - {aname}  (TruthSocial / rank-0 primary)")
+    else:
         handle = args.account or "unknown"
         aname  = args.account_name or handle
-        print(f"  Source: @{handle} - {aname}  "
-              f"(entity_w={args.entity_weight:.2f}  event_w={args.event_weight:.2f})")
+        print(f"  Source: @{handle} - {aname}  (X/Twitter geo)  "
+              f"entity_w={args.entity_weight:.2f}  event_w={args.event_weight:.2f}")
     print("="*64+"\n")
     while True:
         try:
