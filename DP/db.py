@@ -74,6 +74,7 @@ def write_table(table, df, con=None):
             con.close()
 
 
+<<<<<<< HEAD
 def query(sql, con=None):
     """Run arbitrary SQL and return a DataFrame (or None on error)."""
     own = con is None
@@ -101,6 +102,8 @@ def rename_table(old_name, new_name, con=None):
             con.close()
 
 
+=======
+>>>>>>> origin/main
 def append_table(table, df, con=None):
     """Append rows of `df` to `table`, creating it (with df's schema) if it
     doesn't exist yet. Column order/types follow `df`."""

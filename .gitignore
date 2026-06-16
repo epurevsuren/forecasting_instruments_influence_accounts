@@ -14,6 +14,10 @@ market_data_cache/
 *.err
 *.bak
 *.migrated_bak
+<<<<<<< HEAD
+=======
+*.html
+>>>>>>> origin/main
 
 # Local DuckDB database (all the data that used to be CSV/NPY/JSON)
 database.db
