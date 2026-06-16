@@ -28,6 +28,28 @@ import pandas as pd
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_HERE, "..", "database.db")
 
+# Tables whose (platform, id) pair must be globally unique.
+# A UNIQUE INDEX is created/ensured after every write or append to these tables.
+_UNIQUE_KEY_TABLES: dict[str, tuple[str, ...]] = {
+    "unified_feed":           ("platform", "id"),
+    "posts_scored":           ("platform", "id"),
+    "posts_labeled":          ("platform", "id"),
+    "training_set_FINAL":     ("platform", "id"),
+    "training_set_HIGH_SIGNAL": ("platform", "id"),
+}
+
+
+def _ensure_unique_index(table: str, con) -> None:
+    """Create UNIQUE INDEX on (platform, id) for tables that require it, if not present."""
+    cols = _UNIQUE_KEY_TABLES.get(table)
+    if not cols:
+        return
+    idx_name = f"ux_{table}_platform_id"
+    col_list = ", ".join(cols)
+    con.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} ON {table} ({col_list})"
+    )
+
 
 def get_connection():
     """New connection to database.db. Caller should close() it, or use a
@@ -70,6 +92,7 @@ def write_table(table, df, con=None):
         con.register("_tmp_write_df", df)
         con.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM _tmp_write_df")
         con.unregister("_tmp_write_df")
+        _ensure_unique_index(table, con)
     finally:
         if own:
             con.close()
@@ -96,28 +119,4 @@ def rename_table(old_name, new_name, con=None):
         if table_exists(old_name, con) and not table_exists(new_name, con):
             con.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
             return True
-        return False
-    finally:
-        if own:
-            con.close()
-
-
-def append_table(table, df, con=None):
-    """Append rows of `df` to `table`, creating it (with df's schema) if it
-    doesn't exist yet. Column order/types follow `df`."""
-    own = con is None
-    con = con or get_connection()
-    try:
-        con.register("_tmp_append_df", df)
-        if table_exists(table, con):
-            cols = con.execute(f"SELECT * FROM {table} LIMIT 0").fetchdf().columns.tolist()
-            df2 = df.reindex(columns=cols)
-            con.unregister("_tmp_append_df")
-            con.register("_tmp_append_df", df2)
-            con.execute(f"INSERT INTO {table} SELECT * FROM _tmp_append_df")
-        else:
-            con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp_append_df")
-        con.unregister("_tmp_append_df")
-    finally:
-        if own:
-            con.close()
+       
