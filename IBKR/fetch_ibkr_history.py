@@ -267,90 +267,122 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         return
 
     # ── CONTINUOUS FUTURES special path ──────────────────────────────────
-    # ContFuture FORBIDS endDateTime (Error 10339) and only covers ~12 months.
-    # Strategy:
-    #   A) ContFuture with empty endDateTime — only if `until` is within the
-    #      last 14 months (otherwise this contract covers none of our window).
-    #   B) Dated expired contracts (includeExpired=True) — month-by-month back
-    #      to `since`.  Dated futures DO allow endDateTime.
+    # ContFuture FORBIDS endDateTime (Error 10339). Strategy:
+    #   A) ContFuture with empty endDateTime, progressively longer durations.
+    #      IBKR supports up to "5 Y" for 30-min bars via the rolled continuous
+    #      series. Data arrives up to *now* and is trimmed to [since, until].
+    #      This is the PRIMARY path — always tried first.
+    #   B) Dated expired contracts (includeExpired=True) — only for the last
+    #      ~2 years since IBKR drops definitions for older contracts.
+    #      Has a bail-out after 5 consecutive qualify failures.
     is_contfut = type(contract).__name__ == "ContFuture"
     if is_contfut:
         new_frames = []
         c = qualified[0] if isinstance(qualified, list) else contract
-        days_to_now = (pd.Timestamp.now(tz=NY) - until).days
 
-        # ---- A) recent year via continuous (skip if until is far in the past) ----
-        use_continuous = days_to_now < 400
-        if use_continuous:
-            have_recent = False
-            if len(existing):
-                latest_cached = existing['date'].max()
-                if latest_cached >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=10)):
-                    have_recent = True
-                    print(f"     💾 {name}: recent year already cached, skipping continuous pull")
+        # ---- A) continuous contract — always try, trim to [since, until] after ----
+        # Check if existing cache already fully covers the window.
+        cache_covers = False
+        if len(existing):
+            ec_min = existing['date'].min()
+            ec_max = existing['date'].max()
+            if ec_min <= since_utc + pd.Timedelta(days=5) and ec_max >= until_utc - pd.Timedelta(days=5):
+                cache_covers = True
+                print(f"     💾 {name}: cache already covers [{since.date()} → {until.date()}], "
+                      f"skipping continuous pull")
 
-            if not have_recent:
-                for dur in ["180 D", "120 D", "270 D", "365 D", "90 D"]:
-                    try:
-                        bars = ib.reqHistoricalData(
-                            c, endDateTime="", durationStr=dur,
-                            barSizeSetting=BAR_SIZE, whatToShow=what_to_show,
-                            useRTH=0, formatDate=2, timeout=180,
-                        )
-                        if bars:
-                            new_frames.append(pd.DataFrame([{
-                                'date': b.date, 'open': b.open, 'high': b.high,
-                                'low': b.low, 'close': b.close, 'volume': b.volume,
-                            } for b in bars]))
-                            print(f"     ✓ {name}: {len(bars)} recent bars ({dur})")
-                            time.sleep(THROTTLE_SEC)
-                            break
+        if not cache_covers:
+            # Try progressively longer durations. "5 Y" covers ~2021→now.
+            # For 2016 data, IBKR may only support back to ~5 years via ContFuture;
+            # any remaining gap falls back to dated contracts (section B).
+            CONTFUT_DURATIONS = ["5 Y", "3 Y", "2 Y", "365 D", "270 D", "180 D"]
+            for dur in CONTFUT_DURATIONS:
+                try:
+                    bars = ib.reqHistoricalData(
+                        c, endDateTime="", durationStr=dur,
+                        barSizeSetting=BAR_SIZE, whatToShow=what_to_show,
+                        useRTH=0, formatDate=2, timeout=300,
+                    )
+                    if bars:
+                        new_frames.append(pd.DataFrame([{
+                            'date': b.date, 'open': b.open, 'high': b.high,
+                            'low': b.low, 'close': b.close, 'volume': b.volume,
+                        } for b in bars]))
+                        earliest = pd.to_datetime(bars[0].date, utc=True)
+                        print(f"     ✓ {name}: {len(bars)} bars via ContFuture ({dur}) "
+                              f"earliest={earliest.date()}")
                         time.sleep(THROTTLE_SEC)
-                    except Exception as e:
-                        print(f"     ⚠️  {name} recent {dur}: {str(e)[:45]}")
-                        time.sleep(THROTTLE_SEC)
-        else:
-            print(f"     ℹ️  {name}: --until is {days_to_now} days ago — "
-                  f"skipping continuous path, using dated contracts only")
+                        break
+                    time.sleep(THROTTLE_SEC)
+                except Exception as e:
+                    print(f"     ⚠️  {name} ContFuture {dur}: {str(e)[:55]}")
+                    time.sleep(THROTTLE_SEC)
 
-        # ---- B) dated expired contracts to cover [since, until] ----
+        # ---- B) dated expired contracts — fills gap between `since` and what ----
+        #         ContFuture covered. Bail out after 5 consecutive qualify failures
+        #         (IBKR drops contract definitions older than ~2 years).
         base_sym = contract.symbol
         exch     = contract.exchange
         expiries = _gen_futures_expiries(base_sym, since, until)
-        print(f"     📅 {name}: {len(expiries)} contract months to check "
-              f"({expiries[0] if expiries else '–'} → {expiries[-1] if expiries else '–'})")
 
+        # Determine earliest bar already fetched (from ContFuture + existing cache)
+        frames_so_far = ([existing] if len(existing) else []) + new_frames
+        if frames_so_far:
+            tmp = pd.concat(frames_so_far, ignore_index=True)
+            tmp['date'] = pd.to_datetime(tmp['date'], utc=True)
+            earliest_have = tmp['date'].min()
+        else:
+            earliest_have = until_utc  # nothing yet
+
+        # Only attempt dated contracts for months not yet covered
+        gap_months = []
         for ym in expiries:
-            ym_month = f"{ym[:4]}-{ym[4:6]}"
-            if ym_month in cached_months:
-                continue
-            try:
-                fut = Future(symbol=base_sym, exchange=exch, currency="USD",
-                             lastTradeDateOrContractMonth=ym, includeExpired=True)
-                q = ib.qualifyContracts(fut)
-                if not q:
-                    print(f"     ⚠️  {name} {ym}: could not qualify expired contract")
+            ym_ts = pd.Timestamp(ym + "01", tz="UTC")
+            if ym_ts < earliest_have - pd.Timedelta(days=45):
+                gap_months.append(ym)
+
+        if gap_months:
+            print(f"     📅 {name}: {len(gap_months)} gap months to try via dated contracts "
+                  f"({gap_months[0]} → {gap_months[-1]})")
+            consec_qualify_fails = 0
+            for ym in gap_months:
+                ym_month = f"{ym[:4]}-{ym[4:6]}"
+                if ym_month in cached_months:
                     continue
-                # End at the expiry month-end, pull 90 days back (active window)
-                end_dt = (
-                    (pd.Timestamp(ym + "01") + pd.offsets.MonthEnd(0))
-                    .strftime("%Y%m%d %H:%M:%S")
-                )
-                bars = ib.reqHistoricalData(
-                    q[0], endDateTime=end_dt, durationStr="90 D",
-                    barSizeSetting=BAR_SIZE, whatToShow=what_to_show,
-                    useRTH=0, formatDate=2, timeout=90,
-                )
-                if bars:
-                    new_frames.append(pd.DataFrame([{
-                        'date': b.date, 'open': b.open, 'high': b.high,
-                        'low': b.low, 'close': b.close, 'volume': b.volume,
-                    } for b in bars]))
-                    print(f"     ✓ {name}: {len(bars)} bars from expired {ym}")
-                time.sleep(THROTTLE_SEC)
-            except Exception as e:
-                print(f"     ⚠️  {name} expired {ym}: {str(e)[:45]}")
-                time.sleep(THROTTLE_SEC)
+                if consec_qualify_fails >= 5:
+                    print(f"     ⏭️  {name}: 5 consecutive qualify failures — "
+                          f"IBKR doesn't retain definitions this far back. Stopping.")
+                    break
+                try:
+                    fut = Future(symbol=base_sym, exchange=exch, currency="USD",
+                                 lastTradeDateOrContractMonth=ym, includeExpired=True)
+                    q = ib.qualifyContracts(fut)
+                    if not q:
+                        consec_qualify_fails += 1
+                        continue
+                    consec_qualify_fails = 0
+                    end_dt = (
+                        (pd.Timestamp(ym + "01") + pd.offsets.MonthEnd(0))
+                        .strftime("%Y%m%d %H:%M:%S")
+                    )
+                    bars = ib.reqHistoricalData(
+                        q[0], endDateTime=end_dt, durationStr="90 D",
+                        barSizeSetting=BAR_SIZE, whatToShow=what_to_show,
+                        useRTH=0, formatDate=2, timeout=90,
+                    )
+                    if bars:
+                        new_frames.append(pd.DataFrame([{
+                            'date': b.date, 'open': b.open, 'high': b.high,
+                            'low': b.low, 'close': b.close, 'volume': b.volume,
+                        } for b in bars]))
+                        print(f"     ✓ {name}: {len(bars)} bars from expired {ym}")
+                    time.sleep(THROTTLE_SEC)
+                except Exception as e:
+                    consec_qualify_fails += 1
+                    print(f"     ⚠️  {name} expired {ym}: {str(e)[:45]}")
+                    time.sleep(THROTTLE_SEC)
+        else:
+            print(f"     ✓ {name}: ContFuture already covers window — skipping dated contracts")
 
         if new_frames:
             combined = pd.concat(
