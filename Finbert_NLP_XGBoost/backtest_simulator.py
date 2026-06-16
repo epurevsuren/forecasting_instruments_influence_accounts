@@ -279,13 +279,13 @@ def load_window(since, until):
         sys.exit(f"❌ {SCORED_TABLE} not found — run signal_scorer.py first.")
     scored['id'] = scored['id'].astype(str)
     scored['date'] = pd.to_datetime(scored['date'], format='mixed', utc=True)
-    scored = scored.drop_duplicates(subset=['date', 'text'])
+    scored = scored.drop_duplicates(subset=['uid'])
 
-    df = hs.merge(scored, on=['date', 'text'], how='left', suffixes=('', '_sc'))
-    n_missing = df['id'].isna().sum()
+    df = hs.merge(scored, on='uid', how='left', suffixes=('', '_sc'))
+    n_missing = df['uid'].isna().sum()
     if n_missing:
         print(f"  ⚠️  {n_missing} HIGH_SIGNAL post(s) had no NLP-feature match in "
-              f"{SCORED_TABLE} (date/text mismatch) — will use 0-filled features.")
+              f"{SCORED_TABLE} (uid mismatch) — will use 0-filled features.")
     df['id'] = df['id'].astype(str)
     return df
 
@@ -295,21 +295,21 @@ def load_embeddings(df):
     emb_cached = db.read_table(EMB_TABLE)
     cache = {}
     if emb_cached is not None:
-        emb_cached = emb_cached.set_index(emb_cached['id'].astype(str))
+        emb_cached = emb_cached.set_index(emb_cached['uid'].astype(str))
         cache = {i: np.array(v, dtype=np.float32) for i, v in emb_cached['embedding'].items()}
 
-    ids = df['id'].tolist()
-    missing_idx = [i for i, pid in enumerate(ids) if pid not in cache]
+    uids = df['uid'].astype(str).tolist()
+    missing_idx = [i for i, uid in enumerate(uids) if uid not in cache]
     if missing_idx:
-        print(f"  🔢 {len(missing_idx)}/{len(ids)} posts missing cached embeddings — "
+        print(f"  🔢 {len(missing_idx)}/{len(uids)} posts missing cached embeddings — "
               f"computing live with FinBERT...")
         fresh = embed_texts(df.loc[missing_idx, 'text'].tolist())
         for j, i in enumerate(missing_idx):
-            cache[ids[i]] = fresh[j]
+            cache[uids[i]] = fresh[j]
     else:
-        print(f"  ✅ All {len(ids)} embeddings found in cache")
+        print(f"  ✅ All {len(uids)} embeddings found in cache")
 
-    return np.vstack([cache[pid] for pid in ids])
+    return np.vstack([cache[uid] for uid in uids])
 
 
 def load_models(model_dir, instruments):
@@ -421,11 +421,16 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         platform  = str(row.get('platform', src))   # prefer explicit platform col
         account   = str(row.get('account', _rank0_handle()))
         acct_name = str(row.get('account_name', account))
-        is_primary = (platform == 'truthsocial') or bool(row.get('is_primary', False))
-        src_emoji = "🇺🇸" if is_primary else "🌍"
-        src_label = (f"{src_emoji} @{account}  (TruthSocial)"
-                     if is_primary
-                     else f"{src_emoji} @{account} · {acct_name}  (X/Twitter)")
+        # is_primary comes from posts_scored (rank-0 TruthSocial only).
+        # Don't override with platform check — a secondary TruthSocial account
+        # (rank > 0, e.g. a future candidate) is not is_primary.
+        is_primary = bool(row.get('is_primary', False))
+        country = PR._country_for(account)
+        ctry_str = f"  [{country}]" if country else ""
+        src_emoji = "🇺🇸" if (platform == 'truthsocial') else "🌍"
+        src_label = (f"{src_emoji} @{account}{ctry_str}  (TruthSocial)"
+                     if platform == 'truthsocial'
+                     else f"{src_emoji} @{account} · {acct_name}{ctry_str}  (X/Twitter)")
 
         print("\n" + "─" * 78)
         print(f"#{row_i+1}/{len(df)}  {row['date_ny']:%Y-%m-%d %H:%M %Z}{near_tag}")
@@ -440,6 +445,7 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
             'platform': platform,
             'account': account,
             'account_name': acct_name,
+            'country': country,
             'date': row['date_ny'].isoformat(),
             'text': row['text'],
             'nlp_signal': signal,
@@ -659,7 +665,7 @@ def write_csv(csv_rows, csv_path, instruments):
     """
     import csv
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    fieldnames = ['id', 'source', 'platform', 'account', 'account_name',
+    fieldnames = ['id', 'source', 'platform', 'account', 'account_name', 'country',
                   'date', 'text',
                   'nlp_signal', 'gate', 'temporal_label', 'total_mult']
     for inst in instruments:
@@ -824,9 +830,3 @@ def main():
         write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
-        fine_tune(df, X, cfg, args.model_dir, args.fine_tune_out,
-                  args.fine_tune_rounds, impact_cols)
-
-
-if __name__ == "__main__":
-    main()
