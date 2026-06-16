@@ -33,6 +33,45 @@ def _rank0_handle() -> str:
     except Exception:
         return "us_president"
 
+
+def _build_handle_country_map() -> dict:
+    """
+    Build {handle_lower: country_alpha2} from all entries in geopolitical_entities.json.
+    Covers primary_accounts (by 'account'), entities and institutions (by 'twitter_handle').
+    """
+    try:
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+
+    out: dict = {}
+    for a in data.get("primary_accounts", []):
+        h = a.get("account", "")
+        c = a.get("country", "")
+        if h and c:
+            out[h.lower()] = c
+    for section in (data.get("entities", []),
+                    data.get("institutions", {}).get("entries", [])):
+        for e in section:
+            raw = e.get("twitter_handle") or ""
+            h = raw.lstrip("@")
+            c = e.get("country", "")
+            if h and c:
+                out[h.lower()] = c
+    return out
+
+
+_HANDLE_COUNTRY: dict = {}   # loaded lazily once
+
+
+def _country_for(handle: str) -> str:
+    """Return ISO alpha-2 country code for a handle, or '' if unknown."""
+    global _HANDLE_COUNTRY
+    if not _HANDLE_COUNTRY:
+        _HANDLE_COUNTRY = _build_handle_country_map()
+    return _HANDLE_COUNTRY.get(str(handle).lower(), "")
+
 OUT_DIR = "finbert_nlp_xgb_models"
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -218,18 +257,22 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
 
 def show(text, r, signal, gate, tfactor, tlabel,
          account=None, account_name=None, is_primary=True,
-         entity_weight=1.0, event_weight=1.0):
+         entity_weight=1.0, event_weight=1.0, country=None):
     print("\n" + "-"*64)
     # Source attribution line
     if is_primary:
         handle   = account or _rank0_handle()
         aname    = account_name or handle
-        print(f"@{handle} - {aname}  (TruthSocial)")
+        ctry     = country or _country_for(handle)
+        ctry_str = f"  [{ctry}]" if ctry else ""
+        print(f"@{handle} - {aname}{ctry_str}  (TruthSocial)")
     else:
-        handle = account or "unknown"
-        aname  = account_name or handle
-        ew_str = f"entity_w={entity_weight:.2f}  event_w={event_weight:.2f}"
-        print(f"@{handle} - {aname}  (X/Twitter)   {ew_str}")
+        handle   = account or "unknown"
+        aname    = account_name or handle
+        ctry     = country or _country_for(handle)
+        ctry_str = f"  [{ctry}]" if ctry else ""
+        ew_str   = f"entity_w={entity_weight:.2f}  event_w={event_weight:.2f}"
+        print(f"@{handle} - {aname}{ctry_str}  (X/Twitter)   {ew_str}")
     print(f"POST: {text[:120]}{'...' if len(text)>120 else ''}")
     print(f"   NLP signal={signal:.3f}  gate x{gate:.2f}" +
           ("  (real signal - FULL move)" if gate >= 0.5 else "  (noise - damped)"))
@@ -307,11 +350,15 @@ def main():
     if args.is_primary:
         handle = args.account or _rank0_handle()
         aname  = args.account_name or handle
-        print(f"  Source: @{handle} - {aname}  (TruthSocial / rank-0 primary)")
+        ctry   = _country_for(handle)
+        ctry_str = f"  [{ctry}]" if ctry else ""
+        print(f"  Source: @{handle} - {aname}{ctry_str}  (TruthSocial / rank-0 primary)")
     else:
         handle = args.account or "unknown"
         aname  = args.account_name or handle
-        print(f"  Source: @{handle} - {aname}  (X/Twitter geo)  "
+        ctry   = _country_for(handle)
+        ctry_str = f"  [{ctry}]" if ctry else ""
+        print(f"  Source: @{handle} - {aname}{ctry_str}  (X/Twitter geo)  "
               f"entity_w={args.entity_weight:.2f}  event_w={args.event_weight:.2f}")
     print("="*64+"\n")
     while True:

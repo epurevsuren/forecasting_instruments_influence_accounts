@@ -441,7 +441,6 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
 
         csv_row = {
             'id': row['id'],
-            'source': src,
             'platform': platform,
             'account': account,
             'account_name': acct_name,
@@ -665,7 +664,7 @@ def write_csv(csv_rows, csv_path, instruments):
     """
     import csv
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    fieldnames = ['id', 'source', 'platform', 'account', 'account_name', 'country',
+    fieldnames = ['id', 'platform', 'account', 'account_name', 'country',
                   'date', 'text',
                   'nlp_signal', 'gate', 'temporal_label', 'total_mult']
     for inst in instruments:
@@ -830,3 +829,4 @@ def main():
         write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
+        fine_tune(df, X, cfg, args.mod

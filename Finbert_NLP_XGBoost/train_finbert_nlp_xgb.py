@@ -129,10 +129,9 @@ def main():
     feats = feats[feats['date'] <= _bound_utc].copy()
     print(f"  🦆 {SCORED_TABLE}: {len(feats)} rows  (≤ {_bound_ny:%Y-%m-%d %H:%M %Z})")
 
-    # Merge on id: unique post identifier present in both truth_training_set_FINAL
-    # and posts_scored. Columns present in BOTH tables get no suffix from labels,
-    # _sc from feats — values are identical since both derive from the same unified_feed.
-    df = labels.merge(feats, on='id', how='inner', suffixes=('', '_sc'))
+    # Merge on uid: globally unique key "<source>_<id>" prevents cross-platform
+    # Snowflake ID collisions between TruthSocial and X/Twitter posts.
+    df = labels.merge(feats, on='uid', how='inner', suffixes=('', '_sc'))
     n_primary = int(df['is_primary'].sum()) if 'is_primary' in df.columns else '?'
     n_twitter = len(df) - (n_primary if isinstance(n_primary, int) else 0)
     print(f"  Merged rows: {len(df)}  (TruthSocial: {n_primary} | X/Twitter: {n_twitter})")
@@ -151,33 +150,33 @@ def main():
     # This avoids a full 13k-post re-embed when only geo tweets are new.
     emb_cached = db.read_table(EMB_TABLE)
     cache: dict = {}
-    if emb_cached is not None and 'id' in emb_cached.columns:
-        emb_cached = emb_cached.set_index(emb_cached['id'].astype(str))
+    if emb_cached is not None and 'uid' in emb_cached.columns:
+        emb_cached = emb_cached.set_index(emb_cached['uid'].astype(str))
         cache = {i: np.array(v, dtype=np.float32)
                  for i, v in emb_cached['embedding'].items()}
 
-    ids = df['id'].astype(str).tolist() if 'id' in df.columns else []
-    missing_idx = [i for i, pid in enumerate(ids) if pid not in cache]
+    uids = df['uid'].astype(str).tolist() if 'uid' in df.columns else []
+    missing_idx = [i for i, uid in enumerate(uids) if uid not in cache]
 
     if missing_idx:
-        print(f"  🔢 {len(missing_idx)}/{len(ids)} posts missing cached embeddings — "
+        print(f"  🔢 {len(missing_idx)}/{len(uids)} posts missing cached embeddings — "
               f"computing with FinBERT...")
         fresh = embed_texts(df.iloc[missing_idx]['text'].tolist())
         for j, i in enumerate(missing_idx):
-            cache[ids[i]] = fresh[j]
+            cache[uids[i]] = fresh[j]
         # Persist full updated cache
-        if ids:
+        if uids:
             emb_df = pd.DataFrame({
-                'id': list(cache.keys()),
+                'uid': list(cache.keys()),
                 'embedding': [v.tolist() for v in cache.values()],
             })
             db.write_table(EMB_TABLE, emb_df)
             print(f"  💾 Cached {len(emb_df)} embeddings → {EMB_TABLE}")
     else:
-        print(f"  ✅ All {len(ids)} embeddings found in cache")
+        print(f"  ✅ All {len(uids)} embeddings found in cache")
 
-    if ids:
-        X_emb = np.vstack([cache[pid] for pid in ids])
+    if uids:
+        X_emb = np.vstack([cache[uid] for uid in uids])
     else:
         # Fallback: embed everything (no id column — shouldn't happen with current schema)
         print("  ⚠️  no 'id' column in merged df — embeddings not cached")

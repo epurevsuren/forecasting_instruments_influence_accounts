@@ -197,7 +197,9 @@ def load_scored():
     if 'platform' not in scored.columns:
         scored['platform'] = 'truthsocial'
     if 'is_primary' not in scored.columns:
-        scored['is_primary'] = (scored['platform'] == 'truthsocial')
+        # rank-0 TruthSocial only — secondary TS accounts are NOT is_primary
+        _ar = scored['account_rank'].fillna(99).astype(float) if 'account_rank' in scored.columns else pd.Series(99.0, index=scored.index)
+        scored['is_primary'] = (scored['platform'] == 'truthsocial') & (_ar == 0)
     if 'entity_weight' not in scored.columns:
         scored['entity_weight'] = 1.0
     if 'event_weight' not in scored.columns:
@@ -581,8 +583,8 @@ def train_columns(impact_cols):
     # platform / is_primary / entity_weight / event_weight give XGB source-awareness.
     # sample_weight already incorporates them, but explicit columns let the model
     # learn non-linear interactions (e.g. geo tweet + high event_weight → high impact).
-    # is_primary is a bool (1.0 = TruthSocial/rank-0, 0.0 = X/Twitter geo account).
-    base = ['id', 'date', 'text', 'source', 'platform', 'is_primary',
+    # is_primary is a bool (1.0 = rank-0 TruthSocial only; 0.0 = secondary TruthSocial or X/Twitter geo).
+    base = ['uid', 'id', 'date', 'text', 'source', 'platform', 'is_primary',
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']
     return base + impact_cols
@@ -704,13 +706,10 @@ def main_incremental():
     if 'source' not in labeled_df.columns:
         labeled_df['source'] = 'truthsocial'
     # Dedup on (id, source) — safe across TruthSocial and X/Twitter posts
-    labeled_keys = set(zip(labeled_df['id'].astype(str), labeled_df['source']))
+    labeled_keys = set(labeled_df['uid'].astype(str))
     final_cols = list(final_df.columns)
 
-    new = scored[
-        ~scored.apply(lambda r: (str(r['id']), r.get('source', 'truthsocial')), axis=1)
-               .isin(labeled_keys)
-    ].copy()
+    new = scored[~scored['uid'].astype(str).isin(labeled_keys)].copy()
     print(f"\n  Already labeled: {len(labeled_keys)} | new to label: {len(new)}")
     if new.empty:
         print("✅ Nothing new to label — training set is up to date.")

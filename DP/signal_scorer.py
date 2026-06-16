@@ -279,25 +279,41 @@ def relative_signal_strength(df, score_col="raw_score", window_hours=2):
 # ========================================== entity / event weight helpers ----
 def _apply_entity_event_weight(df: pd.DataFrame) -> pd.DataFrame:
     """
-    For rank-0 primary account (TruthSocial): sample_weight unchanged (capped at 1.0).
-    For geo X/Twitter posts: sample_weight × entity_weight × event_weight × SOURCE_DISCOUNT,
-                     then capped at GEO_WEIGHT_CAP (0.70).
-    The primary account always beats any geo post: a perfect geo post reaches at most 0.70.
+    Three-tier sample_weight assignment:
+
+      rank-0 TruthSocial (is_primary=True):
+          clip(base_sw, 0.05, 1.0)           — no discount, full ceiling
+
+      secondary TruthSocial (is_primary=False, platform='truthsocial'):
+          clip(base_sw × ew × evw, 0.05, 1.0) — entity_weight scales it down,
+          but no SOURCE_DISCOUNT (still on the verified TruthSocial platform)
+
+      X/Twitter geo (is_primary=False, platform='x_twitter'):
+          clip(base_sw × ew × evw × SOURCE_DISCOUNT, 0.02, 0.70)
+          — SOURCE_DISCOUNT=0.7 ensures geo posts never exceed 70% of primary ceiling
+
+    Rank-0 always outweighs any other account: a perfect rank-0 post reaches 1.0,
+    a perfect secondary-TS post reaches entity_weight (≤1.0), a perfect geo post 0.70.
     """
-    # is_primary: TruthSocial posts (rank-0 primary / US President account) get uncapped weight.
     if "is_primary" in df.columns:
         is_primary = df["is_primary"].astype(bool).values
     else:
-        is_primary = (df["platform"] == "truthsocial").values
+        _ar = df["account_rank"].fillna(99).astype(float) if "account_rank" in df.columns else pd.Series(99.0, index=df.index)
+        is_primary = ((df["platform"] == "truthsocial") & (_ar == 0)).values
+
+    # secondary TruthSocial = on TS platform but NOT rank-0
+    is_ts_secondary = (~is_primary) & (df["platform"].fillna("") == "truthsocial").values
 
     ew  = df["entity_weight"].fillna(1.0).astype(float).values
     evw = df["event_weight"].fillna(1.0).astype(float).values
     base = df["sample_weight"].values.copy()
 
-    primary_sw = np.clip(base, 0.05, PRIMARY_WEIGHT_CAP)
-    geo_sw     = np.clip(base * ew * evw * SOURCE_DISCOUNT, 0.02, GEO_WEIGHT_CAP)
+    primary_sw  = np.clip(base,                              0.05, PRIMARY_WEIGHT_CAP)
+    ts_sec_sw   = np.clip(base * ew * evw,                  0.05, PRIMARY_WEIGHT_CAP)
+    geo_sw      = np.clip(base * ew * evw * SOURCE_DISCOUNT, 0.02, GEO_WEIGHT_CAP)
 
-    df["sample_weight"] = np.where(is_primary, primary_sw, geo_sw)
+    df["sample_weight"] = np.where(is_primary,     primary_sw,
+                          np.where(is_ts_secondary, ts_sec_sw, geo_sw))
     return df
 
 
@@ -387,9 +403,15 @@ def _prepare_feed_df(feed: pd.DataFrame) -> pd.DataFrame:
     feed = feed.sort_values("date").reset_index(drop=True)
     if "platform" not in feed.columns:
         feed["platform"] = "truthsocial"   # safe default
+    if "uid" not in feed.columns:
+        feed["uid"] = feed["source"].fillna("truthsocial") + "_" + feed["id"]
     # is_primary: used in _apply_entity_event_weight and stored in posts_scored for XGBoost
     if "is_primary" not in feed.columns:
-        feed["is_primary"] = (feed["platform"] == "truthsocial")
+        # is_primary = rank-0 TruthSocial ONLY (account_rank == 0).
+        # Secondary TruthSocial accounts (rank > 0, e.g. a future candidate)
+        # are NOT is_primary — they get entity_weight scaling without SOURCE_DISCOUNT.
+        _acct_rank = feed["account_rank"].fillna(99).astype(float) if "account_rank" in feed.columns else pd.Series(99.0, index=feed.index)
+        feed["is_primary"] = (feed["platform"] == "truthsocial") & (_acct_rank == 0)
     if "entity_weight" not in feed.columns: feed["entity_weight"] = 1.0
     if "event_weight"  not in feed.columns: feed["event_weight"]  = 1.0
     feed["text_clean"] = feed["text"].fillna("").apply(
@@ -590,14 +612,12 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
         return main()
 
     scored["id"] = scored["id"].astype(str)
-    if "source" not in scored.columns:
-        scored["source"] = "truthsocial"
-    existing_keys = set(zip(scored["id"], scored["source"]))
+    if "uid" not in scored.columns:
+        src = scored.get("source", pd.Series("truthsocial", index=scored.index)).fillna("truthsocial")
+        scored["uid"] = src + "_" + scored["id"]
+    existing_keys = set(scored["uid"].astype(str))
 
-    new = feed[
-        ~feed.apply(lambda r: (r["id"], r.get("source", "truthsocial")), axis=1)
-             .isin(existing_keys)
-    ].copy().reset_index(drop=True)
+    new = feed[~feed["uid"].isin(existing_keys)].copy().reset_index(drop=True)
 
     n_primary_new = int(new["is_primary"].sum()) if (len(new) and "is_primary" in new.columns) else 0
     n_twitter_new = len(new) - n_primary_new

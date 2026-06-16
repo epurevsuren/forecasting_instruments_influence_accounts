@@ -74,6 +74,7 @@ INSTITUTION_WEIGHTS: dict[str, float] = {
 }
 
 UNIFIED_FEED_COLS = [
+    "uid",           # globally unique: "<source>_<id>" e.g. "truthsocial_123" / "x_twitter_456"
     "id", "source", "platform",
     "account", "account_name", "account_rank", "mention_count",
     "entity_weight", "event_weight",
@@ -96,14 +97,21 @@ def _build_entity_map() -> dict:
     em = EventManager()
     out: dict = {}
 
-    # Named geo leaders
+    # Named geo leaders / election candidates
     for ent in data.get("entities", []):
         raw = ent.get("twitter_handle")
         if not raw:
             continue
         h = raw.lstrip("@")
         mc = int(ent.get("mention_count", 0))
-        ew = round(mc / MAX_MENTION_COUNT, 4)
+        # Explicit entity_weight overrides the mention_count formula.
+        # Use this for election candidates whose market impact doesn't correlate
+        # with how often the current rank-0 account has mentioned them
+        # (e.g. a Democratic opponent with mention_count=0 but real market relevance).
+        if "entity_weight" in ent:
+            ew = float(ent["entity_weight"])
+        else:
+            ew = round(mc / MAX_MENTION_COUNT, 4)
         out[h.lower()] = {
             "handle":        h,
             "name":          ent.get("name", h),
@@ -239,6 +247,7 @@ def _build_truths() -> pd.DataFrame:
 
     rows = pd.DataFrame(index=df.index)
     rows["id"]       = df["id"].astype(str)
+    rows["uid"]      = "truthsocial_" + rows["id"]
     rows["source"]   = "truthsocial"
     rows["platform"] = "truthsocial"
     rows["account"]  = df["account"]
@@ -294,6 +303,7 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
 
     rows = pd.DataFrame(index=df.index)
     rows["id"]           = df["id"].astype(str)
+    rows["uid"]          = "x_twitter_" + rows["id"]
     rows["source"]       = "x_twitter"
     rows["platform"]     = "x_twitter"
     rows["account"]      = handles
@@ -351,10 +361,8 @@ def sync(full: bool = False) -> int:
         _print_summary(combined)
         return len(combined)
 
-    existing_keys = set(zip(existing["id"].astype(str), existing["source"]))
-    new = combined[
-        ~combined.apply(lambda r: (r["id"], r["source"]), axis=1).isin(existing_keys)
-    ].copy()
+    existing_keys = set(existing["uid"].astype(str))
+    new = combined[~combined["uid"].isin(existing_keys)].copy()
 
     print(f"\n  Already in {FEED_TABLE}: {len(existing_keys)} | new: {len(new)}")
     if new.empty:
