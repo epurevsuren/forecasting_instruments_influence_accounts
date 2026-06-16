@@ -1,0 +1,20 @@
+# Ignore specific folders
+__pycache__/
+.venv/
+finbert_nlp_xgb_models/
+market_data_cache/
+
+# Ignore file extensions
+*.csv
+*.txt
+*.7z
+*.zip
+*.npy
+*.log
+*.err
+*.bak
+*.migrated_bak
+
+# Local DuckDB database (all the data that used to be CSV/NPY/JSON)
+database.db
+database.db.wal

@@ -1,0 +1,66 @@
+{
+  "description": "Geopolitical leaders, officials, and institutions monitored for market-moving posts across influence platforms (TruthSocial and X/Twitter). Entities are ranked by relevance (mention frequency + market-moving potential) with official platform handles and power-expiration dates (next election/term end; N/A if not subject to a competitive electoral term). The rank-0 primary influence account is listed separately under primary_accounts.",
+  "source": "trump_truths.csv (spaCy NER PERSON extraction over 7333 posts)",
+  "generated": "2026-06-16",
+  "primary_accounts": [
+    {
+      "rank": 0,
+      "name": "Donald J. Trump",
+      "platform": "truthsocial",
+      "account": "realDonaldTrump",
+      "account_name": "Donald J. Trump",
+      "entity_weight": 1.0,
+      "event_weight": 1.0,
+      "note": "Rank-0 primary influence account. Currently 47th U.S. President, Republican/MAGA aligned. Posts on TruthSocial. Rank-0 status is assigned to whoever holds the primary influence position — future rank-0 may differ (e.g. next U.S. president regardless of party, or a successor candidate)."
+    }
+  ],
+  "entities": [
+    {"rank": 1, "name": "Vladimir Putin", "country": "Russia", "role": "President", "mention_count": 68, "platform": "x_twitter", "twitter_handle": null, "expiration_date": "N/A", "note": "No personal X account; term nominally to 2030 but not a competitive election"},
+    {"rank": 2, "name": "Xi Jinping", "country": "China", "role": "President / CCP General Secretary", "mention_count": 52, "platform": "x_twitter", "twitter_handle": null, "expiration_date": "N/A", "note": "No personal X account; no term limit since 2018"},
+    {"rank": 3, "name": "Benjamin Netanyahu", "country": "Israel", "role": "Prime Minister", "mention_count": 28, "platform": "x_twitter", "twitter_handle": "@netanyahu", "expiration_date": "2026-10-27", "note": "Latest date for next Knesset election; office account @IsraeliPM"},
+    {"rank": 4, "name": "Volodymyr Zelenskyy", "country": "Ukraine", "role": "President", "mention_count": 25, "platform": "x_twitter", "twitter_handle": "@ZelenskyyUa", "expiration_date": "N/A", "note": "Term expired May 2024 but remains in office indefinitely under martial law; no scheduled election"},
+    {"rank": 5, "name": "Steve Witkoff", "country": "United States", "role": "Special Envoy to the Middle East", "mention_count": 18, "platform": "x_twitter", "twitter_handle": "@SteveWitkoff", "expiration_date": "N/A", "note": "Appointed envoy, serves at the President's pleasure; office account @SEPeaceMissions"},
+    {"rank": 6, "name": "Nicolas Maduro", "country": "Venezuela", "role": "President", "mention_count": 12, "platform": "x_twitter", "twitter_handle": "@NicolasMaduro", "expiration_date": "2031-01-10", "note": "Sworn in for third term Jan 2025; legitimacy disputed"},
+    {"rank": 7, "name": "Keir Starmer", "country": "United Kingdom", "role": "Prime Minister", "mention_count": 10, "platform": "x_twitter", "twitter_handle": "@Keir_Starmer", "expiration_date": "2029-08-15", "note": "Latest date for next UK general election; office account @10DowningStreet"},
+    {"rank": 8, "name": "Claudia Sheinbaum", "country": "Mexico", "role": "President", "mention_count": 8, "platform": "x_twitter", "twitter_handle": "@Claudiashein", "expiration_date": "2030-09-30"},
+    {"rank": 9, "name": "Narendra Modi", "country": "India", "role": "Prime Minister", "mention_count": 7, "platform": "x_twitter", "twitter_handle": "@narendramodi", "expiration_date": "2029-06"},
+    {"rank": 10, "name": "Javier Milei", "country": "Argentina", "role": "President", "mention_count": 7, "platform": "x_twitter", "twitter_handle": "@JMilei", "expiration_date": "2027-12-10"},
+    {"rank": 11, "name": "Mark Carney", "country": "Canada", "role": "Prime Minister", "mention_count": 7, "platform": "x_twitter", "twitter_handle": "@MarkJCarney", "expiration_date": "2029-10", "note": "Next federal election due by; office account @CanadianPM"},
+    {"rank": 12, "name": "Nikol Pashinyan", "country": "Armenia", "role": "Prime Minister", "mention_count": 7, "platform": "x_twitter", "twitter_handle": "@NikolPashinyan", "expiration_date": "2031-06", "note": "Civil Contract won 2026-06-07 election; next vote due ~5 years out"},
+    {"rank": 13, "name": "Ali Khamenei", "country": "Iran", "role": "Supreme Leader", "mention_count": 6, "platform": "x_twitter", "twitter_handle": "@khamenei_ir", "expiration_date": "N/A", "note": "Position for life, not elected"},
+    {"rank": 14, "name": "Emmanuel Macron", "country": "France", "role": "President", "mention_count": 6, "platform": "x_twitter", "twitter_handle": "@EmmanuelMacron", "expiration_date": "2027-05"},
+    {"rank": 15, "name": "Giorgia Meloni", "country": "Italy", "role": "Prime Minister", "mention_count": 5, "platform": "x_twitter", "twitter_handle": "@GiorgiaMeloni", "expiration_date": "2027-10"},
+    {"rank": 16, "name": "Friedrich Merz", "country": "Germany", "role": "Chancellor", "mention_count": 5, "platform": "x_twitter", "twitter_handle": "@_FriedrichMerz", "expiration_date": "2029-08", "note": "Official chancellor account @bundeskanzler"},
+    {"rank": 17, "name": "Ilham Aliyev", "country": "Azerbaijan", "role": "President", "mention_count": 5, "platform": "x_twitter", "twitter_handle": "@presidentaz", "expiration_date": "2031-02"},
+    {"rank": 18, "name": "Alexander Lukashenko", "country": "Belarus", "role": "President", "mention_count": 5, "platform": "x_twitter", "twitter_handle": null, "expiration_date": "N/A", "note": "No personal X account; not a competitive election"},
+    {"rank": 19, "name": "Mohammed bin Salman", "country": "Saudi Arabia", "role": "Crown Prince & Prime Minister", "mention_count": 4, "platform": "x_twitter", "twitter_handle": null, "expiration_date": "N/A", "note": "No confirmed official personal account; not elected"},
+    {"rank": 20, "name": "Luiz Inacio Lula da Silva", "country": "Brazil", "role": "President", "mention_count": 4, "platform": "x_twitter", "twitter_handle": "@LulaOficial", "expiration_date": "2027-01-01"},
+    {"rank": 21, "name": "Mohammed bin Zayed Al Nahyan", "country": "United Arab Emirates", "role": "President", "mention_count": 4, "platform": "x_twitter", "twitter_handle": "@MohamedBinZayed", "expiration_date": "N/A", "note": "Not elected by popular vote"}
+  ],
+  "excluded": {
+    "reason": "Low mention count and/or no longer holding the relevant office -- not worth tracking for market-relevance purposes",
+    "entries": [
+      {"name": "Justin Trudeau", "country": "Canada", "role": "Former Prime Minister", "mention_count": 11, "note": "Resigned March 2025, out of power"},
+      {"name": "Bashar al-Assad", "country": "Syria", "role": "Former President", "mention_count": 4, "note": "Ousted December 2024"},
+      {"name": "Tamim bin Hamad Al Thani", "country": "Qatar", "role": "Emir", "mention_count": 2},
+      {"name": "Hamad bin Isa Al Khalifa", "country": "Bahrain", "role": "King", "mention_count": 2},
+      {"name": "Anthony Albanese", "country": "Australia", "role": "Prime Minister", "mention_count": 1},
+      {"name": "Kim Jong Un", "country": "North Korea", "role": "Supreme Leader", "mention_count": 1}
+    ]
+  },
+  "institutions": {
+    "description": "Government departments, militaries, and embassy/MFA accounts on X/Twitter that often break geopolitical news (e.g. military incidents, strikes, casualties) before or independent of any individual leader's account — relevant for early-signal market monitoring.",
+    "entries": [
+      {"rank": 1, "name": "U.S. Department of War (formerly Department of Defense / Pentagon)", "country": "United States", "platform": "x_twitter", "twitter_handle": "@DeptofWar", "note": "Renamed from @DeptofDefense per Sept 2025 executive order; fallback @DeptofDefense if handle not found. Often first to confirm/deny military incidents (e.g. aircraft crashes, strikes)"},
+      {"rank": 2, "name": "The White House", "country": "United States", "platform": "x_twitter", "twitter_handle": "@WhiteHouse", "note": "Official statements, executive actions"},
+      {"rank": 3, "name": "U.S. Department of State", "country": "United States", "platform": "x_twitter", "twitter_handle": "@StateDept", "note": "Diplomatic/foreign policy statements"},
+      {"rank": 4, "name": "Israel Defense Forces (IDF)", "country": "Israel", "platform": "x_twitter", "twitter_handle": "@IDF", "note": "Frequently first to report strikes, operations, and military incidents in real time"},
+      {"rank": 5, "name": "Israel Ministry of Foreign Affairs", "country": "Israel", "platform": "x_twitter", "twitter_handle": "@IsraelMFA"},
+      {"rank": 6, "name": "Russian Ministry of Foreign Affairs", "country": "Russia", "platform": "x_twitter", "twitter_handle": "@mfa_russia"},
+      {"rank": 7, "name": "Government of Russia", "country": "Russia", "platform": "x_twitter", "twitter_handle": "@GovernmentRF", "note": "Inactive on X since ~2022; kept for monitoring in case of reactivation"},
+      {"rank": 8, "name": "Kremlin / President of Russia", "country": "Russia", "platform": "x_twitter", "twitter_handle": "@KremlinRussia_E", "note": "Inactive on X since ~2022; kept for monitoring in case of reactivation"},
+      {"rank": 9, "name": "Chinese Embassy in the United States", "country": "China", "platform": "x_twitter", "twitter_handle": "@ChineseEmbinUS", "note": "@ForeignChinese inactive since 2020; @ChineseEmbinUS is the active English-language channel used during tariff disputes. Also track @SpokespersonCHN (Hua Chunying, MFA English spokesperson)"},
+      {"rank": 10, "name": "Office of the Special Presidential Envoy for Peace Missions", "country": "United States", "platform": "x_twitter", "twitter_handle": "@SEPeaceMissions", "note": "Steve Witkoff's office account, frequently posts on Ukraine/Middle East negotiations"}
+    ]
+  }
+}

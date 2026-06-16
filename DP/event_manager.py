@@ -1,0 +1,293 @@
+"""
+event_manager.py
+================
+Manages geopolitical/macro events that modulate NLP scoring weight.
+
+Each event has a status and priority that together produce a float weight
+(0.0 – 1.3) used by the signal scorer to scale post-level scores when the
+post references accounts or assets linked to that event.
+
+USAGE
+-----
+  from event_manager import EventManager
+
+  em = EventManager()
+
+  # Weight for a single event
+  em.get_weight("ukraine_war")           # → 1.0
+
+  # All events affecting a tracked account
+  em.get_account_events("ZelenskyyUa")   # → [event dicts …]
+
+  # Highest applicable weight for an account (use as scorer multiplier)
+  em.get_account_multiplier("netanyahu") # → 1.0
+
+  # Update an event and persist to JSON
+  em.update_event("us_china_tariff_war", status="active",
+                   notes="90-day truce expired, tariffs reinstated")
+
+  # Print current event table
+  em.summary()
+
+CLI
+---
+  python event_manager.py                        # summary table
+  python event_manager.py --account ZelenskyyUa  # events for one account
+  python event_manager.py --update ukraine_war --status paused --notes "Ceasefire signed"
+"""
+
+import os
+import json
+import argparse
+from datetime import date, datetime
+from typing import Optional
+
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+EVENTS_FILE  = os.path.join(_HERE, "events.json")
+
+# ----------------------------------------------------------------- weights ----
+
+STATUS_WEIGHTS: dict[str, float] = {
+    "escalating": 1.3,
+    "active":     1.0,
+    "paused":     0.4,
+    "monitoring": 0.2,
+    "ended":      0.1,
+    "resolved":   0.05,
+}
+
+PRIORITY_MULTIPLIERS: dict[str, float] = {
+    "high":   1.0,
+    "medium": 0.6,
+    "low":    0.3,
+}
+
+
+# -------------------------------------------------------------- main class ----
+
+class EventManager:
+    """
+    Load, query, and update events.json.
+
+    Weight formula
+    --------------
+    effective_weight = STATUS_WEIGHTS[status] * PRIORITY_MULTIPLIERS[priority]
+
+    Example:
+      ukraine_war  → active (1.0) * high (1.0)   = 1.00
+      tariff_war   → paused (0.4) * high (1.0)   = 0.40
+      covid19      → ended  (0.1) * medium (0.6) = 0.06
+    """
+
+    def __init__(self, path: str = EVENTS_FILE):
+        self._path = path
+        self._data = self._load()
+
+    # ---------------------------------------------------------------- I/O ----
+
+    def _load(self) -> dict:
+        with open(self._path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save(self) -> None:
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False)
+
+    def reload(self) -> None:
+        """Re-read the JSON from disk (e.g. after manual edits)."""
+        self._data = self._load()
+
+    # ---------------------------------------------------------- accessors ----
+
+    @property
+    def events(self) -> list[dict]:
+        return self._data.get("events", [])
+
+    def get_event(self, event_id: str) -> Optional[dict]:
+        """Return the event dict or None."""
+        for ev in self.events:
+            if ev["id"] == event_id:
+                return ev
+        return None
+
+    def get_weight(self, event_id: str) -> float:
+        """
+        Effective scoring weight for one event.
+        Returns 0.0 if event not found.
+        """
+        ev = self.get_event(event_id)
+        if ev is None:
+            return 0.0
+        sw = STATUS_WEIGHTS.get(ev.get("status", ""), 0.0)
+        pm = PRIORITY_MULTIPLIERS.get(ev.get("priority", ""), 0.0)
+        return round(sw * pm, 4)
+
+    def get_active_events(self, min_weight: float = 0.1) -> list[dict]:
+        """
+        Return events whose effective weight >= min_weight.
+        Sorted by weight descending.
+        """
+        results = []
+        for ev in self.events:
+            w = self.get_weight(ev["id"])
+            if w >= min_weight:
+                results.append({**ev, "_weight": w})
+        return sorted(results, key=lambda x: x["_weight"], reverse=True)
+
+    def get_account_events(self, account_handle: str) -> list[dict]:
+        """
+        Return all events that list account_handle in affected_accounts.
+        Handle matching is case-insensitive and strips leading @.
+        """
+        handle = account_handle.lstrip("@").lower()
+        results = []
+        for ev in self.events:
+            affected = [a.lstrip("@").lower() for a in ev.get("affected_accounts", [])]
+            if handle in affected:
+                results.append({**ev, "_weight": self.get_weight(ev["id"])})
+        return sorted(results, key=lambda x: x["_weight"], reverse=True)
+
+    def get_account_multiplier(self, account_handle: str) -> float:
+        """
+        Single multiplier for a tracked account = max weight across all
+        events that affect it. Returns 1.0 if no events match (neutral).
+
+        Use this to scale the signal scorer's post-level score:
+            adjusted_score = base_score * em.get_account_multiplier(account)
+        """
+        evs = self.get_account_events(account_handle)
+        if not evs:
+            return 1.0
+        return max(ev["_weight"] for ev in evs)
+
+    def get_all_multipliers(self) -> dict[str, float]:
+        """Return {account_handle: multiplier} for every account in any event."""
+        handles: set[str] = set()
+        for ev in self.events:
+            for h in ev.get("affected_accounts", []):
+                handles.add(h.lstrip("@"))
+        return {h: self.get_account_multiplier(h) for h in sorted(handles)}
+
+    # --------------------------------------------------------------- mutate ----
+
+    def update_event(self, event_id: str, **kwargs) -> dict:
+        """
+        Update fields on an event and save to disk.
+
+        Common kwargs: status, priority, end_date, notes
+        Also auto-stamps updated_at.
+
+        Example:
+            em.update_event("us_china_tariff_war",
+                            status="active",
+                            notes="Truce expired 2025-08-12, tariffs reinstated")
+        """
+        ev = self.get_event(event_id)
+        if ev is None:
+            raise KeyError(f"Event not found: {event_id!r}")
+
+        allowed = {"status", "priority", "end_date", "notes", "description",
+                   "affected_accounts", "affected_assets", "tags"}
+        for key, val in kwargs.items():
+            if key not in allowed:
+                raise ValueError(f"Field {key!r} not updatable via update_event()")
+            if key == "status" and val not in STATUS_WEIGHTS:
+                raise ValueError(f"Unknown status {val!r}. Valid: {list(STATUS_WEIGHTS)}")
+            if key == "priority" and val not in PRIORITY_MULTIPLIERS:
+                raise ValueError(f"Unknown priority {val!r}. Valid: {list(PRIORITY_MULTIPLIERS)}")
+            ev[key] = val
+
+        ev["updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._save()
+        return ev
+
+    # ------------------------------------------------------------- display ----
+
+    def summary(self, min_weight: float = 0.0) -> None:
+        """Print a formatted event table to stdout."""
+        evs = [
+            {**ev, "_weight": self.get_weight(ev["id"])}
+            for ev in self.events
+            if self.get_weight(ev["id"]) >= min_weight
+        ]
+        evs.sort(key=lambda x: x["_weight"], reverse=True)
+
+        print(f"\n{'ID':<28} {'STATUS':<12} {'PRI':<8} {'WEIGHT':<8} {'START':<12} {'END':<12} NAME")
+        print("-" * 110)
+        for ev in evs:
+            print(
+                f"  {ev['id']:<26} "
+                f"{ev.get('status','?'):<12} "
+                f"{ev.get('priority','?'):<8} "
+                f"{ev['_weight']:<8.2f} "
+                f"{ev.get('start_date','?'):<12} "
+                f"{ev.get('end_date','N/A'):<12} "
+                f"{ev.get('name','')}"
+            )
+        print()
+
+
+# -------------------------------------------------------------------- CLI ----
+
+def _cli():
+    parser = argparse.ArgumentParser(
+        description="Query or update geopolitical events."
+    )
+    parser.add_argument("--account", metavar="HANDLE",
+                        help="Show events affecting this account")
+    parser.add_argument("--event", metavar="ID",
+                        help="Show detail for one event ID")
+    parser.add_argument("--update", metavar="ID",
+                        help="Event ID to update (use with --status / --notes / --end-date)")
+    parser.add_argument("--status",   help="New status value")
+    parser.add_argument("--priority", help="New priority value (high/medium/low)")
+    parser.add_argument("--end-date", dest="end_date", help="New end date (YYYY-MM-DD or N/A)")
+    parser.add_argument("--notes",    help="Update notes field")
+    parser.add_argument("--multipliers", action="store_true",
+                        help="Print current multiplier per account")
+    args = parser.parse_args()
+
+    em = EventManager()
+
+    if args.update:
+        kwargs = {}
+        if args.status:   kwargs["status"]   = args.status
+        if args.priority: kwargs["priority"] = args.priority
+        if args.end_date: kwargs["end_date"] = args.end_date
+        if args.notes:    kwargs["notes"]    = args.notes
+        ev = em.update_event(args.update, **kwargs)
+        print(f"Updated {ev['id']!r}: weight={em.get_weight(ev['id']):.2f}")
+
+    elif args.account:
+        handle = args.account.lstrip("@")
+        evs = em.get_account_events(handle)
+        mult = em.get_account_multiplier(handle)
+        print(f"\nEvents affecting @{handle}  (multiplier={mult:.2f})")
+        print("-" * 60)
+        for ev in evs:
+            print(f"  [{ev['_weight']:.2f}] {ev['id']}  ({ev['status']}, {ev['priority']})")
+            print(f"         {ev['name']}")
+        if not evs:
+            print("  (no matching events)")
+        print()
+
+    elif args.event:
+        ev = em.get_event(args.event)
+        if ev is None:
+            print(f"Event not found: {args.event!r}")
+        else:
+            print(json.dumps({**ev, "_weight": em.get_weight(ev["id"])}, indent=2))
+
+    elif args.multipliers:
+        print(f"\n{'ACCOUNT':<26} MULTIPLIER")
+        print("-" * 40)
+        for handle, mult in em.get_all_multipliers().items():
+            print(f"  {handle:<24} {mult:.2f}")
+        print()
+
+    else:
+        em.summary()
+
+
+if __name__ == "__main__":
+    _cli()
