@@ -20,8 +20,8 @@ Key concepts from research:
   - Significance via t-stat = AR / std(returns in estimation window)
   - Confounding control: NLP signal acts as the attribution filter
 
-Outputs: truth_training_set_FINAL.csv        (no hard tiers, continuous honest labels)
-         truth_training_set_HIGH_SIGNAL.csv  (sample_weight > 0.5 subset)
+Outputs: training_set_FINAL.csv        (no hard tiers, continuous honest labels)
+         training_set_HIGH_SIGNAL.csv  (sample_weight > 0.5 subset)
          posts_labeled                        (full metadata; also the incremental dedup ledger)
 
 CLI:
@@ -103,8 +103,8 @@ def _rank0_handle() -> str:
 # posts_scored   unified NLP-scored posts (TruthSocial primary accounts + X/Twitter geo)
 # posts_labeled  posts joined with market-impact labels for model training
 SCORED_TABLE   = "posts_scored"
-FINAL_TABLE    = "truth_training_set_FINAL"
-HS_TABLE       = "truth_training_set_HIGH_SIGNAL"
+FINAL_TABLE    = "training_set_FINAL"
+HS_TABLE       = "training_set_HIGH_SIGNAL"
 LABELED_TABLE  = "posts_labeled"
 
 # Baseline = simple average move of same instrument over prior 30 days.
@@ -191,9 +191,7 @@ def load_scored():
     if scored is None:
         print(f"❌ {SCORED_TABLE} not found — run signal_scorer.py first")
         sys.exit(1)
-    scored['id'] = scored['id'].astype(str)
-    if 'source' not in scored.columns:
-        scored['source'] = 'truthsocial'
+    scored['id'] = pd.to_numeric(scored['id'], errors='coerce').astype('Int64')
     if 'platform' not in scored.columns:
         scored['platform'] = 'truthsocial'
     if 'is_primary' not in scored.columns:
@@ -584,7 +582,7 @@ def train_columns(impact_cols):
     # sample_weight already incorporates them, but explicit columns let the model
     # learn non-linear interactions (e.g. geo tweet + high event_weight → high impact).
     # is_primary is a bool (1.0 = rank-0 TruthSocial only; 0.0 = secondary TruthSocial or X/Twitter geo).
-    base = ['uid', 'id', 'date', 'text', 'source', 'platform', 'is_primary',
+    base = ['id', 'date', 'text', 'platform', 'is_primary',
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']
     return base + impact_cols
@@ -703,13 +701,12 @@ def main_incremental():
 
     scored = load_scored()
     labeled_cols = list(labeled_df.columns)
-    if 'source' not in labeled_df.columns:
-        labeled_df['source'] = 'truthsocial'
-    # Dedup on (id, source) — safe across TruthSocial and X/Twitter posts
-    labeled_keys = set(labeled_df['uid'].astype(str))
+    # Dedup on (platform, id) — composite key safe across TruthSocial and X/Twitter
+    labeled_keys = set(zip(labeled_df['platform'], labeled_df['id'].astype(str)))
     final_cols = list(final_df.columns)
 
-    new = scored[~scored['uid'].astype(str).isin(labeled_keys)].copy()
+    scored_keys = list(zip(scored['platform'], scored['id'].astype(str)))
+    new = scored[[k not in labeled_keys for k in scored_keys]].copy()
     print(f"\n  Already labeled: {len(labeled_keys)} | new to label: {len(new)}")
     if new.empty:
         print("✅ Nothing new to label — training set is up to date.")

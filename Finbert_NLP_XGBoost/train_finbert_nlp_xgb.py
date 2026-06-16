@@ -14,7 +14,7 @@ FinBERT embeddings + signal_scorer NLP features → XGBoost, with real upgrades:
   6. Partial embed cache: re-embeds ONLY posts not in finbert_embeddings_v2,
      so adding geo tweets doesn't force a full 13k-post re-embed each run.
 
-Inputs:  truth_training_set_FINAL / posts_scored (database.db tables)
+Inputs:  training_set_FINAL / posts_scored (database.db tables)
          unified_feed labels include TruthSocial posts + English X/Twitter geo posts (13 k+ rows)
 Outputs: finbert_nlp_xgb_models/ (XGBoost model jsons + config.json)
          + finbert_embeddings_v2 / eval_report tables in database.db
@@ -30,7 +30,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
 import db  # DuckDB helper -> ../database.db
 
-LABEL_TABLE  = "truth_training_set_FINAL"
+LABEL_TABLE  = "training_set_FINAL"
 SCORED_TABLE = "posts_scored"
 EMB_TABLE    = "finbert_embeddings_v2"   # v2 = CLS+mean pooling
 EVAL_TABLE   = "eval_report"

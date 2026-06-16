@@ -6,7 +6,6 @@ Merges TruthSocial posts (truth_social.csv) and English geopolitical tweets
 America/New_York time.
 
 Each row is augmented with:
-  source          'truthsocial' | 'x_twitter'
   platform        'truthsocial' | 'x_twitter'  (factual, permanent per account)
   account         'realDonaldTrump' | twitter handle
   account_name    display name
@@ -18,10 +17,10 @@ Each row is augmented with:
 Rank-0 primary account gets entity_weight=1.0, event_weight=1.0 (highest trust).
 Geo X/Twitter accounts are discounted by SOURCE_DISCOUNT in signal_scorer.py.
 
-Dedup is keyed on (id, source): re-running is always safe.
+Dedup is keyed on (platform, id): re-running is always safe.
 
 CLI:
-  python sync_unified_feed.py           # incremental — only new (id, source) pairs
+  python sync_unified_feed.py           # incremental — only new (platform, id) pairs
   python sync_unified_feed.py --full    # full rebuild of unified_feed
 """
 
@@ -74,8 +73,7 @@ INSTITUTION_WEIGHTS: dict[str, float] = {
 }
 
 UNIFIED_FEED_COLS = [
-    "uid",           # globally unique: "<source>_<id>" e.g. "truthsocial_123" / "x_twitter_456"
-    "id", "source", "platform",
+    "id", "platform",
     "account", "account_name", "account_rank", "mention_count",
     "entity_weight", "event_weight",
     "date",          # America/New_York, ISO string
@@ -246,9 +244,7 @@ def _build_truths() -> pd.DataFrame:
         return primary_map.get(handle.lower(), {**_default, "account_name": handle})
 
     rows = pd.DataFrame(index=df.index)
-    rows["id"]       = df["id"].astype(str)
-    rows["uid"]      = "truthsocial_" + rows["id"]
-    rows["source"]   = "truthsocial"
+    rows["id"]       = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     rows["platform"] = "truthsocial"
     rows["account"]  = df["account"]
     rows["account_name"] = df["account"].map(
@@ -302,9 +298,7 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
     lookup_df = pd.DataFrame([_lookup(h) for h in handles], index=df.index)
 
     rows = pd.DataFrame(index=df.index)
-    rows["id"]           = df["id"].astype(str)
-    rows["uid"]          = "x_twitter_" + rows["id"]
-    rows["source"]       = "x_twitter"
+    rows["id"]           = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     rows["platform"]     = "x_twitter"
     rows["account"]      = handles
     rows["account_name"] = df.get("account_name", handles).fillna(handles)
@@ -353,7 +347,7 @@ def sync(full: bool = False) -> int:
         _print_summary(combined)
         return len(combined)
 
-    # Incremental: find (id, source) pairs not yet in the table
+    # Incremental: find (platform, id) pairs not yet in the table
     existing = db.read_table(FEED_TABLE)
     if existing is None:
         db.write_table(FEED_TABLE, combined)
@@ -361,8 +355,9 @@ def sync(full: bool = False) -> int:
         _print_summary(combined)
         return len(combined)
 
-    existing_keys = set(existing["uid"].astype(str))
-    new = combined[~combined["uid"].isin(existing_keys)].copy()
+    existing_keys = set(zip(existing["platform"], existing["id"].astype(str)))
+    combined_keys = list(zip(combined["platform"], combined["id"].astype(str)))
+    new = combined[[k not in existing_keys for k in combined_keys]].copy()
 
     print(f"\n  Already in {FEED_TABLE}: {len(existing_keys)} | new: {len(new)}")
     if new.empty:

@@ -398,13 +398,11 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
 def _prepare_feed_df(feed: pd.DataFrame) -> pd.DataFrame:
     """Normalise date, ensure required columns exist, add text_clean and is_primary."""
     feed = feed.copy()
-    feed["id"]   = feed["id"].astype(str)
+    feed["id"]   = pd.to_numeric(feed["id"], errors="coerce").astype("Int64")
     feed["date"] = pd.to_datetime(feed["date"], format="mixed", utc=True).dt.tz_convert("America/New_York")
     feed = feed.sort_values("date").reset_index(drop=True)
     if "platform" not in feed.columns:
         feed["platform"] = "truthsocial"   # safe default
-    if "uid" not in feed.columns:
-        feed["uid"] = feed["source"].fillna("truthsocial") + "_" + feed["id"]
     # is_primary: used in _apply_entity_event_weight and stored in posts_scored for XGBoost
     if "is_primary" not in feed.columns:
         # is_primary = rank-0 TruthSocial ONLY (account_rank == 0).
@@ -611,13 +609,11 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
         print("⚠️  No existing posts_scored — running full scoring instead.")
         return main()
 
-    scored["id"] = scored["id"].astype(str)
-    if "uid" not in scored.columns:
-        src = scored.get("source", pd.Series("truthsocial", index=scored.index)).fillna("truthsocial")
-        scored["uid"] = src + "_" + scored["id"]
-    existing_keys = set(scored["uid"].astype(str))
+    scored["id"] = pd.to_numeric(scored["id"], errors="coerce").astype("Int64")
+    existing_keys = set(zip(scored["platform"], scored["id"].astype(str)))
+    feed_keys = list(zip(feed["platform"], feed["id"].astype(str)))
 
-    new = feed[~feed["uid"].isin(existing_keys)].copy().reset_index(drop=True)
+    new = feed[[k not in existing_keys for k in feed_keys]].copy().reset_index(drop=True)
 
     n_primary_new = int(new["is_primary"].sum()) if (len(new) and "is_primary" in new.columns) else 0
     n_twitter_new = len(new) - n_primary_new

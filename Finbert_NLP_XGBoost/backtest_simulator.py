@@ -8,7 +8,7 @@ it is left completely untouched, see below).
 
 WHY THIS EXISTS
 ---------------
-truth_training_set_HIGH_SIGNAL / truth_training_set_FINAL already contain, for
+training_set_HIGH_SIGNAL / training_set_FINAL already contain, for
 every historical post, the REAL realized 1-hour market move (computed once by
 build_final_training_set.py from IBKR + yfinance history). For any post whose
 post-time + 60min already lies in the past relative to the simulated "now"
@@ -96,7 +96,7 @@ import predict_finbert_nlp_xgb as PR   # LABELS, temporal_factor, GATE_*
 
 NY = 'America/New_York'
 
-HS_TABLE     = "truth_training_set_HIGH_SIGNAL"
+HS_TABLE     = "training_set_HIGH_SIGNAL"
 SCORED_TABLE = "posts_scored"
 EMB_TABLE    = "finbert_embeddings_v2"
 
@@ -829,4 +829,9 @@ def main():
         write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
-        fine_tune(df, X, cfg, args.mod
+        fine_tune(df, X, cfg, args.model_dir, args.fine_tune_out,
+                  args.fine_tune_rounds, impact_cols)
+
+
+if __name__ == "__main__":
+    main()
