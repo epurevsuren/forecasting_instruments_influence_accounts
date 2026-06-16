@@ -277,16 +277,16 @@ def load_window(since, until):
     scored = db.read_table(SCORED_TABLE)
     if scored is None:
         sys.exit(f"❌ {SCORED_TABLE} not found — run signal_scorer.py first.")
-    scored['id'] = scored['id'].astype(str)
+    scored['id'] = pd.to_numeric(scored['id'], errors='coerce').astype('Int64')
+    hs['id']     = pd.to_numeric(hs['id'],     errors='coerce').astype('Int64')
     scored['date'] = pd.to_datetime(scored['date'], format='mixed', utc=True)
-    scored = scored.drop_duplicates(subset=['uid'])
+    scored = scored.drop_duplicates(subset=['platform', 'id'])
 
-    df = hs.merge(scored, on='uid', how='left', suffixes=('', '_sc'))
-    n_missing = df['uid'].isna().sum()
+    df = hs.merge(scored, on=['platform', 'id'], how='left', suffixes=('', '_sc'))
+    n_missing = df['account'].isna().sum()
     if n_missing:
         print(f"  ⚠️  {n_missing} HIGH_SIGNAL post(s) had no NLP-feature match in "
-              f"{SCORED_TABLE} (uid mismatch) — will use 0-filled features.")
-    df['id'] = df['id'].astype(str)
+              f"{SCORED_TABLE} ((platform, id) mismatch) — will use 0-filled features.")
     return df
 
 
@@ -294,22 +294,22 @@ def load_embeddings(df):
     print(f"📂 Loading cached embeddings ({EMB_TABLE}) ...")
     emb_cached = db.read_table(EMB_TABLE)
     cache = {}
-    if emb_cached is not None:
-        emb_cached = emb_cached.set_index(emb_cached['uid'].astype(str))
+    if emb_cached is not None and 'platform_id' in emb_cached.columns:
+        emb_cached = emb_cached.set_index(emb_cached['platform_id'].astype(str))
         cache = {i: np.array(v, dtype=np.float32) for i, v in emb_cached['embedding'].items()}
 
-    uids = df['uid'].astype(str).tolist()
-    missing_idx = [i for i, uid in enumerate(uids) if uid not in cache]
+    platform_ids = (df['platform'] + '_' + df['id'].astype(str)).tolist()
+    missing_idx = [i for i, pid in enumerate(platform_ids) if pid not in cache]
     if missing_idx:
-        print(f"  🔢 {len(missing_idx)}/{len(uids)} posts missing cached embeddings — "
+        print(f"  🔢 {len(missing_idx)}/{len(platform_ids)} posts missing cached embeddings — "
               f"computing live with FinBERT...")
         fresh = embed_texts(df.loc[missing_idx, 'text'].tolist())
         for j, i in enumerate(missing_idx):
-            cache[uids[i]] = fresh[j]
+            cache[platform_ids[i]] = fresh[j]
     else:
-        print(f"  ✅ All {len(uids)} embeddings found in cache")
+        print(f"  ✅ All {len(platform_ids)} embeddings found in cache")
 
-    return np.vstack([cache[uid] for uid in uids])
+    return np.vstack([cache[pid] for pid in platform_ids])
 
 
 def load_models(model_dir, instruments):
@@ -417,8 +417,7 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         near_tag = " [NEAR-CUTOFF, recomputed]" if row.get('is_near') else ""
 
         # Source / account metadata — pulled from the merged df (HS + scored columns)
-        src       = str(row.get('source', 'truthsocial'))
-        platform  = str(row.get('platform', src))   # prefer explicit platform col
+        platform  = str(row.get('platform', 'truthsocial'))
         account   = str(row.get('account', _rank0_handle()))
         acct_name = str(row.get('account_name', account))
         # is_primary comes from posts_scored (rank-0 TruthSocial only).
@@ -829,9 +828,4 @@ def main():
         write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
-        fine_tune(df, X, cfg, args.model_dir, args.fine_tune_out,
-                  args.fine_tune_rounds, impact_cols)
-
-
-if __name__ == "__main__":
-    main()
+       
