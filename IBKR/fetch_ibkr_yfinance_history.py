@@ -555,15 +555,16 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             combined = pd.DataFrame()
 
         # ---- C) yfinance daily gap fill ----
+        rows_before_fill = len(combined)
         combined = _merge_with_gap_fill(name, since, until, combined)
+        yf_added = len(combined) > rows_before_fill
 
-        # Trim to requested window and save
-        if len(combined):
-            combined = combined[
-                (combined["date"] >= since_utc) & (combined["date"] <= until_utc)
-            ].reset_index(drop=True)
-
-        if len(combined):
+        # Only write if something actually changed.
+        # Never trim the lower bound — the cache grows monotonically backwards.
+        # Only cap at until_utc to avoid storing future data beyond the run window.
+        should_save = bool(new_frames) or yf_added
+        if should_save and len(combined):
+            combined = combined[combined["date"] <= until_utc].reset_index(drop=True)
             combined.to_csv(cache_file, index=False)
             manifest[name] = {
                 "status": "ok", "rows": len(combined),
@@ -571,8 +572,12 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                 "last":  str(combined["date"].max()),
             }
             span = f"{combined['date'].min().date()} → {combined['date'].max().date()}"
-            src  = "fetched" if new_frames else "cached"
+            src  = "fetched+yf" if (new_frames and yf_added) else ("yf gap" if yf_added else "fetched")
             print(f"  ✅ {name:<12} {len(combined):>6} bars  ({span})  [{src}]")
+        elif len(combined):
+            span = f"{combined['date'].min().date()} → {combined['date'].max().date()}"
+            print(f"  💾 {name:<12} {len(combined):>6} bars  ({span})  [cached, no change]")
+            manifest[name] = {"status": "ok", "rows": len(combined)}
         else:
             print(f"  ❌ {name:<12} no data — futures subscription or yfinance ticker may be needed")
             manifest[name] = {"status": "no_data"}
@@ -658,23 +663,28 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         combined = pd.DataFrame()
 
     # yfinance daily gap fill — covers BTC/ETH pre-PAXOS, any early bail-out months
+    rows_before_fill = len(combined)
     combined = _merge_with_gap_fill(name, since, until, combined)
+    yf_added = len(combined) > rows_before_fill
 
-    # Trim and save
-    if len(combined):
-        combined = combined[
-            (combined["date"] >= since_utc) & (combined["date"] <= until_utc)
-        ].reset_index(drop=True)
-
-    if len(combined):
+    # Only write if something changed.
+    # Never trim the lower bound — historical data outside this run's window is kept.
+    # Only cap at until_utc to avoid storing future data beyond the run window.
+    should_save = bool(new_frames) or yf_added
+    if should_save and len(combined):
+        combined = combined[combined["date"] <= until_utc].reset_index(drop=True)
         combined.to_csv(cache_file, index=False)
         manifest[name] = {
             "status": "ok", "rows": len(combined),
             "first": str(combined["date"].min()),
             "last":  str(combined["date"].max()),
         }
+        src = "fetched+yf" if (new_frames and yf_added) else ("yf gap" if yf_added else "fetched")
         print(f"  ✅ {name:<12} {len(combined):>6} bars  "
-              f"(fetched {fetched} mo, cached {skipped} mo)")
+              f"(fetched {fetched} mo, cached {skipped} mo)  [{src}]")
+    elif len(combined):
+        print(f"  💾 {name:<12} {len(combined):>6} bars  [cached, no change]")
+        manifest[name] = {"status": "ok", "rows": len(combined)}
     else:
         print(f"  ❌ {name:<12} no data returned (IBKR subscription + yfinance both failed)")
         manifest[name] = {"status": "no_data"}
