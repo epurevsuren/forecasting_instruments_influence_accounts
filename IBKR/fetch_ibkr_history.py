@@ -334,12 +334,23 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         else:
             earliest_have = until_utc  # nothing yet
 
-        # Only attempt dated contracts for months not yet covered
-        gap_months = []
+        # Hard cutoff: IBKR only retains expired contract definitions for ~2 years.
+        # Attempting anything older always returns Error 200 — skip unconditionally.
+        ibkr_cutoff = (pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=2)).strftime("%Y%m")
+
+        gap_months, n_too_old = [], 0
         for ym in expiries:
             ym_ts = pd.Timestamp(ym + "01", tz="UTC")
             if ym_ts < earliest_have - pd.Timedelta(days=45):
-                gap_months.append(ym)
+                if ym >= ibkr_cutoff:
+                    gap_months.append(ym)
+                else:
+                    n_too_old += 1
+
+        if n_too_old:
+            print(f"     ⏭️  {name}: {n_too_old} gap months before "
+                  f"{ibkr_cutoff[:4]}-{ibkr_cutoff[4:6]} skipped "
+                  f"(IBKR only retains ~2 years of expired definitions)")
 
         if gap_months:
             print(f"     📅 {name}: {len(gap_months)} gap months to try via dated contracts "
@@ -350,14 +361,14 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                 if ym_month in cached_months:
                     continue
                 if consec_qualify_fails >= 5:
-                    print(f"     ⏭️  {name}: 5 consecutive qualify failures — "
-                          f"IBKR doesn't retain definitions this far back. Stopping.")
+                    print(f"     ⏭️  {name}: 5 consecutive qualify failures — stopping.")
                     break
                 try:
                     fut = Future(symbol=base_sym, exchange=exch, currency="USD",
                                  lastTradeDateOrContractMonth=ym, includeExpired=True)
                     q = ib.qualifyContracts(fut)
-                    if not q:
+                    # qualifyContracts returns [None] (not []) on Error 200 — must check q[0]
+                    if not q or q[0] is None:
                         consec_qualify_fails += 1
                         continue
                     consec_qualify_fails = 0
