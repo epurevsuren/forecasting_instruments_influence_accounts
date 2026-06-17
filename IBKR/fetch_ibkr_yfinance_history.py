@@ -1,15 +1,19 @@
 """
-fetch_ibkr_history.py
----------------------
+fetch_ibkr_yfinance_history.py
+------------------------------
 Downloads 30-min historical bars from Interactive Brokers, ONCE, and
 caches them locally. Re-runs read the cache and only fetch missing data.
 
-This breaks the yfinance 60-day wall: all your posts (Nov 2024 → now)
-get real intraday labels, not just the last 57 days.
+GAP FILL:
+  IBKR futures (ContFuture) reach back ~2–5 years for 30-min bars.
+  For any period that IBKR can't cover (too old), this script automatically
+  falls back to yfinance daily bars and prepends them to the same cache CSV.
+  This gives you full 8-year coverage: 30-min resolution where IBKR can
+  provide it, daily resolution for the historical gap.
 
 CACHING:
   market_data_cache/
-    SPY_30min.csv ... (full history per instrument)
+    SPY_30min.csv ... (full history per instrument — may mix 30-min + 1d bars)
     _manifest.json  (tracks cached date ranges)
   Re-running = instant, offline. Only fetches gaps.
 
@@ -20,18 +24,18 @@ SETUP (one time):
        ✅ Socket port = 7497 (TWS paper) / 7496 (TWS live)
                        / 4002 (Gateway paper) / 4001 (Gateway live)
        ✅ Trust 127.0.0.1
-  3. uv pip install ib_async pandas
-  4. uv run python fetch_ibkr_history.py 202606170000 --from 202411010000
+  3. uv pip install ib_async pandas yfinance
+  4. uv run python fetch_ibkr_yfinance_history.py 202606170000 --from 202411010000
 
 USAGE:
   # Full backfill from Nov 2016 to Nov 2024 (all instruments):
-  uv run python fetch_ibkr_history.py 202411010000 --from 201611010000
+  uv run python fetch_ibkr_yfinance_history.py 202411010000 --from 201611010000
 
-  # Update cache through today, starting from Nov 2024:
-  uv run python fetch_ibkr_history.py 202606170000 --from 202411010000
+  # Update cache through today:
+  uv run python fetch_ibkr_yfinance_history.py 202606170000 --from 202411010000
 
   # Only core 5 instruments:
-  uv run python fetch_ibkr_history.py 202606170000 --from 202411010000 --core-only
+  uv run python fetch_ibkr_yfinance_history.py 202606170000 --from 202411010000 --core-only
 
 Edit PORT below to match your TWS/Gateway mode.
 """
@@ -63,10 +67,10 @@ CHUNK        = "1 M"       # one month of 30-min bars per request
 # INSTRUMENT → IBKR CONTRACT MAPPING
 # Core 5 first so they finish in the first ~20 min.
 # ==========================================
-def C_stock(sym):            return Stock(sym, "SMART", "USD")
+def C_stock(sym):              return Stock(sym, "SMART", "USD")
 def C_index(sym, exch="CBOE"): return Index(sym, exch, "USD")
-def C_contfut(sym, exch):    return ContFuture(sym, exch, currency="USD")
-def C_fx(pair):              return Forex(pair)
+def C_contfut(sym, exch):      return ContFuture(sym, exch, currency="USD")
+def C_fx(pair):                return Forex(pair)
 
 # (name, contract, whatToShow)
 INSTRUMENTS = [
@@ -108,16 +112,45 @@ INSTRUMENTS = [
 
 CORE_NAMES = {"SPY", "VIX", "OIL", "GOLD", "BTC"}
 
+# ==========================================
+# yfinance ticker map for gap fill
+# Used when IBKR can't reach far enough back (futures pre-2022, crypto pre-2020).
+# ==========================================
+_YF_TICKERS = {
+    "SPY":     "SPY",
+    "VIX":     "^VIX",
+    "OIL":     "CL=F",
+    "GOLD":    "GC=F",
+    "BTC":     "BTC-USD",
+    "QQQ":     "QQQ",
+    "DIA":     "DIA",
+    "XLI":     "XLI",
+    "XLF":     "XLF",
+    "XLE":     "XLE",
+    "COPPER":  "HG=F",
+    "NATGAS":  "NG=F",
+    "EUR_USD": "EURUSD=X",
+    "USD_JPY": "JPY=X",
+    "GBP_USD": "GBPUSD=X",
+    "USD_CNY": "CNY=X",
+    "USD_CAD": "CAD=X",
+    "USD_MXN": "MXN=X",
+    "USD_CHF": "CHF=X",
+    "AUD_USD": "AUDUSD=X",
+    "US10Y":   "ZN=F",
+    "US2Y":    "ZT=F",
+    "ETH":     "ETH-USD",
+}
+
 # Futures contract schedule per symbol: which months are actively traded.
-# Used to auto-generate expiry strings for the full date range.
 _FUTURES_MONTHS = {
-    "CL": "monthly",       # crude oil: every month
-    "NG": "monthly",       # nat gas: every month
-    "HG": "monthly",       # copper: every month
-    "GC": "even",          # gold: Feb Apr Jun Aug Oct Dec
-    "SI": "bimonthly",     # silver: Mar May Jul Sep Dec
-    "ZN": "quarterly",     # 10y note: Mar Jun Sep Dec
-    "ZT": "quarterly",     # 2y note:  Mar Jun Sep Dec
+    "CL": "monthly",
+    "NG": "monthly",
+    "HG": "monthly",
+    "GC": "even",          # Feb Apr Jun Aug Oct Dec
+    "SI": "bimonthly",     # Mar May Jul Sep Dec
+    "ZN": "quarterly",     # Mar Jun Sep Dec
+    "ZT": "quarterly",
 }
 
 _EVEN_MONTHS   = {2, 4, 6, 8, 10, 12}
@@ -128,8 +161,7 @@ _QUARTERLY     = {3, 6, 9, 12}
 def _gen_futures_expiries(sym: str, since: pd.Timestamp, until: pd.Timestamp) -> list[str]:
     """
     Auto-generate YYYYMM contract strings for `sym` covering [since, until].
-    Returns months whose active trading window overlaps the requested range.
-    We include one extra quarter before `since` and after `until` as buffer.
+    Includes one extra quarter before `since` and after `until` as buffer.
     """
     schedule = _FUTURES_MONTHS.get(sym)
     if schedule is None:
@@ -144,7 +176,7 @@ def _gen_futures_expiries(sym: str, since: pd.Timestamp, until: pd.Timestamp) ->
         m = cur.month
         include = (
             schedule == "monthly" or
-            (schedule == "even" and m in _EVEN_MONTHS) or
+            (schedule == "even"      and m in _EVEN_MONTHS)   or
             (schedule == "bimonthly" and m in _SILVER_MONTHS) or
             (schedule == "quarterly" and m in _QUARTERLY)
         )
@@ -153,6 +185,126 @@ def _gen_futures_expiries(sym: str, since: pd.Timestamp, until: pd.Timestamp) ->
         cur = cur + pd.DateOffset(months=1)
 
     return months
+
+
+def _yfinance_gap_fill(name: str, since: pd.Timestamp, until: pd.Timestamp,
+                       have: pd.DataFrame) -> pd.DataFrame:
+    """
+    Download daily bars from yfinance for any gap not covered by `have`.
+
+    If `have` is non-empty:  fills [since → have['date'].min() - 1 day]
+    If `have` is empty:      fills [since → until]
+
+    Returns a DataFrame with columns [date, open, high, low, close, volume],
+    or an empty DataFrame if there is no gap or yfinance has no data.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print(f"     ⚠️  yfinance not installed — skipping gap fill for {name}")
+        return pd.DataFrame()
+
+    ticker = _YF_TICKERS.get(name)
+    if ticker is None:
+        return pd.DataFrame()
+
+    since_utc = since.tz_convert("UTC")
+    until_utc = until.tz_convert("UTC")
+
+    if len(have):
+        have_dates = pd.to_datetime(have["date"], utc=True)
+        gap_end_utc = have_dates.min() - pd.Timedelta(days=1)
+    else:
+        gap_end_utc = until_utc
+
+    # No meaningful gap (< 2 days) → nothing to fill
+    if gap_end_utc < since_utc + pd.Timedelta(days=2):
+        return pd.DataFrame()
+
+    yf_start = str(since_utc.date())
+    yf_end   = str((gap_end_utc + pd.Timedelta(days=1)).date())
+
+    print(f"     📈 {name}: yfinance daily gap fill "
+          f"[{since_utc.date()} → {gap_end_utc.date()}]...")
+
+    try:
+        raw = yf.download(
+            ticker,
+            start=yf_start,
+            end=yf_end,
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+        )
+        if raw is None or raw.empty:
+            print(f"     ⚠️  {name}: yfinance returned no data")
+            return pd.DataFrame()
+
+        # Flatten MultiIndex columns (yfinance returns them for a single ticker too)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [str(c[0]).lower() for c in raw.columns]
+        else:
+            raw.columns = [str(c).lower() for c in raw.columns]
+
+        raw = raw.reset_index()
+
+        # Normalise the date/datetime column name
+        date_col = next((c for c in raw.columns if c in ("date", "datetime")), None)
+        if date_col is None:
+            print(f"     ⚠️  {name}: yfinance result has no date column — {raw.columns.tolist()}")
+            return pd.DataFrame()
+        raw = raw.rename(columns={date_col: "date"})
+        raw["date"] = pd.to_datetime(raw["date"], utc=True)
+
+        # Pick OHLCV columns (auto_adjust replaces close with adjusted close)
+        col_map = {}
+        for want in ("open", "high", "low", "close", "volume"):
+            # exact match first, then 'adj close' → close
+            if want in raw.columns:
+                col_map[want] = want
+            elif want == "close" and "adj close" in raw.columns:
+                col_map["adj close"] = "close"
+
+        df = raw[["date"] + list(col_map.keys())].rename(columns=col_map)
+        for col in ("open", "high", "low", "close", "volume"):
+            if col not in df.columns:
+                df[col] = float("nan")
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+        df = df.dropna(subset=["close"])
+        df = df[(df["date"] >= since_utc) & (df["date"] <= gap_end_utc + pd.Timedelta(days=1))]
+
+        if df.empty:
+            print(f"     ⚠️  {name}: yfinance gap data empty after filtering")
+            return pd.DataFrame()
+
+        print(f"     ✓ {name}: {len(df)} daily bars from yfinance "
+              f"[{df['date'].min().date()} → {df['date'].max().date()}]")
+        return df.reset_index(drop=True)
+
+    except Exception as e:
+        print(f"     ⚠️  {name}: yfinance error: {str(e)[:70]}")
+        return pd.DataFrame()
+
+
+def _merge_with_gap_fill(name: str, since: pd.Timestamp, until: pd.Timestamp,
+                         ibkr_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge `ibkr_df` with yfinance daily gap fill and return the combined,
+    deduplicated, sorted DataFrame (not yet trimmed to [since, until]).
+    If no gap fill is possible/needed, returns `ibkr_df` unchanged.
+    """
+    yf_fill = _yfinance_gap_fill(name, since, until, ibkr_df)
+    if yf_fill.empty:
+        return ibkr_df
+
+    parts = ([ibkr_df] if len(ibkr_df) else []) + [yf_fill]
+    merged = pd.concat(parts, ignore_index=True)
+    merged["date"] = pd.to_datetime(merged["date"], utc=True)
+    merged = (merged
+              .drop_duplicates(subset=["date"])
+              .sort_values("date")
+              .reset_index(drop=True))
+    return merged
 
 
 # ============================================================
@@ -167,7 +319,7 @@ def parse_stamp(s: str, name: str = "time") -> pd.Timestamp:
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Download 30-min IBKR bars into market_data_cache/ for a date range.",
+        description="Download 30-min IBKR bars (+ yfinance daily gap fill) into market_data_cache/.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -182,8 +334,7 @@ def parse_args():
     )
     ap.add_argument(
         "--core-only", action="store_true",
-        help="Fetch only the 5 core instruments (SPY VIX OIL GOLD BTC). "
-             "Fast (~20 min). Flip off later for all 23.",
+        help="Fetch only the 5 core instruments (SPY VIX OIL GOLD BTC).",
     )
     ap.add_argument(
         "--port", type=int, default=PORT,
@@ -242,9 +393,9 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
 
     # Load existing cache if present
     if os.path.exists(cache_file):
-        existing = pd.read_csv(cache_file, parse_dates=['date'])
-        existing['date'] = pd.to_datetime(existing['date'], utc=True)
-        cached_months = set(existing['date'].dt.strftime('%Y-%m').unique())
+        existing = pd.read_csv(cache_file, parse_dates=["date"])
+        existing["date"] = pd.to_datetime(existing["date"], utc=True)
+        cached_months = set(existing["date"].dt.strftime("%Y-%m").unique())
         # Always re-fetch the latest cached month — may have been captured mid-month.
         if cached_months:
             latest = max(cached_months)
@@ -269,32 +420,27 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
     # ── CONTINUOUS FUTURES special path ──────────────────────────────────
     # ContFuture FORBIDS endDateTime (Error 10339). Strategy:
     #   A) ContFuture with empty endDateTime, progressively longer durations.
-    #      IBKR supports up to "5 Y" for 30-min bars via the rolled continuous
-    #      series. Data arrives up to *now* and is trimmed to [since, until].
-    #      This is the PRIMARY path — always tried first.
-    #   B) Dated expired contracts (includeExpired=True) — only for the last
-    #      ~2 years since IBKR drops definitions for older contracts.
-    #      Has a bail-out after 5 consecutive qualify failures.
+    #      IBKR supports up to "5 Y" for 30-min bars. Data trimmed to [since, until].
+    #   B) Dated expired contracts — only for the last ~2 years (IBKR retention window).
+    #      Bail out after 5 consecutive qualify failures.
+    #   C) yfinance daily gap fill — for any period still not covered after A+B.
     is_contfut = type(contract).__name__ == "ContFuture"
     if is_contfut:
         new_frames = []
         c = qualified[0] if isinstance(qualified, list) else contract
 
-        # ---- A) continuous contract — always try, trim to [since, until] after ----
-        # Check if existing cache already fully covers the window.
+        # ---- A) continuous contract ----
         cache_covers = False
         if len(existing):
-            ec_min = existing['date'].min()
-            ec_max = existing['date'].max()
-            if ec_min <= since_utc + pd.Timedelta(days=5) and ec_max >= until_utc - pd.Timedelta(days=5):
+            ec_min = existing["date"].min()
+            ec_max = existing["date"].max()
+            if (ec_min <= since_utc + pd.Timedelta(days=5) and
+                    ec_max >= until_utc - pd.Timedelta(days=5)):
                 cache_covers = True
-                print(f"     💾 {name}: cache already covers [{since.date()} → {until.date()}], "
-                      f"skipping continuous pull")
+                print(f"     💾 {name}: cache already covers [{since.date()} → {until.date()}],"
+                      f" skipping continuous pull")
 
         if not cache_covers:
-            # Try progressively longer durations. "5 Y" covers ~2021→now.
-            # For 2016 data, IBKR may only support back to ~5 years via ContFuture;
-            # any remaining gap falls back to dated contracts (section B).
             CONTFUT_DURATIONS = ["5 Y", "3 Y", "2 Y", "365 D", "270 D", "180 D"]
             for dur in CONTFUT_DURATIONS:
                 try:
@@ -305,8 +451,8 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     )
                     if bars:
                         new_frames.append(pd.DataFrame([{
-                            'date': b.date, 'open': b.open, 'high': b.high,
-                            'low': b.low, 'close': b.close, 'volume': b.volume,
+                            "date": b.date, "open": b.open, "high": b.high,
+                            "low": b.low, "close": b.close, "volume": b.volume,
                         } for b in bars]))
                         earliest = pd.to_datetime(bars[0].date, utc=True)
                         print(f"     ✓ {name}: {len(bars)} bars via ContFuture ({dur}) "
@@ -318,24 +464,20 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     print(f"     ⚠️  {name} ContFuture {dur}: {str(e)[:55]}")
                     time.sleep(THROTTLE_SEC)
 
-        # ---- B) dated expired contracts — fills gap between `since` and what ----
-        #         ContFuture covered. Bail out after 5 consecutive qualify failures
-        #         (IBKR drops contract definitions older than ~2 years).
+        # ---- B) dated expired contracts — only within IBKR's 2-year retention window ----
         base_sym = contract.symbol
         exch     = contract.exchange
         expiries = _gen_futures_expiries(base_sym, since, until)
 
-        # Determine earliest bar already fetched (from ContFuture + existing cache)
         frames_so_far = ([existing] if len(existing) else []) + new_frames
         if frames_so_far:
             tmp = pd.concat(frames_so_far, ignore_index=True)
-            tmp['date'] = pd.to_datetime(tmp['date'], utc=True)
-            earliest_have = tmp['date'].min()
+            tmp["date"] = pd.to_datetime(tmp["date"], utc=True)
+            earliest_have = tmp["date"].min()
         else:
-            earliest_have = until_utc  # nothing yet
+            earliest_have = until_utc
 
         # Hard cutoff: IBKR only retains expired contract definitions for ~2 years.
-        # Attempting anything older always returns Error 200 — skip unconditionally.
         ibkr_cutoff = (pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=2)).strftime("%Y%m")
 
         gap_months, n_too_old = [], 0
@@ -367,7 +509,7 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     fut = Future(symbol=base_sym, exchange=exch, currency="USD",
                                  lastTradeDateOrContractMonth=ym, includeExpired=True)
                     q = ib.qualifyContracts(fut)
-                    # qualifyContracts returns [None] (not []) on Error 200 — must check q[0]
+                    # qualifyContracts returns [None] (not []) on Error 200
                     if not q or q[0] is None:
                         consec_qualify_fails += 1
                         continue
@@ -383,8 +525,8 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     )
                     if bars:
                         new_frames.append(pd.DataFrame([{
-                            'date': b.date, 'open': b.open, 'high': b.high,
-                            'low': b.low, 'close': b.close, 'volume': b.volume,
+                            "date": b.date, "open": b.open, "high": b.high,
+                            "low": b.low, "close": b.close, "volume": b.volume,
                         } for b in bars]))
                         print(f"     ✓ {name}: {len(bars)} bars from expired {ym}")
                     time.sleep(THROTTLE_SEC)
@@ -393,36 +535,46 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     print(f"     ⚠️  {name} expired {ym}: {str(e)[:45]}")
                     time.sleep(THROTTLE_SEC)
         else:
-            print(f"     ✓ {name}: ContFuture already covers window — skipping dated contracts")
+            if not n_too_old:
+                print(f"     ✓ {name}: ContFuture already covers window — skipping dated contracts")
 
+        # ---- Combine IBKR data ----
         if new_frames:
             combined = pd.concat(
                 ([existing] if len(existing) else []) + new_frames, ignore_index=True
             )
-            combined['date'] = pd.to_datetime(combined['date'], utc=True)
+            combined["date"] = pd.to_datetime(combined["date"], utc=True)
             combined = (combined
-                .drop_duplicates(subset=['date'])
-                .sort_values('date')
-                .reset_index(drop=True))
-            # Trim to requested window
+                        .drop_duplicates(subset=["date"])
+                        .sort_values("date")
+                        .reset_index(drop=True))
+        elif len(existing):
+            combined = existing.copy()
+            combined["date"] = pd.to_datetime(combined["date"], utc=True)
+        else:
+            combined = pd.DataFrame()
+
+        # ---- C) yfinance daily gap fill ----
+        combined = _merge_with_gap_fill(name, since, until, combined)
+
+        # Trim to requested window and save
+        if len(combined):
             combined = combined[
-                (combined['date'] >= since_utc) & (combined['date'] <= until_utc)
-            ]
+                (combined["date"] >= since_utc) & (combined["date"] <= until_utc)
+            ].reset_index(drop=True)
+
+        if len(combined):
             combined.to_csv(cache_file, index=False)
             manifest[name] = {
                 "status": "ok", "rows": len(combined),
-                "first": str(combined['date'].min()),
-                "last":  str(combined['date'].max()),
+                "first": str(combined["date"].min()),
+                "last":  str(combined["date"].max()),
             }
             span = f"{combined['date'].min().date()} → {combined['date'].max().date()}"
-            print(f"  ✅ {name:<12} {len(combined):>6} bars  ({span})")
-        elif len(existing):
-            span = (f"{existing['date'].min().date()} → "
-                    f"{existing['date'].max().date()}")
-            print(f"  💾 {name:<12} {len(existing):>6} bars (already complete, {span})")
-            manifest[name] = {"status": "ok", "rows": len(existing)}
+            src  = "fetched" if new_frames else "cached"
+            print(f"  ✅ {name:<12} {len(combined):>6} bars  ({span})  [{src}]")
         else:
-            print(f"  ❌ {name:<12} no data — futures subscription may be needed")
+            print(f"  ❌ {name:<12} no data — futures subscription or yfinance ticker may be needed")
             manifest[name] = {"status": "no_data"}
 
         save_manifest(manifest)
@@ -436,22 +588,21 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
     consecutive_empty = 0
 
     for m in months:
-        mkey = m.strftime('%Y-%m')
+        mkey = m.strftime("%Y-%m")
         if mkey in cached_months:
             skipped += 1
             continue
 
         if consecutive_empty >= 2 and fetched == 0:
             print(f"     ⏭️  {name}: no data on first 2 months — "
-                  f"likely unsubscribed, skipping rest")
+                  f"likely unsubscribed or pre-launch, skipping rest")
             failed_months.append("(bailed early)")
             break
 
-        # endDateTime = first day of NEXT month, pull "1 M" back.
         next_month = m + pd.offsets.MonthBegin(1)
         end_dt = (
             min(next_month, until + pd.Timedelta(days=1))
-            .strftime('%Y%m%d %H:%M:%S')
+            .strftime("%Y%m%d %H:%M:%S")
         )
 
         got_data = False
@@ -468,8 +619,8 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                 )
                 if bars:
                     dfm = pd.DataFrame([{
-                        'date': b.date, 'open': b.open, 'high': b.high,
-                        'low':  b.low,  'close': b.close, 'volume': b.volume,
+                        "date": b.date, "open": b.open, "high": b.high,
+                        "low":  b.low,  "close": b.close, "volume": b.volume,
                     } for b in bars])
                     new_frames.append(dfm)
                     fetched += 1
@@ -491,30 +642,41 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
     if failed_months:
         print(f"     ❌ {name}: {len(failed_months)} months failed/empty")
 
+    # Build combined from IBKR data
     if new_frames:
         combined = (pd.concat([existing] + new_frames, ignore_index=True)
                     if len(existing) else pd.concat(new_frames, ignore_index=True))
-        combined['date'] = pd.to_datetime(combined['date'], utc=True)
+        combined["date"] = pd.to_datetime(combined["date"], utc=True)
         combined = (combined
-            .drop_duplicates(subset=['date'])
-            .sort_values('date')
-            .reset_index(drop=True))
+                    .drop_duplicates(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True))
+    elif len(existing):
+        combined = existing.copy()
+        combined["date"] = pd.to_datetime(combined["date"], utc=True)
+    else:
+        combined = pd.DataFrame()
+
+    # yfinance daily gap fill — covers BTC/ETH pre-PAXOS, any early bail-out months
+    combined = _merge_with_gap_fill(name, since, until, combined)
+
+    # Trim and save
+    if len(combined):
         combined = combined[
-            (combined['date'] >= since_utc) & (combined['date'] <= until_utc)
-        ]
+            (combined["date"] >= since_utc) & (combined["date"] <= until_utc)
+        ].reset_index(drop=True)
+
+    if len(combined):
         combined.to_csv(cache_file, index=False)
         manifest[name] = {
             "status": "ok", "rows": len(combined),
-            "first": str(combined['date'].min()),
-            "last":  str(combined['date'].max()),
+            "first": str(combined["date"].min()),
+            "last":  str(combined["date"].max()),
         }
         print(f"  ✅ {name:<12} {len(combined):>6} bars  "
               f"(fetched {fetched} mo, cached {skipped} mo)")
-    elif len(existing):
-        print(f"  💾 {name:<12} fully cached ({len(existing)} bars) — no new fetch")
-        manifest[name] = {"status": "ok", "rows": len(existing)}
     else:
-        print(f"  ❌ {name:<12} no data returned (may need market-data subscription)")
+        print(f"  ❌ {name:<12} no data returned (IBKR subscription + yfinance both failed)")
         manifest[name] = {"status": "no_data"}
 
     save_manifest(manifest)
@@ -539,12 +701,13 @@ def main():
     span_years  = (until - since).days / 365.25
 
     print("=" * 64)
-    print("  IBKR HISTORICAL DATA FETCHER — 30min bars, cached")
+    print("  IBKR + yfinance HISTORICAL DATA FETCHER — 30min/daily bars")
     print("=" * 64)
     print(f"  Since : {since:%Y-%m-%d %H:%M %Z}")
     print(f"  Until : {until:%Y-%m-%d %H:%M %Z}")
     print(f"  Span  : ~{span_years:.1f} years ({span_months} months)")
     print(f"  Port  : {args.port}   Host: {args.host}   ClientID: {args.client_id}")
+    print(f"  Gap fill: yfinance daily bars where IBKR can't reach")
     print("=" * 64)
 
     manifest = ensure_cache_dir()
@@ -566,7 +729,7 @@ def main():
     )
     mode = "5 CORE only" if args.core_only else f"all {len(INSTRUMENTS)}"
     print(f"📥 Fetching {mode} instruments  [{since:%Y-%m-%d} → {until:%Y-%m-%d}]")
-    print(f"   ~{THROTTLE_SEC}s between requests to respect pacing limits\n")
+    print(f"   ~{THROTTLE_SEC}s between IBKR requests to respect pacing limits\n")
 
     t0 = time.time()
     for name, contract, wts in todo:
@@ -581,7 +744,7 @@ def main():
     failed = sum(1 for v in manifest.values() if v.get("status") != "ok")
     print(f"\n   {ok} instruments cached, {failed} failed/skipped")
     if failed:
-        print("   Failed ones fall back to yfinance daily in build_final_training_set.py")
+        print("   Check above for ❌ lines — these had no IBKR data and no yfinance fallback")
 
 
 if __name__ == "__main__":
