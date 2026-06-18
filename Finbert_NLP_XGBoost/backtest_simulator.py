@@ -828,4 +828,9 @@ def main():
         write_csv(csv_rows, csv_path, [inst for inst in instruments if inst in models])
 
     if args.fine_tune:
-       
+        fine_tune(df, X, cfg, args.model_dir, args.fine_tune_out,
+                  args.fine_tune_rounds, impact_cols)
+
+
+if __name__ == "__main__":
+    main()

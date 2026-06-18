@@ -217,18 +217,28 @@ def load_scored():
 # ==========================================
 # FETCH DATA
 # ==========================================
-def load_cached_intraday(name, suffix=""):
+def load_cached_intraday(name, suffix="", after=None, before=None):
     """
     Load cached 30min bars for `name` if present (IBKR file, or the yfinance
     extension file when suffix='_yf').
     Returns dict {Open,High,Low,Close} as NYC tz-aware Series, or None.
-    Cached data covers far more history than yfinance's ~60-day intraday limit.
+    `after` / `before` are ISO date strings — when supplied, DuckDB filters
+    the CSV on disk so only the needed rows are loaded into RAM.
     """
+    import duckdb
     path = os.path.join(CACHE_DIR, f"{name}_30min{suffix}.csv")
     if not os.path.exists(path):
         return None
     try:
-        df = pd.read_csv(path)
+        where_clauses = []
+        if after:
+            where_clauses.append(f"date >= '{after}'")
+        if before:
+            where_clauses.append(f"date <= '{before}'")
+        where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        df = duckdb.query(
+            f"SELECT date, open, high, low, close FROM read_csv_auto('{path}') {where}"
+        ).df()
         if 'date' not in df.columns or len(df) == 0:
             return None
         idx = pd.to_datetime(df['date'], utc=True).dt.tz_convert('America/New_York')
@@ -336,13 +346,16 @@ def fetch_market(start_date, end_date):
             # reaches back ~60 days, so the extension is persisted to
             # {name}_30min_yf.csv — coverage accumulates run by run and the
             # cache-end gap that froze labels at the 2026-05-22 bar is closed.
-            cached = load_cached_intraday(name)
+            # 5-day lookback buffer for estimation-window feature extraction
+            _after  = (pd.Timestamp(start_date) - timedelta(days=5)).strftime('%Y-%m-%d')
+            _before = (pd.Timestamp(end_date)   + timedelta(days=2)).strftime('%Y-%m-%d')
+            cached = load_cached_intraday(name, after=_after, before=_before)
             if cached is not None:
-                yfc = load_cached_intraday(name, suffix="_yf")
+                yfc = load_cached_intraday(name, suffix="_yf", after=_after, before=_before)
                 last_ts = max(p['Open'].index.max() for p in (cached, yfc) if p is not None)
                 ext = fetch_30min(ticker, end_date)
                 n_added = _persist_yf_extension(name, ext, last_ts)
-                yfc = load_cached_intraday(name, suffix="_yf")   # reload incl. new bars
+                yfc = load_cached_intraday(name, suffix="_yf", after=_after, before=_before)   # reload incl. new bars
                 merged = _merge_bars([cached, yfc])
                 intraday[name] = merged
                 cache_hits += 1

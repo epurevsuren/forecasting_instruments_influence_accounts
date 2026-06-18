@@ -110,4 +110,58 @@ def write_table(table, df, con=None):
 
 
 def query(sql, con=None):
-    """Run arbitrary SQL and return a DataF
+    """Run arbitrary SQL and return a DataFrame (or None on error)."""
+    own = con is None
+    con = con or get_connection()
+    try:
+        return con.execute(sql).fetchdf()
+    except Exception:
+        return None
+    finally:
+        if own:
+            con.close()
+
+
+def rename_table(old_name, new_name, con=None):
+    """Rename a table; no-op if old_name doesn't exist or new_name already does."""
+    own = con is None
+    con = con or get_connection()
+    try:
+        if table_exists(old_name, con) and not table_exists(new_name, con):
+            con.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
+            return True
+        return False
+    finally:
+        if own:
+            con.close()
+
+
+def append_table(table, df, con=None):
+    """Append rows of `df` to `table`, creating it (with df's schema) if it
+    doesn't exist yet.  For PK tables, duplicates are silently skipped
+    (ON CONFLICT DO NOTHING)."""
+    own = con is None
+    con = con or get_connection()
+    try:
+        con.register("_tmp_pk_df", df)
+        if table_exists(table, con):
+            cols = con.execute(f"SELECT * FROM {table} LIMIT 0").fetchdf().columns.tolist()
+            df2 = df.reindex(columns=cols)
+            con.unregister("_tmp_pk_df")
+            con.register("_tmp_pk_df", df2)
+            if table in _PK_TABLES:
+                con.execute(
+                    f"INSERT OR IGNORE INTO {table} SELECT * FROM _tmp_pk_df"
+                )
+            else:
+                con.execute(f"INSERT INTO {table} SELECT * FROM _tmp_pk_df")
+        else:
+            # Table doesn't exist yet — create it with PK if applicable
+            if table in _PK_TABLES:
+                _create_with_pk(table, df, con)
+            else:
+                con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp_pk_df")
+        con.unregister("_tmp_pk_df")
+    finally:
+        if own:
+            con.close()
