@@ -144,13 +144,17 @@ def fetch_klines(symbol, interval, start_ms, end_ms, throttle):
             break
 
         for row in data:
+            vol = float(row[5])
+            quote_vol = float(row[7])
             all_bars.append({
-                "date":   pd.Timestamp(row[0], unit="ms", tz="UTC"),
-                "open":   float(row[1]),
-                "high":   float(row[2]),
-                "low":    float(row[3]),
-                "close":  float(row[4]),
-                "volume": float(row[5]),
+                "date":     pd.Timestamp(row[0], unit="ms", tz="UTC"),
+                "open":     float(row[1]),
+                "high":     float(row[2]),
+                "low":      float(row[3]),
+                "close":    float(row[4]),
+                "volume":   vol,
+                "wap":      round(quote_vol / vol, 8) if vol else float(row[4]),
+                "barCount": int(row[8]),
             })
 
         cur_start = data[-1][0] + 1   # +1 ms to avoid overlap
