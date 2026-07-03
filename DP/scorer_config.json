@@ -16,6 +16,18 @@
     "blockade", "ceasefire"
   ],
   "policy_flags": {
+    "flag_peace_deescalation": [
+      "ceasefire", "cease-fire", "truce", "peace deal", "peace agreement",
+      "peace plan", "peace formula", "end the war", "end this war",
+      "war can finally come to an end", "come to an end", "war is over",
+      "hostilities have ended", "de-escalation", "de-escalate",
+      "productive discussions", "productive talks", "productive call",
+      "productive meeting", "very good and productive",
+      "agreement reached", "deal is done", "deal is complete",
+      "fully agreed", "hostages released", "hostages will be released",
+      "normalization", "diplomatic solution", "negotiated settlement",
+      "lasting peace", "historic peace"
+    ],
     "flag_stimulus": [
       "stimulus", "relief", "spending", "package", "bailout", "infrastructure",
       "funding", "budget deal", "treasury support"

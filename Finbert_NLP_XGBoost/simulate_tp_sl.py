@@ -319,7 +319,7 @@ def main():
             trade.update({"instrument": inst, "post_id": p["id"], "platform": p["platform"],
                           "account": p["account"], "post_time": p["date"],
                           "pred_pct": round(pred, 4),
-                          "text": str(p["text"])[:200]})
+                          "text": str(p["text"])})
             rows.append(trade)
 
         del bars  # free RAM before the next instrument

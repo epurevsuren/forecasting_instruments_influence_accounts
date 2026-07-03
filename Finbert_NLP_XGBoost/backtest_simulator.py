@@ -250,7 +250,15 @@ def gate_multiplier(row):
     else:
         gate = 1.0
     mult = 1.0 if gate >= 0.5 else gate
-    tfactor, tlabel = PR.temporal_factor(str(row['text']), post_hour=row['date_ny'].hour)
+    _account = str(row.get('account', '') or '')
+    _country = PR._country_for(_account)
+    tfactor, tlabel = PR.temporal_factor(str(row['text']),
+                                         post_hour=row['date_ny'].hour,
+                                         post_ts=row['date_ny'],
+                                         country=_country)
+    efactor, elabel = PR.endorsement_factor(str(row['text']))
+    if efactor < tfactor:            # endorsement gate overrides temporal
+        tfactor, tlabel = efactor, elabel
     mult *= tfactor
     return signal, gate, tfactor, tlabel, mult
 
@@ -432,9 +440,12 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
                      else f"{src_emoji} @{account} · {acct_name}{ctry_str}  (X/Twitter)")
 
         print("\n" + "─" * 78)
-        print(f"#{row_i+1}/{len(df)}  {row['date_ny']:%Y-%m-%d %H:%M %Z}{near_tag}")
+        # platform:id printed so log entries can be matched 1:1 against the
+        # results CSV (id column) and unified_feed / posts_scored rows.
+        print(f"#{row_i+1}/{len(df)}  {row['date_ny']:%Y-%m-%d %H:%M %Z}  "
+              f"[{platform}:{row['id']}]{near_tag}")
         print(f"  {src_label}")
-        print(f"  📝 {str(row['text'])[:140]}{'...' if len(str(row['text']))>140 else ''}")
+        print(f"  📝 {str(row['text'])}")
         print(f"  NLP signal={signal:.3f}  gate×{gate:.2f}  temporal={tlabel} ×{tfactor:.2f}  "
               f"-> total mult ×{mult:.2f}")
 

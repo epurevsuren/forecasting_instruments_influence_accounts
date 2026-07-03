@@ -29,6 +29,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
 import db  # DuckDB helper -> ../database.db
+import signal_scorer as ss  # shim -> canonical DP/signal_scorer.py (same CONFIG as scoring)
 
 LABEL_TABLE  = "training_set_FINAL"
 SCORED_TABLE = "posts_scored"
@@ -44,6 +45,17 @@ INSTRUMENTS = [
     'US10Y','US2Y','BTC','ETH',
 ]
 
+# Policy flags + NER keys are read DYNAMICALLY from the canonical scorer
+# (DP/scorer_config.json + DP/signal_scorer.py) so adding a flag to the JSON
+# flows into training with NO edit here. The exact list used at train time is
+# frozen into <model_dir>/config.json, which predict/backtest read — so
+# inference always matches the model even as the config evolves.
+# Pipeline order matters: run signal_scorer --full BEFORE training after a
+# config change, or the new flag columns won't exist in posts_scored yet
+# (they'd be 0-filled with a warning).
+_FLAG_FEATURES = list(ss.CONFIG["policy_flags"].keys())      # e.g. flag_peace_deescalation
+_NER_FEATURES  = list(ss.canonical._NER_KEYS)                # num_gpe, num_org, ...
+
 NLP_FEATURES = [
     # Source-context features: let XGBoost learn non-linear interactions between
     # NLP signal and post origin (is_primary=1 → rank-0 TruthSocial; geo weight = credibility tier)
@@ -53,15 +65,10 @@ NLP_FEATURES = [
     'score_caps','score_relative',
     'policy_intensity_score','hawkish_risk_score','growth_policy_score',
     'policy_intensity_score_norm','hawkish_risk_score_norm','growth_policy_score_norm',
-    # Policy flag indicators
-    'flag_stimulus','flag_tariff_trade','flag_interest_rate','flag_tax_policy',
-    'flag_sanctions','flag_war_geopolitics','flag_energy_policy','flag_immigration_policy',
-    'flag_industrial_policy','flag_deregulation','flag_financial_system','flag_supply_chain',
-    'flag_ai_chip_policy','flag_pandemic_relief',
-    # NER / linguistic counts
-    'num_policy_verbs','num_policy_nouns','num_gpe','num_org','num_percent','num_money',
-    'num_date','num_law','num_person','num_cardinal','num_event',
-    'num_geopolitical_terms','num_all_caps_words',
+    # Policy flag indicators (dynamic, from scorer_config.json)
+    *_FLAG_FEATURES,
+    # NER / linguistic counts (dynamic, from the canonical scorer)
+    *_NER_FEATURES,
     # Engagement signals
     'favorites','retweets','replies',
 ]

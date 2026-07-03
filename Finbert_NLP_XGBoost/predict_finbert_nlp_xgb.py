@@ -117,33 +117,133 @@ TEMPORAL_PAST_DAMP_PREMARKET  = 0.5
 TEMPORAL_PAST_DAMP_SESSION    = 0.15
 TEMPORAL_PAST_DAMP_AFTERHOURS = 0.3
 
+# Poster-local timezones: time-of-day phrases ("last night", "this morning")
+# are read on the POSTER's clock, not New York's. Zelensky's "last night" at
+# 03:41 EDT is 10:41 in Kyiv. Covers every country in geopolitical_entities.json.
+COUNTRY_TZ = {
+    'US': 'America/New_York',  'UA': 'Europe/Kyiv',      'RU': 'Europe/Moscow',
+    'IL': 'Asia/Jerusalem',    'IR': 'Asia/Tehran',      'CN': 'Asia/Shanghai',
+    'GB': 'Europe/London',     'FR': 'Europe/Paris',     'DE': 'Europe/Berlin',
+    'IT': 'Europe/Rome',       'IN': 'Asia/Kolkata',     'SA': 'Asia/Riyadh',
+    'AE': 'Asia/Dubai',        'BY': 'Europe/Minsk',     'AM': 'Asia/Yerevan',
+    'AZ': 'Asia/Baku',         'CA': 'America/Toronto',  'MX': 'America/Mexico_City',
+    'BR': 'America/Sao_Paulo', 'AR': 'America/Argentina/Buenos_Aires',
+    'VE': 'America/Caracas',
+}
 
-def temporal_factor(text, post_hour=None):
-    """Return (factor, label) for the predict-time temporal gate."""
+# WAR-REPORT FIRST DISCLOSURE (geo accounts): an operational summary like
+# "Last night, FP-5 Flamingo missiles successfully struck the Titan-Barrikady
+# facility" is usually the FIRST public confirmation of the event — the
+# market reacts at post time, so a past-time phrase must NOT damp it.
+# (US primary account relays like "I was informed last night..." stay damped —
+# those describe already-public info; first-person ACTIONS are separately
+# covered by TEMPORAL_BREAKING.)
+WAR_REPORT_PATTERNS = [
+    r"\bsuccessfully struck\b",
+    r"\bstruck\b[^.!?\n]{0,80}\b(?:facility|plant|refinery|depot|base|complex|"
+    r"infrastructure|airfield|warehouse)\b",
+    r"\bour (?:forces|troops|warriors|defenders|soldiers|air defense|missiles|"
+    r"drones|long-range|units)\b",
+    r"\b(?:was|were) (?:hit|destroyed|eliminated|neutralized|downed)\b",
+    r"\bshot down\b",
+    r"\bstrikes? (?:on|against)\b",
+    r"\bcombat (?:operations|missions|work|engagements)\b",
+    r"\bfrontline\b", r"\bair defense\b",
+]
+
+
+def temporal_factor(text, post_hour=None, post_ts=None, country=None):
+    """Return (factor, label) for the predict-time temporal gate.
+
+    post_hour : NY-local hour (legacy path, used when post_ts/country absent).
+    post_ts   : tz-aware post timestamp; combined with `country` it yields the
+                POSTER-LOCAL hour for interpreting time-of-day phrases.
+    country   : ISO alpha-2 of the posting account (geopolitical_entities.json).
+    """
     t = text.lower()
     has_future_time = any(re.search(p, t) for p in TEMPORAL_FUTURE_PHRASES)
     has_breaking     = any(re.search(p, t) for p in TEMPORAL_BREAKING)
     has_past_time    = any(re.search(p, t) for p in TEMPORAL_PAST_PHRASES)
 
+    is_geo = bool(country) and country != "US"
+
+    # war-report exemption BEFORE any past-time damping
+    if is_geo and has_past_time and any(re.search(p, t) for p in WAR_REPORT_PATTERNS):
+        return 1.0, f"war-report/first-disclosure ({country} account -- new info at post time)"
+
+    # poster-local hour for phrase interpretation
+    local_hour, clock = post_hour, "NY"
+    if post_ts is not None and country in COUNTRY_TZ:
+        try:
+            local_hour = post_ts.tz_convert(COUNTRY_TZ[country]).hour
+            clock = country
+        except Exception:
+            pass
+
     if has_past_time and not (has_future_time or has_breaking):
-        if post_hour is None:
+        if local_hour is None:
             return TEMPORAL_DAMP, "past/stale"
-        if post_hour < 9:
+        if is_geo:
+            # geo poster: NY session tiers don't apply to their clock — flat damp
+            return TEMPORAL_DAMP, (f"past/stale (geo account, {clock} local "
+                                   f"{local_hour:02d}h, non-operational recap)")
+        if local_hour < 9:
             return TEMPORAL_PAST_DAMP_PREMARKET, "past/stale (posted premarket -- not yet traded by cash equities)"
-        if post_hour < 16:
+        if local_hour < 16:
             return TEMPORAL_PAST_DAMP_SESSION, "past/stale (posted during session -- already traded)"
         return TEMPORAL_PAST_DAMP_AFTERHOURS, "past/stale (posted after close -- only FX/crypto/futures react overnight)"
     if has_future_time or has_breaking:
         return 1.0, "future/new-info"
 
-    if post_hour is not None:
+    if local_hour is not None:
         for phrase, (start, end) in TEMPORAL_AMBIGUOUS.items():
             if re.search(phrase, t):
-                if post_hour >= end:
-                    return TEMPORAL_DAMP, f"past/stale ('{phrase.strip()}' already over at post time)"
-                return 1.0, f"future/ongoing ('{phrase.strip()}' still ahead at post time)"
+                if local_hour >= end:
+                    return TEMPORAL_DAMP, f"past/stale ('{phrase.strip()}' already over on {clock} clock)"
+                return 1.0, f"future/ongoing ('{phrase.strip()}' still ahead on {clock} clock)"
 
     return 1.0, "neutral"
+
+
+# ---------------------------------------------------------------------------
+# ENDORSEMENT / CEREMONIAL-NOISE GATE
+# Political endorsements ("Congressman X is a Tremendous Advocate...") are
+# stuffed with policy buzzwords (border, taxes, military, regulations), so
+# policy_intensity_score rates them like policy announcements and the NLP
+# gate lets them through (observed: NLP signal 0.68-0.75, gate x0.99, TRADE).
+# They carry ZERO tradeable information — a biography of someone's positions
+# is not an action. Detected -> factor 0.0 -> never traded (hard skip).
+# ---------------------------------------------------------------------------
+ENDORSEMENT_PATTERNS = [
+    r"complete and total endorsement",
+    r"has my (?:complete|full|total|strong)[^.!?\n]{0,30}endorsement",
+    r"\b(?:congressman|congresswoman|senator|governor|sheriff|judge|mayor)\b"
+    r"[^.!?\n]{0,120}\b(?:tremendous|incredible|fantastic|phenomenal|wonderful|"
+    r"spectacular|outstanding|great)\b",
+    r"\b(?:tremendous|incredible|fantastic|phenomenal|wonderful|outstanding)\b"
+    r"[^.!?\n]{0,40}\b(?:champion|advocate|representative|leader|fighter|warrior)\b",
+    r"\bis doing (?:a |an |truly )*(?:incredible|fantastic|tremendous|great|"
+    r"amazing|outstanding)\b",
+    r"\brunning for (?:re-?election|congress|the senate|senate|governor|office)\b",
+    r"\b(?:get out and )?vote for\b",
+    # NOTE: bare "great honor" / "congratulations to" are TOO GREEDY — they
+    # also appear in real market news ("It is my Great Honor to announce our
+    # Trade Agreement with Indonesia", "CONGRATULATIONS TO EVERYONE! ...
+    # ceasefire"). Only the endorsement-specific forms are gated:
+    r"\b(?:great )?honor to endorse\b",
+    r"\bhappy birthday\b",
+]
+ENDORSEMENT_DAMP = 0.0   # hard skip — endorsements are never tradeable
+
+
+def endorsement_factor(text):
+    """Return (factor, label): (0.0, 'endorsement/noise') when the post is a
+    political endorsement / ceremonial post, else (1.0, '')."""
+    t = str(text).lower()
+    for p in ENDORSEMENT_PATTERNS:
+        if re.search(p, t):
+            return ENDORSEMENT_DAMP, "endorsement/noise (hard skip)"
+    return 1.0, ""
 
 
 LABELS = [
@@ -214,7 +314,8 @@ def parse_stamp(s):
 def predict(text, cfg, models, nlp, sbert, post_ts=None,
             entity_weight: float = 1.0,
             event_weight:  float = 1.0,
-            is_primary:    bool  = True):
+            is_primary:    bool  = True,
+            account:       str   = None):
     """Predict 1-hour market impacts for a post.
 
     entity_weight / event_weight / is_primary: supply these for geo-account posts
@@ -244,7 +345,12 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     mult = 1.0 if gate >= 0.5 else gate
 
     post_hour = post_ts.hour if post_ts is not None else None
-    tfactor, tlabel = temporal_factor(text, post_hour=post_hour)
+    country = _country_for(account) if account else ("US" if is_primary else "")
+    tfactor, tlabel = temporal_factor(text, post_hour=post_hour,
+                                      post_ts=post_ts, country=country)
+    efactor, elabel = endorsement_factor(text)
+    if efactor < tfactor:            # endorsement gate overrides temporal
+        tfactor, tlabel = efactor, elabel
     mult *= tfactor
 
     out = {}
@@ -373,6 +479,7 @@ def main():
             entity_weight=args.entity_weight,
             event_weight=args.event_weight,
             is_primary=args.is_primary,
+            account=handle,
         )
         show(t, r, sig, gate, tfactor, tlabel,
              account=args.account, account_name=args.account_name,
