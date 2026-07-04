@@ -329,6 +329,56 @@ _CHAIN_STATE: dict = {}    # {account_lower: {"ts": Timestamp, "sig": float}}
 # new-action cue (novelty 0.36, temporal neutral) gets damped to ~its
 # novelty. Historical novelty quantiles: p25=0.45, p50=0.61.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# COMMENTARY GATE — two no-new-action shapes that were quietly missing most
+# (backtest audit 2026-07-04, 10 posts):
+#   RETRO-BRAG: status/achievement commentary ("Munitions Stockpiles have
+#   never been higher", "accomplished during my First Term", "Tariffs have
+#   made our Country Rich") — often posted nights/weekends, so their label is
+#   the NEXT SESSION's unrelated macro move. ×0.15.
+#   CONDITIONAL THREAT: deterrence language ("Any further attack WILL BE met
+#   with...") — a warning, not an action; markets are habituated. ×0.35.
+# Applied ONLY when the temporal gate says 'neutral' — enacted bombshells
+# ("Effective immediately... will be BLOWN TO HELL") carry breaking/future
+# cues and are never touched.
+# ---------------------------------------------------------------------------
+RETRO_BRAG_PATTERNS = [
+    r"\b(?:was|were|has been|have been) (?:accomplished|achieved|completed|"
+    r"rebuilt|renovated|modernized)\b",
+    r"\bduring my (?:first|second) term\b",
+    r"\bhave (?:never )?been (?:higher|better|stronger|greater|safer)\b",
+    r"\bnever been (?:higher|better|stronger|greater)\b",
+    r"\b(?:made|has made|have made) our country (?:rich|strong|powerful|safe|great)\b",
+    r"\bvirtually unlimited\b",
+    r"\bbegan long before i took office\b",
+    r"\bwould have never happened\b",
+    r"\bmore (?:nuclear weapons|\w+) than any other country\b",
+]
+CONDITIONAL_THREAT_PATTERNS = [
+    r"\bany (?:further|additional|new)\b[^.!?\n]{0,60}\bwill be\b",
+    r"\bif\b[^.!?\n]{0,80}\bwill be (?:met|eliminated|destroyed|blown|hit)\b",
+    r"\bwill be met with\b",
+    r"\bwarning[:!]",
+]
+RETRO_BRAG_DAMP  = 0.15
+COND_THREAT_DAMP = 0.35
+
+
+def commentary_factor(text):
+    """(factor, label) for no-new-action commentary; (1.0, '') otherwise.
+    Caller must apply ONLY on temporally-neutral posts."""
+    t = str(text).lower()
+    for p in RETRO_BRAG_PATTERNS:
+        if re.search(p, t):
+            return RETRO_BRAG_DAMP, ("retrospective-brag/status commentary "
+                                     "(no new action) x%.2f" % RETRO_BRAG_DAMP)
+    for p in CONDITIONAL_THREAT_PATTERNS:
+        if re.search(p, t):
+            return COND_THREAT_DAMP, ("conditional threat/deterrence warning "
+                                      "(no enacted action) x%.2f" % COND_THREAT_DAMP)
+    return 1.0, ""
+
+
 REITER_NOVELTY_MAX = 0.45   # damp below this (25th percentile of history)
 REITER_FLOOR       = 0.20
 REITER_MEMORY_HRS  = 24
@@ -556,13 +606,17 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     cfactor, clabel = chain_factor(account, post_ts, signal)
     if cfactor < tfactor:            # chain guard overrides everything
         tfactor, tlabel = cfactor, clabel
-    # reiteration damp: ONLY for temporally-neutral posts (a bombshell in
-    # familiar vocabulary is protected by its breaking/future cues)
-    _apply_reiter = (tfactor == 1.0 and tlabel == "neutral")
+    # reiteration + commentary damps: ONLY for temporally-neutral posts (a
+    # bombshell in familiar vocabulary is protected by breaking/future cues)
+    _neutral = (tfactor == 1.0 and tlabel == "neutral")
     rfactor, rlabel = reiteration_factor(text, account=account, post_ts=post_ts,
                                          sbert=sbert)
-    if _apply_reiter and rfactor < tfactor:
+    if _neutral and rfactor < tfactor:
         tfactor, tlabel = rfactor, rlabel
+    if _neutral:
+        mfactor, mlabel = commentary_factor(text)
+        if mfactor < tfactor:
+            tfactor, tlabel = mfactor, mlabel
     mult *= tfactor
 
     out = {}

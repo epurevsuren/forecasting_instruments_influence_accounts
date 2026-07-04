@@ -268,14 +268,17 @@ def gate_multiplier(row):
     cfactor, clabel = PR.chain_factor(_account, row['date_ny'], signal)
     if cfactor < tfactor:            # chain guard overrides everything
         tfactor, tlabel = cfactor, clabel
-    # reiteration damp (production code path) — uses the REAL context-computed
-    # score_novelty from posts_scored; only for temporally-neutral posts
+    # reiteration + commentary damps (production code path) — reiteration uses
+    # the REAL context-computed score_novelty; both only for temporally-neutral
     if tfactor == 1.0 and tlabel == "neutral":
         rfactor, rlabel = PR.reiteration_factor(
             str(row['text']), account=_account, post_ts=row['date_ny'],
             novelty=row.get('score_novelty'))
         if rfactor < tfactor:
             tfactor, tlabel = rfactor, rlabel
+        mfactor, mlabel = PR.commentary_factor(str(row['text']))
+        if mfactor < tfactor:
+            tfactor, tlabel = mfactor, mlabel
     mult *= tfactor
     return signal, gate, tfactor, tlabel, mult
 

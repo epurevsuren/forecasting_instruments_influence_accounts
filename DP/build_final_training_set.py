@@ -553,6 +553,9 @@ def apply_caps(scored, impact_cols):
 
 CHAIN_LABEL_DAMP       = 0.3   # training trust multiplier for chain followers
 CHAIN_LABEL_WINDOW_MIN = 60
+DAILY_LABEL_DAMP       = 0.7   # trust multiplier when the core label is
+                               # daily-fallback (post while market closed —
+                               # "actual" = next session's whole move)
 
 
 def finalize(scored, impact_cols):
@@ -587,6 +590,19 @@ def finalize(scored, impact_cols):
               f"(label carries the leader's move)")
     scored['sample_weight'] = (scored['sample_weight']
                                * pd.Series(_damp, index=scored.index)).round(4)
+
+    # LABEL-QUALITY TRUST: posts whose core label fell back to DAILY data
+    # (posted overnight/weekend — market closed) get the NEXT SESSION's whole
+    # move as their "actual", which is mostly macro noise unrelated to the
+    # post (e.g. a Saturday-morning brag wearing Monday's selloff). Keep the
+    # label but trust it less.
+    if 'SPY_quality' in scored.columns:
+        daily_mask = scored['SPY_quality'].astype(str) == 'daily'
+        if daily_mask.any():
+            print(f"  🌙 {int(daily_mask.sum())} post(s) with daily-fallback labels "
+                  f"(closed market): sample_weight ×{DAILY_LABEL_DAMP}")
+            scored.loc[daily_mask, 'sample_weight'] = (
+                scored.loc[daily_mask, 'sample_weight'] * DAILY_LABEL_DAMP).round(4)
     return scored
 
 
