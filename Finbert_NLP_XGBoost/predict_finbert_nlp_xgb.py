@@ -245,6 +245,191 @@ def endorsement_factor(text):
     return 1.0, ""
 
 
+# ---------------------------------------------------------------------------
+# SELF-NEWS-SHARE GATE ("Trump upends China's oil scheme: https://...")
+# A poster sharing press coverage ABOUT THEMSELVES is relaying something that
+# ALREADY HAPPENED and was already published — the market priced it when the
+# article ran, not when the re-post appears. The tell: the poster's own name
+# as a THIRD-PERSON subject (people don't use their own name as a pronoun
+# when announcing their own action) + a URL + no first-person pronouns.
+# First-person posts ("I have just signed... https://") are never gated.
+# ---------------------------------------------------------------------------
+_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i|i'm|i've|i'll|i'd|my|me|we|we're|we've|our|us)\b", re.I)
+_URL_ONLY_RE = re.compile(r"https?://\S+")
+
+_HANDLE_NAME: dict = {}   # {handle_lower: display name} — lazy, from influence_accounts.json
+
+
+def _display_name_for(handle: str) -> str:
+    global _HANDLE_NAME
+    if not _HANDLE_NAME:
+        try:
+            with open(_ENTITIES_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            for a in data.get("primary_accounts", []):
+                if a.get("account"):
+                    _HANDLE_NAME[a["account"].lower()] = a.get("account_name", a.get("name", ""))
+            for section in (data.get("entities", []),
+                            data.get("institutions", {}).get("entries", [])):
+                for e in section:
+                    h = str(e.get("twitter_handle") or "").lstrip("@")
+                    if h:
+                        _HANDLE_NAME[h.lower()] = e.get("name", "")
+        except Exception:
+            _HANDLE_NAME = {"__failed__": ""}
+    return _HANDLE_NAME.get(str(handle).lower(), "")
+
+
+def self_news_share_factor(text, account=None, account_name=None):
+    """(0.0, label) when the post is third-person press coverage of the
+    poster's own (past) actions with a link; else (1.0, '')."""
+    t = str(text)
+    if not _URL_ONLY_RE.search(t):
+        return 1.0, ""
+    name = (account_name or "").strip() or (_display_name_for(account) if account else "")
+    tokens = [w for w in re.split(r"[\s.]+", str(name)) if len(w) > 2]
+    if not tokens:
+        return 1.0, ""
+    surname = tokens[-1].lower()
+    body = _URL_ONLY_RE.sub("", t).strip()
+    if not re.search(rf"\b{re.escape(surname)}\b", body, re.I):
+        return 1.0, ""
+    if _FIRST_PERSON_RE.search(body):
+        return 1.0, ""
+    return 0.0, "self-news-share (3rd-person coverage of own past action -- already priced)"
+
+
+# ---------------------------------------------------------------------------
+# CHAIN GUARD (PRODUCTION) — posts from the same account within CHAIN_WINDOW_MIN
+# share ONE market reaction: the leader moves the market, followers are
+# elaboration/recap whose reaction window is already priced (and whose labels
+# were contaminated in training). Only the chain LEADER trades; a follower
+# passes only when its NLP signal is materially STRONGER than the leader's
+# (the bombshell came second — it then becomes the new leader).
+#
+# State: in-process _CHAIN_STATE for a long-running production loop feeding
+# posts chronologically, with a posts_scored DB lookup as COLD-START fallback
+# (first prediction after process start still knows about a post from 20
+# minutes ago). Requires post_ts + account; without them (ad-hoc interactive
+# text) the guard is inert.
+# ---------------------------------------------------------------------------
+CHAIN_WINDOW_MIN   = 60
+CHAIN_SIGNAL_DELTA = 0.10
+_CHAIN_STATE: dict = {}    # {account_lower: {"ts": Timestamp, "sig": float}}
+
+# ---------------------------------------------------------------------------
+# REITERATION DAMP — a post that mostly RESTATES the account's recent posts
+# has little market power left ("the market already reacted to the powerful
+# posts"). Detection: LOW semantic novelty vs the account's recent posts,
+# applied ONLY when the temporal gate says 'neutral'. That last condition is
+# critical and data-calibrated: the blockade bombshell itself had novelty
+# 0.31 (familiar Iran/Hormuz vocabulary) but carries 'Effective immediately'
+# -> future/new-info -> NEVER damped here. A next-day restatement with no
+# new-action cue (novelty 0.36, temporal neutral) gets damped to ~its
+# novelty. Historical novelty quantiles: p25=0.45, p50=0.61.
+# ---------------------------------------------------------------------------
+REITER_NOVELTY_MAX = 0.45   # damp below this (25th percentile of history)
+REITER_FLOOR       = 0.20
+REITER_MEMORY_HRS  = 24
+REITER_MEMORY_N    = 10
+_RECENT_POSTS: dict = {}    # {account_lower: [(ts, sbert_emb | token_set), ...]}
+
+
+def reiteration_factor(text, account=None, post_ts=None, sbert=None,
+                       novelty=None, remember=True):
+    """
+    (factor, label) — factor < 1 when the post is a low-novelty reiteration.
+    novelty: pass posts_scored.score_novelty when available (backtest path);
+    else it is computed against the in-process recent-post memory using the
+    loaded SBERT model (production path; token-Jaccard fallback without it).
+    """
+    key = str(account).lower() if account else None
+    nov = novelty
+
+    if nov is None or (isinstance(nov, float) and nov != nov):   # None/NaN
+        nov = 1.0
+        if key is not None and post_ts is not None:
+            hist = [h for h in _RECENT_POSTS.get(key, [])
+                    if (post_ts - h[0]).total_seconds() <= REITER_MEMORY_HRS * 3600]
+            cur_repr = None
+            if sbert is not None:
+                try:
+                    cur_repr = sbert.encode([str(text)[:512]], show_progress_bar=False)[0]
+                    sims = [float((cur_repr @ h[1]) /
+                                  ((cur_repr @ cur_repr) ** .5 * (h[1] @ h[1]) ** .5))
+                            for h in hist if not isinstance(h[1], (set, frozenset))]
+                    if sims:
+                        nov = 1.0 - max(sims)
+                except Exception:
+                    cur_repr = None
+            if cur_repr is None:                                  # Jaccard fallback
+                cur_repr = set(str(text).lower().split())
+                sims = [len(cur_repr & h[1]) / max(len(cur_repr | h[1]), 1)
+                        for h in hist if isinstance(h[1], (set, frozenset))]
+                if sims:
+                    nov = 1.0 - max(sims)
+            if remember:
+                _RECENT_POSTS[key] = (hist + [(post_ts, cur_repr)])[-REITER_MEMORY_N:]
+
+    if nov >= REITER_NOVELTY_MAX:
+        return 1.0, ""
+    f = max(REITER_FLOOR, round(float(nov), 2))
+    return f, (f"reiteration (novelty {nov:.2f} vs recent posts, no new-action "
+               f"cue) -- market already reacted x{f:.2f}")
+
+
+def _db_last_post_signal(account, before_ts):
+    """Cold-start fallback: newest posts_scored row from `account` inside the
+    chain window before `before_ts`. Returns (ts, signal) or None."""
+    try:
+        import db as _db
+        lo = (before_ts - pd.Timedelta(minutes=CHAIN_WINDOW_MIN)).isoformat()
+        r = _db.query(
+            f"SELECT date, policy_intensity_score, hawkish_risk_score, sample_weight "
+            f"FROM posts_scored WHERE lower(account) = '{str(account).lower()}' "
+            f"AND date >= '{lo}' AND date < '{before_ts.isoformat()}' "
+            f"ORDER BY date DESC LIMIT 1")
+        if r is None or r.empty:
+            return None
+        row = r.iloc[0]
+        parts = []
+        if pd.notna(row.get('policy_intensity_score')):
+            parts.append(min(float(row['policy_intensity_score']) / 8.0, 1.0))
+        if pd.notna(row.get('hawkish_risk_score')):
+            parts.append(min(float(row['hawkish_risk_score']) / 5.0, 1.0))
+        if pd.notna(row.get('sample_weight')):
+            parts.append(float(row['sample_weight']))
+        if not parts:
+            return None
+        return pd.to_datetime(row['date'], utc=True), float(np.mean(parts))
+    except Exception:
+        return None
+
+
+def chain_factor(account, post_ts, signal):
+    """(0.0, label) when this post is a chain-follower; else (1.0, '').
+    Updates the in-process chain state either way."""
+    if account is None or post_ts is None:
+        return 1.0, ""
+    key = str(account).lower()
+    prev = _CHAIN_STATE.get(key)
+    if prev is None:
+        hit = _db_last_post_signal(account, post_ts)
+        if hit is not None:
+            prev = {"ts": hit[0], "sig": hit[1]}
+    if prev is not None:
+        gap = (post_ts - prev["ts"]).total_seconds()
+        if 0 <= gap <= CHAIN_WINDOW_MIN * 60 and signal <= prev["sig"] + CHAIN_SIGNAL_DELTA:
+            # follower: EXTEND the chain, keep the leader's signal on record
+            _CHAIN_STATE[key] = {"ts": post_ts, "sig": prev["sig"]}
+            return 0.0, (f"chain-follower ({gap/60:.0f}min after leader, "
+                         f"Δsignal {signal - prev['sig']:+.2f} < +{CHAIN_SIGNAL_DELTA}) "
+                         f"-- same reaction window, move already priced")
+    _CHAIN_STATE[key] = {"ts": post_ts, "sig": signal}
+    return 1.0, ""
+
+
 # (name, emoji, display label) — loaded DYNAMICALLY from DP/instruments.json
 # (master registry). Add/remove instruments there, no code edits needed.
 _INSTRUMENTS_FILE = os.path.join(_HERE, "..", "DP", "instruments.json")
@@ -365,6 +550,19 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     efactor, elabel = endorsement_factor(text)
     if efactor < tfactor:            # endorsement gate overrides temporal
         tfactor, tlabel = efactor, elabel
+    sfactor, slabel = self_news_share_factor(text, account=account)
+    if sfactor < tfactor:            # self-news-share gate overrides both
+        tfactor, tlabel = sfactor, slabel
+    cfactor, clabel = chain_factor(account, post_ts, signal)
+    if cfactor < tfactor:            # chain guard overrides everything
+        tfactor, tlabel = cfactor, clabel
+    # reiteration damp: ONLY for temporally-neutral posts (a bombshell in
+    # familiar vocabulary is protected by its breaking/future cues)
+    _apply_reiter = (tfactor == 1.0 and tlabel == "neutral")
+    rfactor, rlabel = reiteration_factor(text, account=account, post_ts=post_ts,
+                                         sbert=sbert)
+    if _apply_reiter and rfactor < tfactor:
+        tfactor, tlabel = rfactor, rlabel
     mult *= tfactor
 
     out = {}

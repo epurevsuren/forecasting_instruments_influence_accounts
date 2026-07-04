@@ -551,14 +551,42 @@ def apply_caps(scored, impact_cols):
     return scored
 
 
+CHAIN_LABEL_DAMP       = 0.3   # training trust multiplier for chain followers
+CHAIN_LABEL_WINDOW_MIN = 60
+
+
 def finalize(scored, impact_cols):
-    """fillna, drop core-NaN rows, sample_weight = nlp_signal."""
+    """fillna, drop core-NaN rows, sample_weight = nlp_signal (chain-damped)."""
     for col in impact_cols:
         scored[col] = scored[col].fillna(0.0)
     core = [f'{n}_Impact' for n in CORE_INSTRUMENTS]
     scored = scored.dropna(subset=core)
     # Sample weight = NLP signal directly (continuous, no gate)
     scored['sample_weight'] = scored['nlp_signal'].round(4)
+
+    # CHAIN DAMP (training trust): a post fired within CHAIN_LABEL_WINDOW_MIN
+    # of the SAME account's previous post shares that post's 1-hour reaction
+    # window — its label carries the LEADER's move, not its own. Training on
+    # it at full weight teaches the model that recap posts cause bombshell
+    # moves. Followers keep their (contaminated) label but at 0.3x trust.
+    # NOTE: incremental runs only see chains WITHIN the new batch — fine in
+    # practice, since chained posts arrive in the same daily batch.
+    scored = scored.sort_values('date')
+    _last: dict = {}
+    _damp = []
+    for _, r in scored.iterrows():
+        k = str(r.get('account', '')).lower()
+        prev = _last.get(k)
+        is_follower = (prev is not None and
+                       (r['date'] - prev) <= pd.Timedelta(minutes=CHAIN_LABEL_WINDOW_MIN))
+        _damp.append(CHAIN_LABEL_DAMP if is_follower else 1.0)
+        _last[k] = r['date']
+    n_damped = sum(1 for d in _damp if d < 1.0)
+    if n_damped:
+        print(f"  🔗 {n_damped} chain-follower post(s): sample_weight ×{CHAIN_LABEL_DAMP} "
+              f"(label carries the leader's move)")
+    scored['sample_weight'] = (scored['sample_weight']
+                               * pd.Series(_damp, index=scored.index)).round(4)
     return scored
 
 

@@ -299,13 +299,20 @@ def main():
                   f"{args.sl_noise_mult * noise_pct:.4f}%")
 
         rows, skips = [], {}
-        for _, p in todo.iterrows():
+        # ONE OPEN POSITION PER INSTRUMENT: chained posts minutes apart share
+        # one market reaction — a second entry while the first trade is still
+        # open would ride the SAME move twice. Skip until the position exits.
+        open_until = None
+        for _, p in todo.sort_values("post_ts").iterrows():
             pred = float(p[pcol])
             if pred == 0 or not np.isfinite(pred):
                 skips["zero_pred"] = skips.get("zero_pred", 0) + 1
                 continue
             if abs(pred) < args.min_pred:
                 skips["small_pred"] = skips.get("small_pred", 0) + 1
+                continue
+            if open_until is not None and p["post_ts"] <= open_until:
+                skips["position_open"] = skips.get("position_open", 0) + 1
                 continue
             tp_d = args.tp_pct if args.tp_pct is not None else abs(pred) * args.tp_mult
             sl_d = args.sl_pct if args.sl_pct is not None else abs(pred) * args.sl_mult
@@ -321,6 +328,7 @@ def main():
                           "pred_pct": round(pred, 4),
                           "text": str(p["text"])})
             rows.append(trade)
+            open_until = pd.Timestamp(trade["exit_time"])   # position stays open until exit
 
         del bars  # free RAM before the next instrument
 

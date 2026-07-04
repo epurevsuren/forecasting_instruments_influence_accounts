@@ -258,6 +258,24 @@ def gate_multiplier(row):
     efactor, elabel = PR.endorsement_factor(str(row['text']))
     if efactor < tfactor:            # endorsement gate overrides temporal
         tfactor, tlabel = efactor, elabel
+    sfactor, slabel = PR.self_news_share_factor(
+        str(row['text']), account=_account,
+        account_name=str(row.get('account_name') or ''))
+    if sfactor < tfactor:            # self-news-share gate overrides both
+        tfactor, tlabel = sfactor, slabel
+    # chain guard: SAME production code path as live prediction
+    # (predict_finbert_nlp_xgb.chain_factor — in-process state, chronological)
+    cfactor, clabel = PR.chain_factor(_account, row['date_ny'], signal)
+    if cfactor < tfactor:            # chain guard overrides everything
+        tfactor, tlabel = cfactor, clabel
+    # reiteration damp (production code path) — uses the REAL context-computed
+    # score_novelty from posts_scored; only for temporally-neutral posts
+    if tfactor == 1.0 and tlabel == "neutral":
+        rfactor, rlabel = PR.reiteration_factor(
+            str(row['text']), account=_account, post_ts=row['date_ny'],
+            novelty=row.get('score_novelty'))
+        if rfactor < tfactor:
+            tfactor, tlabel = rfactor, rlabel
     mult *= tfactor
     return signal, gate, tfactor, tlabel, mult
 
@@ -403,6 +421,12 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
 
     preds = {inst: models[inst].predict(X) for inst in models}
 
+    # Chain handling lives in the PRODUCTION module (PR.chain_factor, called
+    # by gate_multiplier) — the backtest only resets its in-process state so
+    # each run starts clean. df is chronological, so the state replays
+    # exactly what a live prediction loop would have seen.
+    PR._CHAIN_STATE.clear()
+
     stats = {inst: {'n': 0, 'match': 0, 'abs_err': 0.0} for inst in instruments}
     # TRADE/SKIP decision based on the model's OWN |predicted move| vs trade_threshold —
     # i.e. "would we have acted on this prediction?" — independent of the gate/temporal
@@ -475,7 +499,11 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
             actual = float(row[col]) if pd.notna(row[col]) else 0.0
             abs_err = abs(raw_pred - actual)
 
-            meaningful = abs(actual) >= dir_threshold
+            # Damped posts (chain-follower / endorsement / reiteration / stale)
+            # were DELIBERATELY not traded — grading their zeroed prediction
+            # against the market's move would pollute accuracy with fake
+            # misses. They are excluded from direction stats entirely.
+            meaningful = abs(actual) >= dir_threshold and not damped
             if meaningful:
                 match = np.sign(raw_pred) == np.sign(actual)
                 stats[inst]['n'] += 1
