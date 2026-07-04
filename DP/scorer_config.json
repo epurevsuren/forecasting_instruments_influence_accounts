@@ -24,9 +24,16 @@
       "productive discussions", "productive talks", "productive call",
       "productive meeting", "very good and productive",
       "agreement reached", "deal is done", "deal is complete",
-      "fully agreed", "hostages released", "hostages will be released",
+      "fully agreed by and between", "hostages released", "hostages will be released",
       "normalization", "diplomatic solution", "negotiated settlement",
       "lasting peace", "historic peace"
+    ],
+    "flag_escalation": [
+      "escalation", "escalating", "expanding this war", "ballistic missile",
+      "intercontinental", "largest attack", "massive attack", "record number of",
+      "new weapon", "first use", "mobilization", "nuclear test",
+      "testing our nuclear", "invaded", "invasion", "declared war",
+      "crossed the border", "offensive has begun"
     ],
     "flag_stimulus": [
       "stimulus", "relief", "spending", "package", "bailout", "infrastructure",

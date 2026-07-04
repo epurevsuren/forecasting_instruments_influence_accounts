@@ -84,6 +84,10 @@ TEMPORAL_PAST_PHRASES = [
     r"last night", r"yesterday", r"earlier today",
     r"overnight", r"earlier this week", r"last week", r"last month",
     r"a (?:few|couple of) (?:hours|days) ago", r"this past (?:weekend|week)",
+    # weekly/periodic RECAPS ("Over the past week, Ukraine has endured...") —
+    # summaries of already-public events; a Sunday recap must not wear
+    # Monday's macro move (the DeepSeek-crash label incident, post #14)
+    r"over the past (?:week|month|year|\d+ (?:days|weeks|months))",
 ]
 TEMPORAL_FUTURE_PHRASES = [
     r"tomorrow", r"next week", r"next month", r"next year",
@@ -94,6 +98,7 @@ TEMPORAL_BREAKING = [
     r"\bbreaking\b", r"\bjust announced\b", r"\bmoments ago\b", r"\bright now\b",
     r"\bhappening now\b", r"\bas we speak\b", r"\bat this (?:very )?moment\b",
     r"\bat my direction\b", r"\bhereby announc(?:e|ing|ed)\b",
+    r"\beffective immediately\b", r"\bwill begin immediately\b",
     r"\bwe got (?:him|her|them)\b",
     r"\bi (?:have |'ve |am |will |just |now |already |strongly |"
     r"formally |personally |immediately )*(?:ordered|directed|authorized|"
