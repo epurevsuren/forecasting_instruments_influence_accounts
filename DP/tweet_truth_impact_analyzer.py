@@ -11,18 +11,12 @@ load_dotenv()
 
 client = genai.Client()
 
-TICKERS = {
-    'SPY': ('SPY', 'us'), 'VIX': ('^VIX', 'us'),
-    'OIL': ('CL=F', '24h'), 'GOLD': ('GC=F', '24h'), 'BTC': ('BTC-USD', '24h'),
-    'QQQ': ('QQQ', 'us'), 'DIA': ('DIA', 'us'),
-    'XLI': ('XLI', 'us'), 'XLF': ('XLF', 'us'), 'XLE': ('XLE', 'us'),
-    'COPPER': ('HG=F', '24h'), 'NATGAS': ('NG=F', '24h'),
-    'EUR_USD': ('EURUSD=X', '24h'), 'USD_JPY': ('JPY=X', '24h'), 'GBP_USD': ('GBPUSD=X', '24h'),
-    'USD_CNY': ('CNY=X', '24h'), 'USD_CAD': ('CAD=X', '24h'), 'USD_MXN': ('MXN=X', '24h'),
-    'USD_CHF': ('CHF=X', '24h'), 'AUD_USD': ('AUDUSD=X', '24h'),
-    'US10Y': ('^TNX', 'us'), 'US2Y': ('^IRX', 'us'),
-    'ETH': ('ETH-USD', '24h'),
-}
+# Instruments loaded DYNAMICALLY from DP/instruments.json (master registry).
+import json as _json
+_INSTRUMENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    TICKERS = {k: (v["yf"], v["market"])
+               for k, v in _json.load(_f)["instruments"].items()}
 
 # --- 1. NEW DATA STRUCTURE: Define a sub-model for individual ticker impacts ---
 class TickerImpact(BaseModel):

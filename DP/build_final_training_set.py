@@ -113,50 +113,23 @@ BASELINE_DAYS        = 30    # prior 30 calendar days for expected-return baseli
 DOMINANCE_WINDOW_HRS = 2
 NLP_FLOOR_MULT       = 0.05
 
-TICKERS = {
-    # Core
-    'SPY':('SPY','us'),'VIX':('^VIX','us'),
-    'OIL':('CL=F','24h'),'GOLD':('GC=F','24h'),'BTC':('BTC-USD','24h'),
-    # US equity sectors / breadth
-    'QQQ':('QQQ','us'),'DIA':('DIA','us'),
-    'XLI':('XLI','us'),'XLF':('XLF','us'),'XLE':('XLE','us'),
-    # commodities
-    'COPPER':('HG=F','24h'),'NATGAS':('NG=F','24h'),
-    # FX majors (all cached with full history)
-    'EUR_USD':('EURUSD=X','24h'),'USD_JPY':('JPY=X','24h'),'GBP_USD':('GBPUSD=X','24h'),
-    'USD_CNY':('CNY=X','24h'),'USD_CAD':('CAD=X','24h'),'USD_MXN':('MXN=X','24h'),
-    'USD_CHF':('CHF=X','24h'),'AUD_USD':('AUDUSD=X','24h'),
-    # bonds
-    'US10Y':('^TNX','us'),'US2Y':('^IRX','us'),
-    # crypto
-    'ETH':('ETH-USD','24h'),
-}
-# 23 instruments — exactly what IBKR cached with full 2024-11→2026-05 history.
-# Cut per user: USD_KRW + SILVER + all Asian/EU indices
-# (failed download / no subscription / no clean US President transmission).
+# ------------------------------------------------------------------------
+# INSTRUMENTS — loaded DYNAMICALLY from DP/instruments.json (master registry:
+# yf symbol, market type, impact_cap, core flag, IBKR/Binance specs, emoji).
+# Add or remove an instrument THERE — no code edits needed anywhere.
+# ------------------------------------------------------------------------
+_INSTRUMENTS_FILE = os.path.join(_HERE, "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    INSTRUMENT_REGISTRY = json.load(_f)["instruments"]
+
+# {name: (yfinance_symbol, market_type)} — 'us' = US session, '24h' = always on
+TICKERS = {k: (v["yf"], v["market"]) for k, v in INSTRUMENT_REGISTRY.items()}
 
 # Realistic 1hr move ceilings — caps daily-data noise on old posts.
-IMPACT_CAP = {
-    # Equities/ETFs — rarely move >3% in 1hr even on big news
-    'SPY': 3.0, 'QQQ': 3.5, 'DIA': 3.0, 'XLI': 3.5, 'XLF': 3.5, 'XLE': 4.0,
-    # VIX — can spike hard but cap at reasonable 1hr bound
-    'VIX': 15.0,
-    # Commodities
-    'OIL': 6.0, 'GOLD': 3.0, 'SILVER': 5.0, 'COPPER': 4.0, 'NATGAS': 6.0,
-    # FX — move in small increments
-    'EUR_USD': 1.5, 'USD_JPY': 1.5, 'GBP_USD': 1.5, 'USD_CNY': 1.0,
-    'USD_CAD': 1.5, 'USD_MXN': 2.5, 'USD_CHF': 1.5, 'AUD_USD': 1.5, 'USD_KRW': 1.5,
-    # Asian/EU indexes (next-session, so allow full-day range)
-    'NIKKEI': 5.0, 'HANG_SENG': 5.0, 'SHANGHAI': 5.0, 'KOSPI': 5.0,
-    'ASX200': 4.0, 'TAIWAN': 5.0, 'INDIA': 4.0,
-    'DAX': 4.0, 'CAC40': 4.0, 'FTSE100': 4.0, 'EURO_STOXX': 4.0, 'IBEX': 4.0,
-    # Bonds (yields) — can move on rate news
-    'US10Y': 6.0, 'US2Y': 6.0,
-    # Crypto — most volatile
-    'BTC': 8.0, 'ETH': 10.0,
-}
+IMPACT_CAP = {k: float(v["impact_cap"]) for k, v in INSTRUMENT_REGISTRY.items()}
 
-CORE_INSTRUMENTS = ['SPY', 'VIX', 'OIL']
+# Pipeline core (labels deferred when ALL core instruments lack data)
+CORE_INSTRUMENTS = [k for k, v in INSTRUMENT_REGISTRY.items() if v.get("core")]
 
 # Market data containers — populated by fetch_market(), read by abnormal_* fns.
 intraday, daily = {}, {}

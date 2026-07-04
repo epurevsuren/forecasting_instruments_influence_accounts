@@ -246,17 +246,12 @@ def endorsement_factor(text):
     return 1.0, ""
 
 
-LABELS = [
-    ('SPY','\U0001f4c8','S&P 500'),('QQQ','\U0001f4bb','Nasdaq'),('DIA','\U0001f3ed','Dow'),
-    ('XLI','\U0001f527','Industrials'),('XLF','\U0001f3e6','Financials'),('XLE','⛽','Energy'),
-    ('VIX','\U0001f628','VIX Fear'),
-    ('OIL','\U0001f6e2️','WTI Oil'),('GOLD','\U0001f947','Gold'),('COPPER','\U0001f7eb','Copper'),('NATGAS','\U0001f525','NatGas'),
-    ('EUR_USD','\U0001f4b6','EUR/USD'),('USD_JPY','\U0001f4b4','USD/JPY'),('GBP_USD','\U0001f4b7','GBP/USD'),
-    ('USD_CNY','\U0001f1e8\U0001f1f3','USD/CNY'),('USD_CAD','\U0001f1e8\U0001f1e6','USD/CAD'),('USD_MXN','\U0001f1f2\U0001f1fd','USD/MXN'),
-    ('USD_CHF','\U0001f1e8\U0001f1ed','USD/CHF'),('AUD_USD','\U0001f1e6\U0001f1fa','AUD/USD'),
-    ('US10Y','\U0001f4dc','US 10Y'),('US2Y','\U0001f4c3','US 2Y'),
-    ('BTC','₿','Bitcoin'),('ETH','Ξ','Ethereum'),
-]
+# (name, emoji, display label) — loaded DYNAMICALLY from DP/instruments.json
+# (master registry). Add/remove instruments there, no code edits needed.
+_INSTRUMENTS_FILE = os.path.join(_HERE, "..", "DP", "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    LABELS = [(k, v.get("emoji", ""), v.get("label", k))
+              for k, v in json.load(_f)["instruments"].items()]
 
 _tok = _bert = None
 

@@ -39,11 +39,13 @@ OUT_DIR    = "finbert_nlp_xgb_models"
 FINBERT    = "ProsusAI/finbert"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 
-INSTRUMENTS = [
-    'SPY','QQQ','DIA','XLI','XLF','XLE','VIX','OIL','GOLD','COPPER','NATGAS',
-    'EUR_USD','USD_JPY','GBP_USD','USD_CNY','USD_CAD','USD_MXN','USD_CHF','AUD_USD',
-    'US10Y','US2Y','BTC','ETH',
-]
+# Instruments loaded DYNAMICALLY from DP/instruments.json (master registry) —
+# add/remove there, retrain, done. The trained set is frozen into
+# <model_dir>/config.json so predict/backtest always match the model.
+_INSTRUMENTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "DP", "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    INSTRUMENTS = list(json.load(_f)["instruments"].keys())
 
 # Policy flags + NER keys are read DYNAMICALLY from the canonical scorer
 # (DP/scorer_config.json + DP/signal_scorer.py) so adding a flag to the JSON

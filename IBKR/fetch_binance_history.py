@@ -41,10 +41,14 @@ BAR_CONFIG = {
     "30m": ("30m", "30min", 0.5),
 }
 
-INSTRUMENTS = [
-    ("BTC", "BTCUSDT"),
-    ("ETH", "ETHUSDT"),
-]
+# Instruments loaded DYNAMICALLY from ../DP/instruments.json (master registry):
+# every entry with a "binance" symbol is fetched. Add/remove there, no code edits.
+_INSTRUMENTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "DP", "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    INSTRUMENTS = [(name, v["binance"])
+                   for name, v in json.load(_f)["instruments"].items()
+                   if v.get("binance")]
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
@@ -311,8 +315,11 @@ def main():
                          "(or 2017-08-01 if no cache).")
     ap.add_argument("--until", metavar="YYYYMMDD[hhmm]", default=None,
                     help="End of fetch window. Default: now.")
-    ap.add_argument("--instruments", nargs="+", metavar="NAME", default=None,
-                    help="Fetch only these (e.g. --instruments BTC ETH).")
+    ap.add_argument("--instruments", nargs="+", metavar="COIN", default=None,
+                    help="Fetch only these. Defaults (instruments.json): BTC ETH. "
+                         "ANY other coin works bare and pairs with USD "
+                         "(SOL -> SOLUSDT, DOGE -> DOGEUSDT). Bars land in the "
+                         "same market_data_cache/ -- usable anywhere.")
     args = ap.parse_args()
 
     interval, suffix, throttle = BAR_CONFIG[args.bar_size]
@@ -334,11 +341,18 @@ def main():
     manifest = ensure_cache_dir()
 
     if args.instruments:
-        names   = {n.upper() for n in args.instruments}
-        todo    = [(n, s) for n, s in INSTRUMENTS if n in names]
-        unknown = names - {n for n, _ in todo}
-        if unknown:
-            print(f"[!] Unknown instruments ignored: {', '.join(sorted(unknown))}")
+        # Registry names (instruments.json) resolve to their configured pair;
+        # any OTHER coin pairs with USD automatically (SOL -> SOLUSDT).
+        # Bars go to the same cache, usable anywhere.
+        registry = dict(INSTRUMENTS)
+        todo = []
+        for token in args.instruments:
+            name = token.upper()
+            if name in registry:
+                todo.append((name, registry[name]))
+            else:
+                todo.append((name, f"{name}USDT"))
+                print(f"[+] {name} -> {name}USDT")
     else:
         todo = INSTRUMENTS
 

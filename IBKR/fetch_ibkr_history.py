@@ -96,44 +96,80 @@ def C_index(sym, exch="CBOE"): return Index(sym, exch, "USD")
 def C_contfut(sym, exch):      return ContFuture(sym, exch, currency="USD")
 def C_fx(pair):                return Forex(pair)
 
-INSTRUMENTS = [
-    # ---- CORE 5 ----
-    ("SPY",   C_stock("SPY"),               "TRADES"),
-    ("VIX",   C_index("VIX", "CBOE"),       "TRADES"),
-    ("OIL",   C_contfut("CL", "NYMEX"),     "TRADES"),
-    ("GOLD",  C_contfut("GC", "COMEX"),     "TRADES"),
-    ("BTC",   Crypto("BTC", "PAXOS", "USD"),"AGGTRADES"),
+# Instruments loaded DYNAMICALLY from ../DP/instruments.json (master registry).
+# Each entry's "ibkr" object: kind (stock|index|contfut|fx|crypto), symbol,
+# exchange, what (whatToShow), core (True = member of the --core fetch set).
+# Add or remove an instrument THERE — no code edits needed.
+import json as _json
+_INSTRUMENTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "DP", "instruments.json")
 
-    # ---- US equity sectors ----
-    ("QQQ",  C_stock("QQQ"), "TRADES"),
-    ("DIA",  C_stock("DIA"), "TRADES"),
-    ("XLI",  C_stock("XLI"), "TRADES"),
-    ("XLF",  C_stock("XLF"), "TRADES"),
-    ("XLE",  C_stock("XLE"), "TRADES"),
 
-    # ---- commodities ----
-    ("COPPER", C_contfut("HG", "COMEX"), "TRADES"),
-    ("NATGAS", C_contfut("NG", "NYMEX"), "TRADES"),
+def _build_contract(spec):
+    kind = spec["kind"]
+    if kind == "stock":   return C_stock(spec["symbol"])
+    if kind == "index":   return C_index(spec["symbol"], spec.get("exchange", "CBOE"))
+    if kind == "contfut": return C_contfut(spec["symbol"], spec["exchange"])
+    if kind == "fx":      return C_fx(spec["symbol"])
+    if kind == "crypto":  return Crypto(spec["symbol"], spec.get("exchange", "PAXOS"), "USD")
+    raise ValueError(f"Unknown ibkr contract kind: {kind!r}")
 
-    # ---- FX ----
-    ("EUR_USD", C_fx("EURUSD"), "MIDPOINT"),
-    ("USD_JPY", C_fx("USDJPY"), "MIDPOINT"),
-    ("GBP_USD", C_fx("GBPUSD"), "MIDPOINT"),
-    ("USD_CNY", C_fx("USDCNH"), "MIDPOINT"),
-    ("USD_CAD", C_fx("USDCAD"), "MIDPOINT"),
-    ("USD_MXN", C_fx("USDMXN"), "MIDPOINT"),
-    ("USD_CHF", C_fx("USDCHF"), "MIDPOINT"),
-    ("AUD_USD", C_fx("AUDUSD"), "MIDPOINT"),
 
-    # ---- bonds ----
-    ("US10Y", C_contfut("ZN", "CBOT"), "TRADES"),
-    ("US2Y",  C_contfut("ZT", "CBOT"), "TRADES"),
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    _REGISTRY = _json.load(_f)["instruments"]
 
-    # ---- crypto ----
-    ("ETH", Crypto("ETH", "PAXOS", "USD"), "AGGTRADES"),
-]
+INSTRUMENTS = [(name, _build_contract(v["ibkr"]), v["ibkr"]["what"])
+               for name, v in _REGISTRY.items() if "ibkr" in v]
 
-CORE_NAMES = {"SPY", "VIX", "OIL", "GOLD", "BTC"}
+CORE_NAMES = {name for name, v in _REGISTRY.items()
+              if v.get("ibkr", {}).get("core")}
+
+# Bare futures symbols (investing.com style) -> IBKR exchange. Ad-hoc
+# --instruments tokens not in instruments.json resolve through this first —
+# futures are the main ad-hoc use case.
+FUTURES_EXCHANGES = {
+    # NYMEX energy / platinum group
+    "CL": "NYMEX", "NG": "NYMEX", "HO": "NYMEX", "RB": "NYMEX",
+    "PA": "NYMEX", "PL": "NYMEX",
+    # COMEX metals
+    "GC": "COMEX", "SI": "COMEX", "HG": "COMEX",
+    # CBOT rates / grains / mini Dow
+    "ZN": "CBOT", "ZT": "CBOT", "ZF": "CBOT", "ZB": "CBOT", "UB": "CBOT",
+    "ZC": "CBOT", "ZS": "CBOT", "ZW": "CBOT", "ZL": "CBOT", "ZM": "CBOT",
+    "YM": "CBOT",
+    # CME equity index / FX / livestock
+    "ES": "CME", "NQ": "CME", "RTY": "CME", "LE": "CME", "HE": "CME", "GF": "CME",
+    "6E": "CME", "6J": "CME", "6B": "CME", "6A": "CME", "6C": "CME",
+    "6M": "CME", "6N": "CME",
+    # CBOE futures
+    "VX": "CFE",
+}
+_FUT_QUALIFY_EXCHANGES = ("NYMEX", "COMEX", "CBOT", "CME", "CFE")
+
+
+def resolve_symbol(ib, sym):
+    """
+    Resolve a bare ad-hoc symbol (investing.com style: SI, ZC, ES, AAPL...)
+    to (name, contract, whatToShow). Futures first — the main ad-hoc case:
+      1. FUTURES_EXCHANGES map            (SI -> ContFuture SI @ COMEX)
+      2. live ContFuture qualification against the major exchanges
+      3. fallback: Stock @ SMART
+    The CSV lands in the same market_data_cache/ as registry instruments, so
+    the bars are usable anywhere — inside or outside this project.
+    """
+    s = sym.upper()
+    if s in FUTURES_EXCHANGES:
+        return (s, C_contfut(s, FUTURES_EXCHANGES[s]), "TRADES")
+    for exch in _FUT_QUALIFY_EXCHANGES:
+        try:
+            c = C_contfut(s, exch)
+            if ib.qualifyContracts(c):
+                print(f"  🔎 {s}: resolved as future on {exch}")
+                return (s, c, "TRADES")
+        except Exception:
+            pass
+    print(f"  🔎 {s}: not a known future — fetching as stock (SMART)")
+    return (s, C_stock(s), "TRADES")
 
 
 # ==========================================
@@ -555,8 +591,12 @@ def main():
                     help="Start of fetch window. Default: per-instrument latest cached date.")
     ap.add_argument("--until", metavar="YYYYMMDD[hhmm]", default=None,
                     help="End of fetch window. Default: now.")
-    ap.add_argument("--instruments", nargs="+", metavar="NAME", default=None,
-                    help="Fetch only these instruments (e.g. --instruments OIL GOLD SPY).")
+    ap.add_argument("--instruments", nargs="+", metavar="SYMBOL", default=None,
+                    help="Fetch only these. Registry names (instruments.json) work "
+                         "as-is (OIL GOLD SPY). ANY other symbol works bare, "
+                         "investing.com style — futures resolve first (SI -> COMEX "
+                         "silver, ZC -> CBOT corn, ES -> CME e-mini), unknown "
+                         "symbols fall back to stock. Bars land in the same cache.")
     ap.add_argument("--core-only", action="store_true",
                     help="Fetch only SPY VIX OIL GOLD BTC.")
     ap.add_argument("--port", type=int, default=PORT)
@@ -594,11 +634,16 @@ def main():
     print("✅ Connected\n")
 
     if args.instruments:
-        names   = {n.upper() for n in args.instruments}
-        todo    = [x for x in INSTRUMENTS if x[0] in names]
-        unknown = names - {x[0] for x in todo}
-        if unknown:
-            print(f"⚠️  Unknown instruments ignored: {', '.join(sorted(unknown))}")
+        # Registry names resolve from instruments.json; any OTHER bare symbol
+        # resolves investing.com style via resolve_symbol() (futures first).
+        registry = {x[0]: x for x in INSTRUMENTS}
+        todo = []
+        for token in args.instruments:
+            name = token.upper()
+            if name in registry:
+                todo.append(registry[name])
+            else:
+                todo.append(resolve_symbol(ib, name))
         mode = ", ".join(x[0] for x in todo)
     elif args.core_only or CORE_ONLY:
         todo = [x for x in INSTRUMENTS if x[0] in CORE_NAMES]
