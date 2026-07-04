@@ -106,11 +106,10 @@ LIVE_DIR = os.path.join(_HERE, "finbert_nlp_xgb_models_live")   # fine-tuned, up
 FINBERT = "ProsusAI/finbert"
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
-_ENTITIES_FILE = os.path.join(_DP, "geopolitical_entities.json")
-
+_ENTITIES_FILE = os.path.join(_DP, "influence_accounts.json")
 
 def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json."""
+    """Return the rank-0 TruthSocial account handle from influence_accounts.json."""
     try:
         import json
         with open(_ENTITIES_FILE, encoding="utf-8") as f:

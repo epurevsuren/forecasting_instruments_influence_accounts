@@ -14,7 +14,7 @@ Platform is a factual string ('truthsocial' | 'x_twitter'). is_primary is a deri
 boolean (platform == 'truthsocial') stored in posts_scored for XGBoost features.
 
 The entity_weight and event_weight columns come from unified_feed (populated by
-sync_unified_feed.py, which reads geopolitical_entities.json + events.json).
+sync_unified_feed.py, which reads influence_accounts.json + events.json).
 
 PUBLIC API (importable):
   CONFIG, FEED_TABLE, SCORED_TABLE
@@ -65,11 +65,10 @@ SOURCE_DISCOUNT   = 0.7      # X/Twitter geo posts: sample_weight capped at 70% 
 GEO_WEIGHT_CAP    = 0.70     # hard ceiling for X/Twitter geo post sample_weight
 PRIMARY_WEIGHT_CAP = 1.00    # hard ceiling for rank-0 primary account sample_weight
 
-_ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
-
+_ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
 
 def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json.
+    """Return the rank-0 TruthSocial account handle from influence_accounts.json.
     Falls back to 'us_president' if the file is missing or empty."""
     try:
         import json
@@ -80,6 +79,45 @@ def _rank0_handle() -> str:
         return ts[0]["account"] if ts else "us_president"
     except Exception:
         return "us_president"
+
+
+def _rank0_windows() -> dict:
+    """
+    {handle_lower: (from_ts|None, to_ts|None)} for ALL rank-0 primary accounts,
+    ANY platform. Multiple rank-0 entries with disjoint active windows support
+    election handovers and back-simulation: Trump T2 on TruthSocial
+    (2025-01-20 -> 2029-01-20), Trump T1 / Biden on X in their eras, and the
+    NEXT president (JD Vance? a Trump kid?) whenever they're added. The post's
+    DATE decides who is primary at that moment.
+    """
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+
+    try:
+        import json as _json
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = _json.load(f).get("primary_accounts", [])
+    except Exception:
+        return {}
+    out = {}
+    for a in accounts:
+        try:
+            if int(a.get("rank", 99)) != 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        h = str(a.get("account", "")).strip().lower()
+        if not h:
+            continue
+        lo = _p(a.get("active_from"))
+        hi = _p(a.get("active_to")) or _p(a.get("expiration_date"))
+        out[h] = (lo, hi)
+    return out
 
 
 def _resolve_config_path():
@@ -405,11 +443,29 @@ def _prepare_feed_df(feed: pd.DataFrame) -> pd.DataFrame:
         feed["platform"] = "truthsocial"   # safe default
     # is_primary: used in _apply_entity_event_weight and stored in posts_scored for XGBoost
     if "is_primary" not in feed.columns:
-        # is_primary = rank-0 TruthSocial ONLY (account_rank == 0).
-        # Secondary TruthSocial accounts (rank > 0, e.g. a future candidate)
-        # are NOT is_primary — they get entity_weight scaling without SOURCE_DISCOUNT.
+        # is_primary = rank-0 PRIMARY ACCOUNT within its ACTIVE WINDOW.
+        # Platform-agnostic + time-aware for election handovers/back-sim:
+        # Trump T2 is rank-0 on TruthSocial, but Trump T1 / Biden / the next
+        # president may be rank-0 on X in THEIR era. Multiple rank-0 entries
+        # with disjoint windows are allowed — the post date picks the primary.
         _acct_rank = feed["account_rank"].fillna(99).astype(float) if "account_rank" in feed.columns else pd.Series(99.0, index=feed.index)
-        feed["is_primary"] = (feed["platform"] == "truthsocial") & (_acct_rank == 0)
+        _wins = _rank0_windows()
+        _acc_l = (feed["account"].fillna("").astype(str).str.lower()
+                  if "account" in feed.columns else pd.Series("", index=feed.index))
+        _in_win = pd.Series(False, index=feed.index)
+        for _h, (_lo, _hi) in _wins.items():
+            _m = (_acc_l == _h)
+            if not _m.any():
+                continue
+            if _lo is not None:
+                _m &= (feed["date"] >= _lo)
+            if _hi is not None:
+                _m &= (feed["date"] <= _hi)
+            _in_win |= _m
+        if _wins:
+            feed["is_primary"] = (_acct_rank == 0) & _in_win
+        else:   # no windows declared — legacy behaviour
+            feed["is_primary"] = (feed["platform"] == "truthsocial") & (_acct_rank == 0)
     if "entity_weight" not in feed.columns: feed["entity_weight"] = 1.0
     if "event_weight"  not in feed.columns: feed["event_weight"]  = 1.0
     feed["text_clean"] = feed["text"].fillna("").apply(
@@ -650,11 +706,19 @@ def score_incremental(context_days: int = 3, novelty_window: int = 10):
                        ctx_texts=ctx_texts, ctx_dates=ctx_dates,
                        ctx_raw=ctx_raw, novelty_window=novelty_window)
 
-    # Align to existing column order (fill any missing with 0)
+    # Align to existing column order (fill any missing with 0) while KEEPING
+    # any NEW feature columns — e.g. a flag the daily LLM added to
+    # scorer_config.json this morning. db.append_table evolves the table
+    # schema (ALTER ... DEFAULT 0), so every historical post reads false/0
+    # for the new flag with NO full re-score.
     for c in scored_cols:
         if c not in new.columns:
             new[c] = 0
-    out = new.reindex(columns=scored_cols, fill_value=0)
+    extra = [c for c in new.columns if c not in scored_cols and c != "text_clean"]
+    if extra:
+        print(f"  🧬 New feature column(s) from config: {extra[:8]}"
+              f"{'...' if len(extra) > 8 else ''} — old posts default to 0/false")
+    out = new.reindex(columns=scored_cols + extra, fill_value=0)
 
     db.append_table(SCORED_TABLE, out.drop(columns=["text_clean"], errors="ignore"))
 

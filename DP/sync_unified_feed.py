@@ -47,7 +47,7 @@ for _s in (sys.stdout, sys.stderr):
             pass
 
 # ------------------------------------------------------------------ paths ----
-ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
+ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
 TRUTHS_CSV    = os.path.join(_HERE, "truth_social.csv")
 TWEETS_CSV    = os.path.join(_HERE, "x_tweets_en.csv")
 FEED_TABLE    = "unified_feed"
@@ -169,7 +169,7 @@ def _load_primary_account_map() -> dict:
     """
     Build {handle_lower: {account, account_name, account_rank,
                           entity_weight, event_weight}}
-    from geopolitical_entities.json primary_accounts.
+    from influence_accounts.json primary_accounts.
 
     Falls back to sensible defaults if an account is not in the JSON so that
     truth_social.csv rows for any handle are always processable.
@@ -205,7 +205,7 @@ def _build_truths() -> pd.DataFrame:
     'realDonaldTrump' so existing data is never broken.
 
     Per-account metadata (account_name, rank, entity_weight, event_weight) is
-    resolved from geopolitical_entities.json primary_accounts, making this
+    resolved from influence_accounts.json primary_accounts, making this
     function automatically aware of any new account added to that file.
     """
     if not os.path.exists(TRUTHS_CSV):
@@ -214,7 +214,7 @@ def _build_truths() -> pd.DataFrame:
 
     df = pd.read_csv(TRUTHS_CSV, dtype={"id": str})
 
-    # Load account metadata from geopolitical_entities.json (needed for legacy fallback too)
+    # Load account metadata from influence_accounts.json (needed for legacy fallback too)
     primary_map = _load_primary_account_map()
 
     # Legacy files (single-account era) have no 'account' column —
@@ -284,8 +284,22 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
     df = df[df["_type"] != "url_only"].copy()
     df = df.drop(columns=["_type"])
 
+    # ELECTION/BACK-SIM SUPPORT: an X/Twitter handle can BE a primary account
+    # (rank 0..N in primary_accounts) — Trump term 1 and Biden posted on X,
+    # and a future president may too. primary_accounts metadata wins over the
+    # entity list so era presidents keep rank-0 weight on either platform.
+    primary_map = _load_primary_account_map()
+
     # Unknown handles get low-weight defaults
     def _lookup(handle: str) -> dict:
+        p = primary_map.get(str(handle).lower())
+        if p:
+            return {
+                "account_rank":   p["account_rank"],
+                "mention_count":  None,
+                "entity_weight":  p["entity_weight"],
+                "event_weight":   p["event_weight"],
+            }
         info = entity_map.get(str(handle).lower(), {})
         return {
             "account_rank":   info.get("rank", None),
@@ -316,6 +330,75 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
     return rows[UNIFIED_FEED_COLS]
 
 
+# -------------------------------------------------- active-window damping ----
+# Accounts in influence_accounts.json may declare "active_from"/"active_to"
+# (ISO date; null/"N/A" = open-ended): the timeframe when the account actually
+# moves markets. Built for BACK-SIMULATION — e.g. Biden's account active
+# 2021-01-20→2025-01-20, Trump term 1 vs term 2, billionaires (Musk et al.)
+# influential only in specific windows. Posts OUTSIDE the window keep flowing
+# into the feed (raw data preserved) but their entity_weight is damped hard.
+
+OUT_OF_WINDOW_FACTOR = 0.05
+
+
+def _active_windows() -> dict:
+    """{handle_lower: (from_ts|None, to_ts|None)} for every account that
+    declares an active window in influence_accounts.json."""
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+
+    try:
+        with open(ENTITIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    entries = (data.get("primary_accounts", []) + data.get("entities", [])
+               + data.get("institutions", {}).get("entries", []))
+    out = {}
+    for e in entries:
+        h = (e.get("account") or e.get("twitter_handle") or "").lstrip("@")
+        if not h:
+            continue
+        lo, hi = _p(e.get("active_from")), _p(e.get("active_to"))
+        if lo is not None or hi is not None:
+            out[h.lower()] = (lo, hi)
+    return out
+
+
+def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
+    """Damp entity_weight (×OUT_OF_WINDOW_FACTOR) for posts dated outside
+    their account's declared active window."""
+    wins = _active_windows()
+    if not wins or df.empty:
+        return df
+    dt  = pd.to_datetime(df["date"], format="mixed", utc=True)
+    acc = df["account"].fillna("").astype(str).str.lower()
+    n_damped = 0
+    for handle, (lo, hi) in wins.items():
+        m = (acc == handle)
+        if not m.any():
+            continue
+        outside = pd.Series(False, index=df.index)
+        if lo is not None:
+            outside |= m & (dt < lo)
+        if hi is not None:
+            outside |= m & (dt > hi)
+        if outside.any():
+            df.loc[outside, "entity_weight"] = (
+                df.loc[outside, "entity_weight"].astype(float)
+                * OUT_OF_WINDOW_FACTOR).round(4)
+            n_damped += int(outside.sum())
+    if n_damped:
+        print(f"  ⏳ {n_damped} post(s) outside their account's active window "
+              f"— entity_weight ×{OUT_OF_WINDOW_FACTOR}")
+    return df
+
+
 # -------------------------------------------------------------- sync main ----
 
 def sync(full: bool = False) -> int:
@@ -340,6 +423,9 @@ def sync(full: bool = False) -> int:
     combined = pd.concat([truths, tweets], ignore_index=True)
     combined["_dt"] = pd.to_datetime(combined["date"], format="mixed", utc=True)
     combined = combined.sort_values("_dt").drop(columns=["_dt"]).reset_index(drop=True)
+
+    # Back-simulation support: damp weights outside each account's active window
+    combined = _apply_active_windows(combined)
 
     if full:
         db.write_table(FEED_TABLE, combined)

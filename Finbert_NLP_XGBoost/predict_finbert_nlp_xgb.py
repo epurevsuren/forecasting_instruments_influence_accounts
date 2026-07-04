@@ -19,11 +19,10 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 NY = 'America/New_York'
 
 _HERE          = os.path.dirname(os.path.abspath(__file__))
-_ENTITIES_FILE = os.path.join(_HERE, "..", "DP", "geopolitical_entities.json")
-
+_ENTITIES_FILE = os.path.join(_HERE, "..", "DP", "influence_accounts.json")
 
 def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json."""
+    """Return the rank-0 TruthSocial account handle from influence_accounts.json."""
     try:
         with open(_ENTITIES_FILE, encoding="utf-8") as f:
             accounts = json.load(f).get("primary_accounts", [])
@@ -36,7 +35,7 @@ def _rank0_handle() -> str:
 
 def _build_handle_country_map() -> dict:
     """
-    Build {handle_lower: country_alpha2} from all entries in geopolitical_entities.json.
+    Build {handle_lower: country_alpha2} from all entries in influence_accounts.json.
     Covers primary_accounts (by 'account'), entities and institutions (by 'twitter_handle').
     """
     try:
@@ -119,7 +118,7 @@ TEMPORAL_PAST_DAMP_AFTERHOURS = 0.3
 
 # Poster-local timezones: time-of-day phrases ("last night", "this morning")
 # are read on the POSTER's clock, not New York's. Zelensky's "last night" at
-# 03:41 EDT is 10:41 in Kyiv. Covers every country in geopolitical_entities.json.
+# 03:41 EDT is 10:41 in Kyiv. Covers every country in influence_accounts.json.
 COUNTRY_TZ = {
     'US': 'America/New_York',  'UA': 'Europe/Kyiv',      'RU': 'Europe/Moscow',
     'IL': 'Asia/Jerusalem',    'IR': 'Asia/Tehran',      'CN': 'Asia/Shanghai',
@@ -158,7 +157,7 @@ def temporal_factor(text, post_hour=None, post_ts=None, country=None):
     post_hour : NY-local hour (legacy path, used when post_ts/country absent).
     post_ts   : tz-aware post timestamp; combined with `country` it yields the
                 POSTER-LOCAL hour for interpreting time-of-day phrases.
-    country   : ISO alpha-2 of the posting account (geopolitical_entities.json).
+    country   : ISO alpha-2 of the posting account (influence_accounts.json).
     """
     t = text.lower()
     has_future_time = any(re.search(p, t) for p in TEMPORAL_FUTURE_PHRASES)
@@ -261,6 +260,26 @@ def load(model_dir=None):
     global _tok, _bert, TRADE_ACCURACY
     model_dir = model_dir or OUT_DIR
     cfg = json.load(open(f"{model_dir}/config.json"))
+
+    # CONFIG-DRIFT NOTICE: scorer_config.json evolves daily (LLM-updated), but
+    # this model only uses the feature list frozen at ITS train time
+    # (cfg['nlp_features']). Newer flags are scored+stored in the DB but
+    # ignored here until the next retrain — safe, never a crash. This just
+    # makes the drift visible so you know when a retrain is worth it.
+    try:
+        cur_flags   = set(ss.CONFIG["policy_flags"].keys())
+        model_feats = set(cfg["nlp_features"])
+        new_flags     = sorted(cur_flags - model_feats)
+        dropped_flags = sorted(f for f in model_feats
+                               if f.startswith("flag_") and f not in cur_flags)
+        if new_flags:
+            print(f"  ℹ️  {len(new_flags)} newer flag(s) in scorer_config.json not in this "
+                  f"model (stored in DB, ignored until retrain): {', '.join(new_flags[:5])}")
+        if dropped_flags:
+            print(f"  ℹ️  {len(dropped_flags)} flag(s) removed from config since training "
+                  f"(fed as 0): {', '.join(dropped_flags[:5])}")
+    except Exception:
+        pass
 
     acc_path = f"{model_dir}/trade_accuracy.json"
     if os.path.exists(acc_path):

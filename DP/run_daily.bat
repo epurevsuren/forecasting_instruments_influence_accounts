@@ -81,6 +81,24 @@ powershell -NoProfile -Command ^
    | Tee-Object -FilePath 'logs\sync_unified_feed_%TS%.log'"
 
 REM ---------------------------------------------------------------------------
+REM Step 4.5: LLM config curator (OPTIONAL — runs only if GEMINI_API_KEY set).
+REM   Proposes strictly-additive deltas to scorer_config.json /
+REM   influence_accounts.json / events.json from the last days' posts.
+REM   Validated + backed up (config_backups\) + changelogged. Runs BEFORE the
+REM   scorer so today's posts are scored with today's config. New flags reach
+REM   posts_scored via DuckDB schema evolution (old posts default 0) — no
+REM   full re-score, no retrain needed until the drift notice says so.
+REM ---------------------------------------------------------------------------
+if defined GEMINI_API_KEY (
+  powershell -NoProfile -Command ^
+    "uv run python update_configs_llm.py ^
+     2>>'logs\config_curator_%TS%.err' ^
+     | Tee-Object -FilePath 'logs\config_curator_%TS%.log'"
+) else (
+  echo [skip] Step 4.5 config curator: GEMINI_API_KEY not set
+)
+
+REM ---------------------------------------------------------------------------
 REM Step 5: Score new posts (incremental: only new (id,source) pairs)
 REM ---------------------------------------------------------------------------
 powershell -NoProfile -Command ^

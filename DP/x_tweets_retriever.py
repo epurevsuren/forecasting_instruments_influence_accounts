@@ -1,7 +1,7 @@
 """
 x_tweets_retriever.py
 ======================
-Retrieves tweets for the geopolitical accounts in DP/geopolitical_entities.json
+Retrieves tweets for the geopolitical accounts in DP/influence_accounts.json
 using Playwright (local headless Chromium with your real X cookies).
 
 SETUP
@@ -44,7 +44,7 @@ UTC = timezone.utc
 # ------------------------------------------------------------------ config ----
 _HERE         = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE   = os.path.join(_HERE, "x_tweets.csv")
-ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
+ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
 COOKIES_FILE  = os.path.join(_HERE, ".x_cookies.json")
 
 COLUMNS = ["id", "date", "text", "url", "favorites", "retweets", "replies",
@@ -86,11 +86,32 @@ def monthly_chunks(since, until):
         cur = nxt
 
 
+def _is_expired(entry) -> bool:
+    """
+    True when the account's influence window has ENDED (active_to or
+    expiration_date strictly in the past) — resigned, dead, out of office,
+    or moved platforms. ONLY expiry excludes an account: a not-yet-started
+    active_from (e.g. Kremlin might reactivate, an election candidate not
+    yet sworn in) still gets fetched — who knows when they start mattering,
+    and the active-window damping in sync_unified_feed handles the weighting.
+    """
+    for key in ("active_to", "expiration_date"):
+        v = entry.get(key)
+        if v is None or str(v).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            continue
+        try:
+            if pd.Timestamp(v).date() < datetime.now(UTC).date():
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
 def load_tracked_accounts(handles_filter=None):
     with open(ENTITIES_FILE, encoding="utf-8") as f:
         data = json.load(f)
 
-    accounts, seen = [], set()
+    accounts, seen, skipped = [], set(), []
     sections = [data.get("entities", []),
                 data.get("institutions", {}).get("entries", [])]
     for entries in sections:
@@ -102,7 +123,12 @@ def load_tracked_accounts(handles_filter=None):
             if handle.lower() in seen:
                 continue
             seen.add(handle.lower())
+            if _is_expired(entry):
+                skipped.append(handle)
+                continue
             accounts.append({"handle": handle, "name": entry.get("name", handle)})
+    if skipped:
+        print(f"[skip] {len(skipped)} expired account(s) not fetched: {', '.join(skipped)}")
 
     if handles_filter:
         wanted = {h.lstrip("@").lower() for h in handles_filter}
@@ -520,7 +546,7 @@ def main():
         description="Retrieve tweets for tracked geopolitical X accounts via Playwright.")
     ap.add_argument("--handles",
                     help="Comma-separated handles (with or without @). "
-                         "Default: all accounts in geopolitical_entities.json.")
+                         "Default: all accounts in influence_accounts.json.")
     ap.add_argument("--since",
                     help="YYYYMMDD or YYYY-MM-DD: fetch tweets on or after this date.")
     ap.add_argument("--until",

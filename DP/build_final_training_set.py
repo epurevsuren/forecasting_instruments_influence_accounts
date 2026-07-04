@@ -84,11 +84,10 @@ import db  # DuckDB helper (DP/db.py) -> ../database.db
 import json
 
 CACHE_DIR      = os.path.join(_HERE, "..", "IBKR", "market_data_cache")
-_ENTITIES_FILE = os.path.join(_HERE, "geopolitical_entities.json")
-
+_ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
 
 def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from geopolitical_entities.json.
+    """Return the rank-0 TruthSocial account handle from influence_accounts.json.
     Falls back to 'us_president' if the file is missing or has no primary accounts."""
     try:
         with open(_ENTITIES_FILE, encoding="utf-8") as f:

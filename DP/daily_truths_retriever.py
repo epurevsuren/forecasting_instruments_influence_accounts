@@ -2,13 +2,13 @@
 daily_truths_retriever.py
 =========================
 Daily, incremental retriever for Truth Social posts. Accounts to retrieve are
-driven by the `primary_accounts` list in DP/geopolitical_entities.json — no
+driven by the `primary_accounts` list in DP/influence_accounts.json — no
 account is hardcoded here, so adding a future candidate (e.g. for the 2028
 election) only requires updating that JSON file.
 
 What this script does
 ---------------------
-For each primary account listed in geopolitical_entities.json:
+For each primary account listed in influence_accounts.json:
   * loads the ids already in truth_social.csv for that account,
   * pulls only recent statuses (from the last captured post, with a small
     overlap window to catch any posts missed on a previous run),
@@ -72,8 +72,7 @@ warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 # ------------------------------------------------------------------ paths ----
 _HERE           = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE     = os.path.join(_HERE, "truth_social.csv")
-ENTITIES_FILE   = os.path.join(_HERE, "geopolitical_entities.json")
-
+ENTITIES_FILE   = os.path.join(_HERE, "influence_accounts.json")
 # ----------------------------------------------------------------- config ----
 LOOKBACK_DAYS    = 3      # re-scan window before the last post (dedup handles repeats)
 CHECKPOINT_EVERY = 100    # append + sleep every N new rows (be gentle on the API)
@@ -84,13 +83,13 @@ COLUMNS          = ["id", "account", "date", "text", "url",
 # --------------------------------------------------------- account loading ----
 def load_primary_accounts() -> list[dict]:
     """
-    Return the `primary_accounts` list from geopolitical_entities.json.
+    Return the `primary_accounts` list from influence_accounts.json.
 
     Each entry is expected to have at minimum:
         { "account": "realDonaldTrump", "name": "Donald J. Trump", ... }
 
     Adding a new TruthSocial account for a future candidate only requires
-    appending an entry to geopolitical_entities.json — no code change needed.
+    appending an entry to influence_accounts.json — no code change needed.
     """
     try:
         with open(ENTITIES_FILE, encoding="utf-8") as f:
@@ -100,13 +99,34 @@ def load_primary_accounts() -> list[dict]:
 
     accounts = data.get("primary_accounts", [])
     if not accounts:
-        sys.exit("❌ 'primary_accounts' list is empty in geopolitical_entities.json.")
+        sys.exit("❌ 'primary_accounts' list is empty in influence_accounts.json.")
 
     # Only TruthSocial accounts are relevant for this retriever
     ts_accounts = [a for a in accounts if a.get("platform") == "truthsocial"]
-    if not ts_accounts:
-        sys.exit("❌ No primary_accounts with platform='truthsocial' found.")
-    return ts_accounts
+
+    # EXPIRY FILTER: skip only accounts whose window has ENDED (active_to /
+    # expiration_date strictly in the past — resigned, dead, out of office).
+    # A future active_from does NOT exclude: not-yet-active accounts might
+    # start mattering any day, and sync's active-window damping weights them.
+    def _is_expired(a) -> bool:
+        for key in ("active_to", "expiration_date"):
+            v = a.get(key)
+            if v is None or str(v).strip().upper() in ("", "N/A", "NONE", "NULL"):
+                continue
+            try:
+                if pd.Timestamp(v).date() < datetime.now(timezone.utc).date():
+                    return True
+            except (ValueError, TypeError):
+                continue
+        return False
+
+    live = [a for a in ts_accounts if not _is_expired(a)]
+    skipped = [a.get("account", "?") for a in ts_accounts if _is_expired(a)]
+    if skipped:
+        print(f"⏭️  Skipping {len(skipped)} expired account(s): {', '.join(skipped)}")
+    if not live:
+        sys.exit("❌ No non-expired primary_accounts with platform='truthsocial' found.")
+    return live
 
 
 # ----------------------------------------------------------------- helpers ----
@@ -308,7 +328,7 @@ def main():
     elif args.since:
         created_after = parse_date(args.since)
 
-    # Load account list from geopolitical_entities.json so no account
+    # Load account list from influence_accounts.json so no account
     # is ever hardcoded here. Adding a 2028 candidate = edit the JSON only.
     all_accounts = load_primary_accounts()
     if args.account:

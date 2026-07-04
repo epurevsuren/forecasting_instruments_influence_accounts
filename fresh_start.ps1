@@ -1,5 +1,5 @@
 # 0. Fresh start — delete ONLY the DuckDB file (keep all CSVs!)
-cd D:\Coding\forecasting_instruments_influence_accounts
+Set-Location D:\Coding\forecasting_instruments_influence_accounts
 Remove-Item database.db
 
 # 1. Top up TruthSocial posts (auto-resumes from last captured post)
@@ -9,7 +9,7 @@ uv run python daily_truths_retriever.py
 
 # 2. Top up X/geo tweets since your last run (~mid-June; adjust date)
 #    If it returns 0 for ALL accounts, cookies expired -> re-export DP\.x_cookies.json
-uv run python x_tweets_retriever.py --since 20260615
+uv run python x_tweets_retriever.py
 
 # 3. Rebuild English-only tweet file
 uv run python filter_english_tweets.py
@@ -29,7 +29,7 @@ cd ..\Finbert_NLP_XGBoost
 uv run python train_finbert_nlp_xgb.py
 
 # 9. Direction backtest over the full window (until = now, NY time)
-uv run python backtest_simulator.py 202607020900 --from 202411010000
+.\run_backtest.bat 202607040000 --from 202411010000
 
 # 10. Layer-2 TP/SL simulation (auto-picks the latest backtest CSV)
 uv run python simulate_tp_sl.py

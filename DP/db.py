@@ -136,15 +136,58 @@ def rename_table(old_name, new_name, con=None):
             con.close()
 
 
+def _dtype_to_duck(dtype) -> str:
+    """Map a pandas dtype to a DuckDB column type for ALTER TABLE ADD COLUMN."""
+    if pd.api.types.is_bool_dtype(dtype):
+        return "BOOLEAN"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(dtype):
+        return "DOUBLE"
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return "TIMESTAMP"
+    return "VARCHAR"
+
+
+_DUCK_DEFAULTS = {"BOOLEAN": "FALSE", "BIGINT": "0", "DOUBLE": "0"}
+
+
+def _evolve_schema(table, df, con):
+    """
+    SCHEMA EVOLUTION — the key to daily scorer_config.json changes without
+    full re-scores: for every column in `df` that the table doesn't have yet,
+    run  ALTER TABLE ADD COLUMN ... DEFAULT 0/false.  In DuckDB this is a
+    METADATA-ONLY operation: all existing rows instantly read the default
+    (old posts get flag=0/false) with no table rewrite and no re-scoring.
+    """
+    existing = {r[1] for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    added = []
+    for c in df.columns:
+        if c not in existing:
+            duck = _dtype_to_duck(df[c].dtype)
+            ddl = f'ALTER TABLE {table} ADD COLUMN "{c}" {duck}'
+            dflt = _DUCK_DEFAULTS.get(duck)
+            if dflt is not None:
+                ddl += f" DEFAULT {dflt}"
+            con.execute(ddl)
+            added.append(c)
+    if added:
+        print(f"  🧬 {table}: schema evolved +{len(added)} column(s) "
+              f"{added[:6]}{'...' if len(added) > 6 else ''} "
+              f"(historical rows read default 0/false — no rewrite)")
+
+
 def append_table(table, df, con=None):
     """Append rows of `df` to `table`, creating it (with df's schema) if it
     doesn't exist yet.  For PK tables, duplicates are silently skipped
-    (ON CONFLICT DO NOTHING)."""
+    (ON CONFLICT DO NOTHING).  NEW columns in `df` evolve the table schema
+    (ALTER ... DEFAULT 0) instead of being dropped — see _evolve_schema."""
     own = con is None
     con = con or get_connection()
     try:
         con.register("_tmp_pk_df", df)
         if table_exists(table, con):
+            _evolve_schema(table, df, con)
             cols = con.execute(f"SELECT * FROM {table} LIMIT 0").fetchdf().columns.tolist()
             df2 = df.reindex(columns=cols)
             con.unregister("_tmp_pk_df")
