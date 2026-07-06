@@ -337,13 +337,37 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
 # 2021-01-20→2025-01-20, Trump term 1 vs term 2, billionaires (Musk et al.)
 # influential only in specific windows. Posts OUTSIDE the window keep flowing
 # into the feed (raw data preserved) but their entity_weight is damped hard.
+#
+# Window end: entities/primary_accounts use "expiration_date" (= next election,
+# the rank-0 SWITCH date) as their window end; archives use "active_to". Either
+# is honoured. So a president is hot from active_from (their election day) to
+# expiration_date (next election), and the president-elect takes over ON election
+# day — the transition gap is handled because the successor's active_from is that
+# same election date.
+#
+# Election candidates additionally declare "peak_date" (= election day). Inside
+# the campaign window their entity_weight RAMPS from RAMP_BASE at active_from up
+# to full at peak_date, so influence is hottest right before the vote (matches
+# "only the last dates are hot"). Two co-equal rank-1 candidates each carry
+# entity_weight≈1.0 and their own peak_date, so they ramp symmetrically and
+# collapse to one rank-0 winner on election day (loser's active_to = that day,
+# after which they fall outside the window and are damped). entity_weight is a
+# platform-NEUTRAL config weight (already normalised to [0,1]), so a Republican
+# challenger on Truth Social and a Democrat on X compare fairly at equal rank —
+# raw favorites/retweets are the only platform-scaled fields and are discounted
+# separately in signal_scorer.py.
 
-OUT_OF_WINDOW_FACTOR = 0.05
+OUT_OF_WINDOW_FACTOR = 0.05   # hard damp for posts outside [active_from, window_end]
+RAMP_BASE            = 0.20   # election candidate weight at campaign start; ramps to 1.0 at peak_date
 
 
 def _active_windows() -> dict:
-    """{handle_lower: (from_ts|None, to_ts|None)} for every account that
-    declares an active window in influence_accounts.json."""
+    """{handle_lower: (from_ts|None, to_ts|None, peak_ts|None)} for every account
+    that declares an active window in influence_accounts.json.
+
+    Window end (to_ts) = active_to if present, else expiration_date (entities and
+    primary_accounts use expiration_date as their window end / next-election
+    switch date). peak_ts = peak_date (election day) for election candidates."""
     def _p(x):
         if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
             return None
@@ -358,44 +382,71 @@ def _active_windows() -> dict:
     except FileNotFoundError:
         return {}
     entries = (data.get("primary_accounts", []) + data.get("entities", [])
-               + data.get("institutions", {}).get("entries", []))
+               + data.get("institutions", {}).get("entries", [])
+               + data.get("archives", {}).get("entries", []))
     out = {}
     for e in entries:
         h = (e.get("account") or e.get("twitter_handle") or "").lstrip("@")
         if not h:
             continue
-        lo, hi = _p(e.get("active_from")), _p(e.get("active_to"))
-        if lo is not None or hi is not None:
-            out[h.lower()] = (lo, hi)
+        lo   = _p(e.get("active_from"))
+        hi   = _p(e.get("active_to")) or _p(e.get("expiration_date"))
+        peak = _p(e.get("peak_date"))
+        if lo is not None or hi is not None or peak is not None:
+            out[h.lower()] = (lo, hi, peak)
     return out
 
 
 def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
-    """Damp entity_weight (×OUT_OF_WINDOW_FACTOR) for posts dated outside
-    their account's declared active window."""
+    """Adjust entity_weight by each account's active window:
+      * posts OUTSIDE [active_from, window_end]  → ×OUT_OF_WINDOW_FACTOR (hard damp)
+      * election candidates (peak_date set), INSIDE the window and on/before the
+        peak → ramp ×(RAMP_BASE .. 1.0) linearly from active_from to peak_date,
+        so influence is hottest right before election day.
+    Raw post data is never dropped; only the weight changes."""
     wins = _active_windows()
     if not wins or df.empty:
         return df
     dt  = pd.to_datetime(df["date"], format="mixed", utc=True)
     acc = df["account"].fillna("").astype(str).str.lower()
-    n_damped = 0
-    for handle, (lo, hi) in wins.items():
+    n_damped = n_ramped = 0
+    for handle, (lo, hi, peak) in wins.items():
         m = (acc == handle)
         if not m.any():
             continue
+
+        # 1) hard damp outside [lo, hi]. Dates are day-granular, so the end day
+        #    is inclusive (a post any time on election day is still in-window).
+        _DAY = pd.Timedelta(days=1)
         outside = pd.Series(False, index=df.index)
         if lo is not None:
             outside |= m & (dt < lo)
         if hi is not None:
-            outside |= m & (dt > hi)
+            outside |= m & (dt >= hi + _DAY)
         if outside.any():
             df.loc[outside, "entity_weight"] = (
                 df.loc[outside, "entity_weight"].astype(float)
                 * OUT_OF_WINDOW_FACTOR).round(4)
             n_damped += int(outside.sum())
+
+        # 2) ramp-to-peak inside the campaign window (election candidates)
+        if peak is not None and lo is not None and peak > lo:
+            inside = m & ~outside & (dt < peak + _DAY)
+            if inside.any():
+                span   = (peak - lo).total_seconds()
+                frac   = ((dt - lo).dt.total_seconds() / span).clip(lower=0, upper=1)
+                factor = RAMP_BASE + (1.0 - RAMP_BASE) * frac
+                df.loc[inside, "entity_weight"] = (
+                    df.loc[inside, "entity_weight"].astype(float)
+                    * factor[inside]).round(4)
+                n_ramped += int(inside.sum())
+
     if n_damped:
         print(f"  ⏳ {n_damped} post(s) outside their account's active window "
               f"— entity_weight ×{OUT_OF_WINDOW_FACTOR}")
+    if n_ramped:
+        print(f"  📈 {n_ramped} campaign post(s) ramped toward peak_date "
+              f"(base {RAMP_BASE} → 1.0 at election day)")
     return df
 
 

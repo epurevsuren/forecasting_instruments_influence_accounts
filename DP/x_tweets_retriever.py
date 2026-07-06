@@ -18,6 +18,17 @@ USAGE
   python x_tweets_retriever.py --since 20250101 --until 20250601
   python x_tweets_retriever.py --handles ZelenskyyUa,IDF --since 20260601
   python x_tweets_retriever.py --handles ZelenskyyUa --dry-run
+  python x_tweets_retriever.py --handles JoeBiden --since 20221217 --refetch  # re-scrape covered months
+
+ROBUSTNESS / RESUME
+-------------------
+X throttles scraping to ~600-700 tweets per session, then silently serves empty
+pages. To handle that: each monthly chunk is deduped and written to disk
+IMMEDIATELY (an interruption never loses progress), every chunk logs its yield,
+and rate-limit/empty streaks print a warning instead of stalling quietly. Months
+already present in x_tweets.csv are SKIPPED on re-run, so simply re-running the
+SAME command resumes forward into un-fetched months until the range is complete.
+Use --refetch to force re-scraping covered months (e.g. to fill a partial month).
 
 OUTPUT SCHEMA (mirrors truth_social.csv + two extra columns)
 -------------------------------------------------------------
@@ -53,6 +64,13 @@ COLUMNS = ["id", "date", "text", "url", "favorites", "retweets", "replies",
 MAX_PER_ACCOUNT_DEFAULT = 40
 SLEEP_BETWEEN_ACCOUNTS  = (4.0, 8.0)
 SLEEP_BETWEEN_CHUNKS    = (2.0, 4.0)
+
+# Robustness / resume (X throttles scraping ~600-700 tweets per session, then
+# silently returns empty pages). Each monthly chunk is saved to disk IMMEDIATELY,
+# so an interruption never loses progress; re-running the same command resumes.
+MIN_MONTH_COVERAGE  = 1     # skip a month that already has >= this many rows (resume). --refetch overrides
+EMPTY_STREAK_WARN   = 3     # consecutive empty months -> warn about likely X throttling
+RATE_LIMIT_BACKOFF  = 900    # seconds to pause after an X rate-limit signal
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -111,10 +129,16 @@ def load_tracked_accounts(handles_filter=None):
     with open(ENTITIES_FILE, encoding="utf-8") as f:
         data = json.load(f)
 
+    # (entries, apply_expiry_filter). Archives = out-of-office / former accounts
+    # (e.g. @JoeBiden, @POTUS46Archive, former PMs). They are NEVER fetched on a
+    # default/scheduled run -- only when the user explicitly passes --handles --
+    # and their expiry is ignored so their historical tweets can be backfilled.
     accounts, seen, skipped = [], set(), []
-    sections = [data.get("entities", []),
-                data.get("institutions", {}).get("entries", [])]
-    for entries in sections:
+    sections = [(data.get("entities", []), True),
+                (data.get("institutions", {}).get("entries", []), True)]
+    if handles_filter:
+        sections.append((data.get("archives", {}).get("entries", []), False))
+    for entries, apply_expiry in sections:
         for entry in entries:
             handle = entry.get("twitter_handle")
             if not handle:
@@ -123,7 +147,7 @@ def load_tracked_accounts(handles_filter=None):
             if handle.lower() in seen:
                 continue
             seen.add(handle.lower())
-            if _is_expired(entry):
+            if apply_expiry and _is_expired(entry):
                 skipped.append(handle)
                 continue
             accounts.append({"handle": handle, "name": entry.get("name", handle)})
@@ -137,11 +161,27 @@ def load_tracked_accounts(handles_filter=None):
     return accounts
 
 
-def load_existing():
+def load_existing_coverage():
+    """Return (set_of_ids, {handle_lower: {'YYYY-MM': count}}).
+
+    The per-handle monthly counts drive RESUME: a monthly chunk already covered
+    in x_tweets.csv is skipped on re-run, so successive runs march forward into
+    un-fetched months instead of re-hitting X's per-session cap on the same
+    early tweets."""
     if not os.path.exists(OUTPUT_FILE):
-        return set()
-    df = pd.read_csv(OUTPUT_FILE)
-    return set(df["id"].astype(str)) if "id" in df.columns else set()
+        return set(), {}
+    df = pd.read_csv(OUTPUT_FILE, dtype={"id": str})
+    ids = set(df["id"].astype(str)) if "id" in df.columns else set()
+    cov: dict = {}
+    if "account" in df.columns and "date" in df.columns:
+        dt = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        months = dt.dt.strftime("%Y-%m")
+        for h, mth in zip(df["account"].astype(str).str.lower(), months):
+            if not isinstance(mth, str):
+                continue
+            cov.setdefault(h, {})
+            cov[h][mth] = cov[h].get(mth, 0) + 1
+    return ids, cov
 
 
 def save_rows(rows):
@@ -156,6 +196,23 @@ def save_rows(rows):
         encoding="utf-8-sig" if not exists else "utf-8",
         lineterminator="\n",
     )
+
+
+def save_new(raw_rows, handle, name, existing_ids, dry_run):
+    """Dedup raw_rows against existing_ids and write to disk IMMEDIATELY.
+    Returns the number of new rows written. Mutates existing_ids."""
+    rows = []
+    for r in raw_rows:
+        tid = str(r.get("id", ""))
+        if not tid or tid in existing_ids:
+            continue
+        existing_ids.add(tid)
+        r = dict(r)
+        r["account"], r["account_name"] = handle, name
+        rows.append({c: r.get(c) for c in COLUMNS})
+    if rows and not dry_run:
+        save_rows(rows)
+    return len(rows)
 
 
 # ---------------------------------------------------------------- X parsing ----
@@ -292,14 +349,25 @@ async def _scroll_until_stable(page, collected, max_scrolls=5, wait_secs=1.5):
 
 
 async def fetch_search_page(page, handle, chunk_since, chunk_until):
-    """Fetch one monthly search chunk; returns list of raw tweet dicts."""
+    """Fetch one monthly search chunk. Returns (rows, rate_limited).
+    rate_limited is True if X returned an HTTP 429 or a GraphQL error payload
+    (the tell-tale of throttling that otherwise stops the scroll silently)."""
     collected = []
+    rate_limited = {"hit": False}
 
     async def on_response(response):
+        try:
+            if response.status == 429:
+                rate_limited["hit"] = True
+                return
+        except Exception:
+            pass
         if "UserTweets" not in response.url and "SearchTimeline" not in response.url:
             return
         try:
             body = await response.json()
+            if isinstance(body, dict) and body.get("errors"):
+                rate_limited["hit"] = True
             collected.extend(_extract_from_graphql(body))
         except Exception:
             pass
@@ -326,7 +394,7 @@ async def fetch_search_page(page, handle, chunk_since, chunk_until):
         if cdt and (cdt < chunk_since or cdt >= chunk_until):
             continue
         rows.append(r)
-    return rows
+    return rows, rate_limited["hit"]
 
 
 async def fetch_latest(page, handle, max_tweets):
@@ -419,7 +487,8 @@ async def fetch_profile_scroll(page, handle, since=None, max_tweets=500):
 
 
 async def retrieve(handles_filter=None, since=None, until=None,
-                   max_per_account=MAX_PER_ACCOUNT_DEFAULT, dry_run=False):
+                   max_per_account=MAX_PER_ACCOUNT_DEFAULT, dry_run=False,
+                   refetch=False):
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -430,7 +499,7 @@ async def retrieve(handles_filter=None, since=None, until=None,
         print("[done]  no matching tracked accounts found.")
         return 0
 
-    existing_ids = load_existing()
+    existing_ids, coverage = load_existing_coverage()
     now = datetime.now(UTC)
     if until is None:
         until = now
@@ -452,7 +521,7 @@ async def retrieve(handles_filter=None, since=None, until=None,
     if not pw_cookies:
         print("[warn]  no cookies found -- scraping without authentication")
 
-    total_added, total_scanned, total_dup = 0, 0, 0
+    total_added, total_scanned = 0, 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -476,68 +545,83 @@ async def retrieve(handles_filter=None, since=None, until=None,
 
         for i, acc in enumerate(accounts):
             handle, name = acc["handle"], acc["name"]
+            hkey = handle.lower()
+            acc_added = 0
 
             if chunks:
-                all_rows = []
-                for ci, (cs, ce) in enumerate(chunks):
+                empty_streak = 0
+                ci = 0
+                while ci < len(chunks):
+                    cs, ce = chunks[ci]
+                    mkey = cs.strftime("%Y-%m")
+                    have = coverage.get(hkey, {}).get(mkey, 0)
+                    # RESUME: skip months already covered (unless --refetch), so a
+                    # re-run marches forward instead of re-hitting X's session cap.
+                    if not refetch and have >= MIN_MONTH_COVERAGE:
+                        print(f"  [{handle}] {mkey}: skip (already have {have})")
+                        ci += 1
+                        continue
                     try:
-                        chunk_rows = await fetch_search_page(page, handle, cs, ce)
+                        chunk_rows, rate_limited = await fetch_search_page(page, handle, cs, ce)
                     except Exception as e:
-                        print("    [warn] chunk " + cs.strftime("%Y-%m") + ": " + str(e))
-                        chunk_rows = []
-                    all_rows.extend(chunk_rows)
-                    if ci < len(chunks) - 1:
+                        print(f"  [{handle}] {mkey}: [warn] {str(e)[:900]}")
+                        chunk_rows, rate_limited = [], False
+                    # SAVE THIS CHUNK NOW -- interruption never loses progress
+                    added = save_new(chunk_rows, handle, name, existing_ids, dry_run)
+                    acc_added += added
+                    total_scanned += len(chunk_rows)
+                    if not rate_limited:
+                        coverage.setdefault(hkey, {})[mkey] = have + added
+                    print(f"  [{handle}] {mkey}: +{added} new "
+                          f"({len(chunk_rows)} scanned, account total {acc_added})"
+                          + ("  [DRY]" if dry_run else "  -> saved"))
+                    # WARN on throttling instead of pausing and retrying current month
+                    if rate_limited:
+                        print(f"  [warn] X rate-limit signal at {mkey}; progress saved. "
+                              f"backing off {RATE_LIMIT_BACKOFF}s and retrying the same month.")
+                        await asyncio.sleep(RATE_LIMIT_BACKOFF)
+                        continue
+                    if len(chunk_rows) == 0:
+                        empty_streak += 1
+                        if empty_streak == EMPTY_STREAK_WARN:
+                            print(f"  [warn] {empty_streak} empty months in a row for {handle} "
+                                  f"-- likely X throttling (or no posts). Progress is saved; "
+                                  f"re-run the SAME command to resume where it stopped.")
+                    else:
+                        empty_streak = 0
+                    ci += 1
+                    if ci < len(chunks):
                         await asyncio.sleep(random.uniform(*SLEEP_BETWEEN_CHUNKS))
-                # Fallback: if search gave nothing, try scrolling the profile page
-                if not all_rows:
+                # Fallback profile-scroll only when the account has nothing at all
+                if acc_added == 0 and not coverage.get(hkey):
                     try:
-                        all_rows = await fetch_profile_scroll(page, handle, since=since)
-                        if all_rows:
-                            print("    [fallback profile-scroll] " + handle + ": " + str(len(all_rows)) + " tweets")
+                        fb = await fetch_profile_scroll(page, handle, since=since)
+                        acc_added += save_new(fb, handle, name, existing_ids, dry_run)
+                        if acc_added:
+                            print(f"  [{handle}] fallback profile-scroll: +{acc_added} new")
                     except Exception as e:
-                        print("    [warn fallback] " + handle + ": " + str(e))
-                raw_rows = all_rows
+                        print(f"  [warn fallback] {handle}: {str(e)[:900]}")
             else:
                 try:
                     raw_rows = await fetch_latest(page, handle, max_per_account)
                 except Exception as e:
                     print("  [warn] " + handle + ": " + str(e))
                     continue
+                acc_added = save_new(raw_rows, handle, name, existing_ids, dry_run)
+                total_scanned += len(raw_rows)
 
-            rows, added, dup = [], 0, 0
-            seen_in_batch = set()
-            for r in raw_rows:
-                tid = str(r["id"])
-                if tid in existing_ids or tid in seen_in_batch:
-                    dup += 1
-                    continue
-                existing_ids.add(tid)
-                seen_in_batch.add(tid)
-                r["account"]      = handle
-                r["account_name"] = name
-                rows.append({c: r.get(c) for c in COLUMNS})
-                added += 1
-
-            if not dry_run:
-                save_rows(rows)
-
-            scanned = len(raw_rows)
-            total_added   += added
-            total_scanned += scanned
-            total_dup     += dup
-            print("  [" + handle.ljust(18) + "] scanned " + str(scanned).rjust(4)
-                  + ", skipped " + str(dup).rjust(4) + " dup, "
-                  + ("would add " if dry_run else "added ") + str(added).rjust(4) + " new")
-
+            total_added += acc_added
+            print(f"  [{handle.ljust(18)}] DONE: +{acc_added} new this run"
+                  + ("  [DRY]" if dry_run else ""))
             if i < len(accounts) - 1:
                 await asyncio.sleep(random.uniform(*SLEEP_BETWEEN_ACCOUNTS))
 
         await browser.close()
 
-    print("[done]  scanned " + str(total_scanned) + " tweets across "
-          + str(len(accounts)) + " account(s), skipped " + str(total_dup)
-          + " already in file, "
-          + ("would add " if dry_run else "added ") + str(total_added) + " new.")
+    print("[done]  scanned " + str(total_scanned) + " across "
+          + str(len(accounts)) + " account(s); "
+          + ("would add " if dry_run else "added ") + str(total_added)
+          + " new this run (covered months skipped; re-run to fetch more).")
     return total_added
 
 
@@ -555,6 +639,9 @@ def main():
                     help="Max tweets per account when no --since is given (default 40).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Fetch and report without writing to the CSV.")
+    ap.add_argument("--refetch", action="store_true",
+                    help="Re-scrape months already present in x_tweets.csv "
+                         "(default: skip covered months so re-runs resume forward).")
     args = ap.parse_args()
 
     handles_filter = [h.strip() for h in args.handles.split(",")] if args.handles else None
@@ -567,6 +654,7 @@ def main():
         until=until,
         max_per_account=args.max_per_account,
         dry_run=args.dry_run,
+        refetch=args.refetch,
     ))
 
 
