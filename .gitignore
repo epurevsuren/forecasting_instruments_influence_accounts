@@ -1,4 +1,4 @@
-# Ignore specific files and folders
+# Ignore specific folders
 __pycache__/
 .venv/
 .vscode/
@@ -26,5 +26,4 @@ database.db
 database.db.wal
 
 # Credentials / secrets — never commit
-.x_cookies.json
-.twscrape_accounts.db
+.x_cookies/

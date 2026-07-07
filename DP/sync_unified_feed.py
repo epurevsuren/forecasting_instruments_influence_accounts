@@ -359,6 +359,10 @@ def _build_tweets(entity_map: dict) -> pd.DataFrame:
 
 OUT_OF_WINDOW_FACTOR = 0.05   # hard damp for posts outside [active_from, window_end]
 RAMP_BASE            = 0.20   # election candidate weight at campaign start; ramps to 1.0 at peak_date
+SUCCESSOR_TRANSFER   = 0.30   # a rank-2 backer that declares `successor_of: <nominee>` adds
+                              # SUCCESSOR_TRANSFER x backer_weight to that nominee's entity_weight over
+                              # the overlap of their windows (capped at 1.0). Models Trump->Ivanka, or a
+                              # VP who ascends on the president's death (Vance) and backs the nominee.
 
 
 def _active_windows() -> dict:
@@ -397,6 +401,53 @@ def _active_windows() -> dict:
     return out
 
 
+def _successor_links() -> list:
+    """[(backer_handle_lower, nominee_handle_lower, backer_lo, backer_hi, backer_weight)]
+    for every account that declares `successor_of` (the rank-2 backer endorsing a
+    rank-1 nominee). backer_weight = the backer's configured entity_weight
+    (primary_accounts -> its entity_weight; entities -> explicit or mention-based;
+    else 1.0)."""
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+    try:
+        with open(ENTITIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    wmap = {}
+    for a in data.get("primary_accounts", []):
+        h = (a.get("account") or a.get("twitter_handle") or "").lstrip("@").lower()
+        if h:
+            wmap[h] = float(a.get("entity_weight", 1.0))
+    for e in data.get("entities", []):
+        h = (e.get("twitter_handle") or "").lstrip("@").lower()
+        if not h:
+            continue
+        if "entity_weight" in e:
+            wmap[h] = float(e["entity_weight"])
+        elif e.get("mention_count") is not None:
+            wmap[h] = round(int(e["mention_count"]) / MAX_MENTION_COUNT, 4)
+    links = []
+    for e in (data.get("primary_accounts", []) + data.get("entities", [])
+              + data.get("archives", {}).get("entries", [])):
+        succ = e.get("successor_of")
+        if not succ:
+            continue
+        bh = (e.get("account") or e.get("twitter_handle") or "").lstrip("@").lower()
+        nh = str(succ).lstrip("@").lower()
+        if not bh or not nh:
+            continue
+        links.append((bh, nh, _p(e.get("active_from")),
+                      _p(e.get("active_to")) or _p(e.get("expiration_date")),
+                      wmap.get(bh, 1.0)))
+    return links
+
+
 def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
     """Adjust entity_weight by each account's active window:
       * posts OUTSIDE [active_from, window_end]  → ×OUT_OF_WINDOW_FACTOR (hard damp)
@@ -409,7 +460,8 @@ def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
         return df
     dt  = pd.to_datetime(df["date"], format="mixed", utc=True)
     acc = df["account"].fillna("").astype(str).str.lower()
-    n_damped = n_ramped = 0
+    _DAY = pd.Timedelta(days=1)
+    n_damped = n_ramped = n_boosted = 0
     for handle, (lo, hi, peak) in wins.items():
         m = (acc == handle)
         if not m.any():
@@ -417,7 +469,6 @@ def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
 
         # 1) hard damp outside [lo, hi]. Dates are day-granular, so the end day
         #    is inclusive (a post any time on election day is still in-window).
-        _DAY = pd.Timedelta(days=1)
         outside = pd.Series(False, index=df.index)
         if lo is not None:
             outside |= m & (dt < lo)
@@ -441,12 +492,40 @@ def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
                     * factor[inside]).round(4)
                 n_ramped += int(inside.sum())
 
+    # 3) successor_of: a rank-2 backer's endorsement lifts the rank-1 nominee's
+    #    entity_weight over the overlap of their windows (Trump->Ivanka, or a VP
+    #    who ascends like Vance and backs the nominee). Additive, capped at 1.0.
+    for bh, nh, blo, bhi, bw in _successor_links():
+        nwin = wins.get(nh)
+        if nwin is None:
+            continue                       # nominee has no active window yet
+        nlo, nhi, npeak = nwin
+        n_end = npeak or nhi
+        lo = max([d for d in (blo, nlo) if d is not None], default=None)
+        hi = min([d for d in (bhi, n_end) if d is not None], default=None)
+        sel = (acc == nh)
+        if not sel.any():
+            continue
+        if lo is not None:
+            sel &= (dt >= lo)
+        if hi is not None:
+            sel &= (dt < hi + _DAY)
+        if sel.any():
+            transfer = SUCCESSOR_TRANSFER * bw
+            df.loc[sel, "entity_weight"] = (
+                (df.loc[sel, "entity_weight"].astype(float) + transfer)
+                .clip(upper=1.0).round(4))
+            n_boosted += int(sel.sum())
+
     if n_damped:
         print(f"  ⏳ {n_damped} post(s) outside their account's active window "
               f"— entity_weight ×{OUT_OF_WINDOW_FACTOR}")
     if n_ramped:
         print(f"  📈 {n_ramped} campaign post(s) ramped toward peak_date "
               f"(base {RAMP_BASE} → 1.0 at election day)")
+    if n_boosted:
+        print(f"  🤝 {n_boosted} nominee post(s) boosted by a rank-2 backer's "
+              f"endorsement (successor_of, +{SUCCESSOR_TRANSFER}×backer_weight, capped 1.0)")
     return df
 
 

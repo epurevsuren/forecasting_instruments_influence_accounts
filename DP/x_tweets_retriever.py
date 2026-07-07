@@ -30,11 +30,18 @@ already present in x_tweets.csv are SKIPPED on re-run, so simply re-running the
 SAME command resumes forward into un-fetched months until the range is complete.
 Use --refetch to force re-scraping covered months (e.g. to fill a partial month).
 
+COOKIE ROTATION: on an X rate-limit the run pauses 1 minute and switches to the
+next cookie set in DP/.x_cookies/ (.x_cookies.json, .x_cookies1.json ..
+.x_cookies6.json), retrying the SAME month with a fresh logged-in session. It
+cycles the pool; once every set has been throttled on one month it takes a longer
+cooldown -- so ONE invocation runs unattended far past one account's ~600-700 cap.
+
 OUTPUT SCHEMA (mirrors truth_social.csv + two extra columns)
 -------------------------------------------------------------
   id, date, text, url, favorites, retweets, replies, account, account_name
 """
 import os
+import glob
 import re
 import sys
 import json
@@ -57,6 +64,7 @@ _HERE         = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE   = os.path.join(_HERE, "x_tweets.csv")
 ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
 COOKIES_FILE  = os.path.join(_HERE, ".x_cookies.json")
+COOKIES_DIR   = os.path.join(_HERE, ".x_cookies")   # folder of rotating cookie sets (.x_cookies*.json)
 
 COLUMNS = ["id", "date", "text", "url", "favorites", "retweets", "replies",
            "account", "account_name", "language"]
@@ -70,7 +78,8 @@ SLEEP_BETWEEN_CHUNKS    = (2.0, 4.0)
 # so an interruption never loses progress; re-running the same command resumes.
 MIN_MONTH_COVERAGE  = 1     # skip a month that already has >= this many rows (resume). --refetch overrides
 EMPTY_STREAK_WARN   = 3     # consecutive empty months -> warn about likely X throttling
-RATE_LIMIT_BACKOFF  = 900    # seconds to pause after an X rate-limit signal
+RATE_LIMIT_BACKOFF  = 30     # pause after an X rate-limit signal (30 seconds), then rotate to the next cookie set
+LONG_COOLDOWN       = 247    # longer pause once EVERY cookie set has been throttled on the same month
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -287,10 +296,22 @@ def _extract_from_graphql(body):
 
 
 # ----------------------------------------------------------------- cookies ----
-def _playwright_cookies():
-    if not os.path.exists(COOKIES_FILE):
+def _cookie_files():
+    """Rotation pool: sorted .x_cookies*.json inside .x_cookies/, else the legacy
+    single DP/.x_cookies.json. Rotating between logged-in X sessions lets the run
+    continue past one account's ~600-700-tweet throttle without re-running."""
+    files = []
+    if os.path.isdir(COOKIES_DIR):
+        files = sorted(glob.glob(os.path.join(COOKIES_DIR, ".x_cookies*.json")))
+    if not files and os.path.exists(COOKIES_FILE):
+        files = [COOKIES_FILE]
+    return files
+
+
+def _playwright_cookies(path=COOKIES_FILE):
+    if not path or not os.path.exists(path):
         return []
-    with open(COOKIES_FILE, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     result = []
     for c in (raw if isinstance(raw, list) else []):
@@ -517,8 +538,12 @@ async def retrieve(handles_filter=None, since=None, until=None,
     print("[fetch] " + str(len(accounts)) + " account(s)" + date_info
           + ("   [DRY RUN]" if dry_run else ""))
 
-    pw_cookies = _playwright_cookies()
-    if not pw_cookies:
+    cookie_files = _cookie_files()
+    cookie_idx = 0
+    if cookie_files:
+        print("[cookies] " + str(len(cookie_files)) + " set(s) for rotation: "
+              + ", ".join(os.path.basename(c) for c in cookie_files))
+    else:
         print("[warn]  no cookies found -- scraping without authentication")
 
     total_added, total_scanned = 0, 0
@@ -535,8 +560,22 @@ async def retrieve(handles_filter=None, since=None, until=None,
             user_agent=_UA,
             viewport={"width": 1280, "height": 900},
         )
-        if pw_cookies:
-            await context.add_cookies(pw_cookies)
+
+        async def _use_cookies(idx):
+            """Swap the browser context to cookie set `idx` (wraps around the pool)."""
+            if not cookie_files:
+                return None
+            path = cookie_files[idx % len(cookie_files)]
+            cks = _playwright_cookies(path)
+            try:
+                await context.clear_cookies()
+            except Exception:
+                pass
+            if cks:
+                await context.add_cookies(cks)
+            return os.path.basename(path)
+
+        await _use_cookies(cookie_idx)
 
         page = await context.new_page()
         await page.add_init_script(
@@ -550,6 +589,7 @@ async def retrieve(handles_filter=None, since=None, until=None,
 
             if chunks:
                 empty_streak = 0
+                rotations = 0
                 ci = 0
                 while ci < len(chunks):
                     cs, ce = chunks[ci]
@@ -564,7 +604,7 @@ async def retrieve(handles_filter=None, since=None, until=None,
                     try:
                         chunk_rows, rate_limited = await fetch_search_page(page, handle, cs, ce)
                     except Exception as e:
-                        print(f"  [{handle}] {mkey}: [warn] {str(e)[:900]}")
+                        print(f"  [{handle}] {mkey}: [warn] {str(e)[:247]}")
                         chunk_rows, rate_limited = [], False
                     # SAVE THIS CHUNK NOW -- interruption never loses progress
                     added = save_new(chunk_rows, handle, name, existing_ids, dry_run)
@@ -575,12 +615,23 @@ async def retrieve(handles_filter=None, since=None, until=None,
                     print(f"  [{handle}] {mkey}: +{added} new "
                           f"({len(chunk_rows)} scanned, account total {acc_added})"
                           + ("  [DRY]" if dry_run else "  -> saved"))
-                    # WARN on throttling instead of pausing and retrying current month
+                    # On throttle: pause 1 min, ROTATE to the next cookie set, and
+                    # retry the SAME month. After the whole pool has been throttled on
+                    # one month, take a single longer cooldown to let X's limits reset.
                     if rate_limited:
-                        print(f"  [warn] X rate-limit signal at {mkey}; progress saved. "
-                              f"backing off {RATE_LIMIT_BACKOFF}s and retrying the same month.")
-                        await asyncio.sleep(RATE_LIMIT_BACKOFF)
+                        rotations += 1
+                        cookie_idx += 1
+                        nm = await _use_cookies(cookie_idx)
+                        pause = (LONG_COOLDOWN if cookie_files
+                                 and rotations % len(cookie_files) == 0
+                                 else RATE_LIMIT_BACKOFF)
+                        print(f"  [warn] X rate-limit at {mkey}; progress saved. "
+                              f"pausing {pause}s"
+                              + (f" and switching cookies -> {nm}" if nm else "")
+                              + ", retrying same month.")
+                        await asyncio.sleep(pause)
                         continue
+                    rotations = 0
                     if len(chunk_rows) == 0:
                         empty_streak += 1
                         if empty_streak == EMPTY_STREAK_WARN:
@@ -600,7 +651,7 @@ async def retrieve(handles_filter=None, since=None, until=None,
                         if acc_added:
                             print(f"  [{handle}] fallback profile-scroll: +{acc_added} new")
                     except Exception as e:
-                        print(f"  [warn fallback] {handle}: {str(e)[:900]}")
+                        print(f"  [warn fallback] {handle}: {str(e)[:247]}")
             else:
                 try:
                     raw_rows = await fetch_latest(page, handle, max_per_account)
