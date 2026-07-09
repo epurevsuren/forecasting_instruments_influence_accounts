@@ -1,53 +1,589 @@
 {
-  "_comment": "MASTER instrument registry — single source of truth. Every pipeline script loads instruments from here: build_final_training_set.py (yf/market/impact_cap/core), train_finbert_nlp_xgb.py (instrument list), predict_finbert_nlp_xgb.py (emoji/label), tweet_truth_impact_analyzer.py (yf/market), IBKR/fetch_ibkr_history.py (ibkr contract spec), IBKR/fetch_binance_history.py (binance symbol). Add or remove an instrument HERE — no code edits needed. Field notes: market 'us' = US session only, '24h' = trades around the clock; impact_cap = realistic 1-hour |move| ceiling in %; core = pipeline core (labels deferred if all core instruments lack data); ibkr.core = fetcher's CORE_NAMES set for --core runs; ibkr.kind = stock|index|contfut|fx|crypto.",
+  "_comment": "MASTER instrument registry — single source of truth. Every pipeline script loads instruments from here: build_final_training_set.py (yf/market/impact_cap/core), train_finbert_nlp_xgb.py (instrument list), predict_finbert_nlp_xgb.py (emoji/label), tweet_truth_impact_analyzer.py (yf/market), IBKR/fetch_ibkr_history.py (ibkr contract spec), IBKR/fetch_binance_history.py (binance symbol), Finbert_NLP_XGBoost/simulate_ctrader.py (ctrader spec). Add or remove an instrument HERE — no code edits needed. Field notes: market 'us' = US session only, '24h' = trades around the clock; impact_cap = realistic 1-hour |move| ceiling in %; core = pipeline core; ibkr.core = fetcher's CORE_NAMES; ibkr.kind = stock|index|contfut|fx|crypto. ctrader = Pepperstone cTrader Symbol Info values: lot_size (contract units per lot), pip_position (pip = 10^-pip_position price units; VIX pip_position 1 -> 0.1), min_lots/max_lots (Min/Max trade quantity), leverage (class margin, capped by account leverage). VERIFY each symbol against the cTrader Symbol Info window — VIX and AUDUSD confirmed by screenshot 2026-07-05; others are best-effort and safe to correct here without code changes. No ctrader key = not tradeable on cTrader (skipped).",
   "instruments": {
-    "SPY":     {"yf": "SPY",      "market": "us",  "impact_cap": 3.0,  "core": true,  "emoji": "📈", "label": "S&P 500",
-                "ibkr": {"kind": "stock",   "symbol": "SPY",    "exchange": "SMART", "what": "TRADES", "core": true}},
-    "VIX":     {"yf": "^VIX",     "market": "us",  "impact_cap": 15.0, "core": true,  "emoji": "😨", "label": "VIX Fear",
-                "ibkr": {"kind": "index",   "symbol": "VIX",    "exchange": "CBOE",  "what": "TRADES", "core": true}},
-    "OIL":     {"yf": "CL=F",     "market": "24h", "impact_cap": 6.0,  "core": true,  "emoji": "🛢️", "label": "WTI Oil",
-                "ibkr": {"kind": "contfut", "symbol": "CL",     "exchange": "NYMEX", "what": "TRADES", "core": true}},
-    "GOLD":    {"yf": "GC=F",     "market": "24h", "impact_cap": 3.0,  "core": false, "emoji": "🥇", "label": "Gold",
-                "ibkr": {"kind": "contfut", "symbol": "GC",     "exchange": "COMEX", "what": "TRADES", "core": true}},
-    "BTC":     {"yf": "BTC-USD",  "market": "24h", "impact_cap": 8.0,  "core": false, "emoji": "₿",  "label": "Bitcoin",
-                "ibkr": {"kind": "crypto",  "symbol": "BTC",    "exchange": "PAXOS", "what": "AGGTRADES", "core": true},
-                "binance": "BTCUSDT"},
-    "QQQ":     {"yf": "QQQ",      "market": "us",  "impact_cap": 3.5,  "core": false, "emoji": "💻", "label": "Nasdaq",
-                "ibkr": {"kind": "stock",   "symbol": "QQQ",    "exchange": "SMART", "what": "TRADES"}},
-    "DIA":     {"yf": "DIA",      "market": "us",  "impact_cap": 3.0,  "core": false, "emoji": "🏭", "label": "Dow",
-                "ibkr": {"kind": "stock",   "symbol": "DIA",    "exchange": "SMART", "what": "TRADES"}},
-    "XLI":     {"yf": "XLI",      "market": "us",  "impact_cap": 3.5,  "core": false, "emoji": "🔧", "label": "Industrials",
-                "ibkr": {"kind": "stock",   "symbol": "XLI",    "exchange": "SMART", "what": "TRADES"}},
-    "XLF":     {"yf": "XLF",      "market": "us",  "impact_cap": 3.5,  "core": false, "emoji": "🏦", "label": "Financials",
-                "ibkr": {"kind": "stock",   "symbol": "XLF",    "exchange": "SMART", "what": "TRADES"}},
-    "XLE":     {"yf": "XLE",      "market": "us",  "impact_cap": 4.0,  "core": false, "emoji": "⛽", "label": "Energy",
-                "ibkr": {"kind": "stock",   "symbol": "XLE",    "exchange": "SMART", "what": "TRADES"}},
-    "COPPER":  {"yf": "HG=F",     "market": "24h", "impact_cap": 4.0,  "core": false, "emoji": "🟫", "label": "Copper",
-                "ibkr": {"kind": "contfut", "symbol": "HG",     "exchange": "COMEX", "what": "TRADES"}},
-    "NATGAS":  {"yf": "NG=F",     "market": "24h", "impact_cap": 6.0,  "core": false, "emoji": "🔥", "label": "NatGas",
-                "ibkr": {"kind": "contfut", "symbol": "NG",     "exchange": "NYMEX", "what": "TRADES"}},
-    "EUR_USD": {"yf": "EURUSD=X", "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "💶", "label": "EUR/USD",
-                "ibkr": {"kind": "fx",      "symbol": "EURUSD", "what": "MIDPOINT"}},
-    "USD_JPY": {"yf": "JPY=X",    "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "💴", "label": "USD/JPY",
-                "ibkr": {"kind": "fx",      "symbol": "USDJPY", "what": "MIDPOINT"}},
-    "GBP_USD": {"yf": "GBPUSD=X", "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "💷", "label": "GBP/USD",
-                "ibkr": {"kind": "fx",      "symbol": "GBPUSD", "what": "MIDPOINT"}},
-    "USD_CNY": {"yf": "CNY=X",    "market": "24h", "impact_cap": 1.0,  "core": false, "emoji": "🇨🇳", "label": "USD/CNY",
-                "ibkr": {"kind": "fx",      "symbol": "USDCNH", "what": "MIDPOINT"}},
-    "USD_CAD": {"yf": "CAD=X",    "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "🇨🇦", "label": "USD/CAD",
-                "ibkr": {"kind": "fx",      "symbol": "USDCAD", "what": "MIDPOINT"}},
-    "USD_MXN": {"yf": "MXN=X",    "market": "24h", "impact_cap": 2.5,  "core": false, "emoji": "🇲🇽", "label": "USD/MXN",
-                "ibkr": {"kind": "fx",      "symbol": "USDMXN", "what": "MIDPOINT"}},
-    "USD_CHF": {"yf": "CHF=X",    "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "🇨🇭", "label": "USD/CHF",
-                "ibkr": {"kind": "fx",      "symbol": "USDCHF", "what": "MIDPOINT"}},
-    "AUD_USD": {"yf": "AUDUSD=X", "market": "24h", "impact_cap": 1.5,  "core": false, "emoji": "🇦🇺", "label": "AUD/USD",
-                "ibkr": {"kind": "fx",      "symbol": "AUDUSD", "what": "MIDPOINT"}},
-    "US10Y":   {"yf": "^TNX",     "market": "us",  "impact_cap": 6.0,  "core": false, "emoji": "📜", "label": "US 10Y",
-                "ibkr": {"kind": "contfut", "symbol": "ZN",     "exchange": "CBOT",  "what": "TRADES"}},
-    "US2Y":    {"yf": "^IRX",     "market": "us",  "impact_cap": 6.0,  "core": false, "emoji": "📃", "label": "US 2Y",
-                "ibkr": {"kind": "contfut", "symbol": "ZT",     "exchange": "CBOT",  "what": "TRADES"}},
-    "ETH":     {"yf": "ETH-USD",  "market": "24h", "impact_cap": 10.0, "core": false, "emoji": "Ξ",  "label": "Ethereum",
-                "ibkr": {"kind": "crypto",  "symbol": "ETH",    "exchange": "PAXOS", "what": "AGGTRADES"},
-                "binance": "ETHUSDT"}
+    "SPY": {
+      "yf": "SPY",
+      "market": "us",
+      "impact_cap": 3.0,
+      "core": true,
+      "emoji": "📈",
+      "label": "S&P 500",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "SPY",
+        "exchange": "SMART",
+        "what": "TRADES",
+        "core": true
+      },
+      "ctrader": {
+        "symbol": "SPY.US",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 2500.0,
+        "leverage": 5,
+        "digits": 2,
+        "lot_step": 0.1,
+        "swap_long": -6.14,
+        "swap_short": 1.04,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "VIX": {
+      "yf": "^VIX",
+      "market": "us",
+      "impact_cap": 15.0,
+      "core": true,
+      "emoji": "😨",
+      "label": "VIX Fear",
+      "ibkr": {
+        "kind": "index",
+        "symbol": "VIX",
+        "exchange": "CBOE",
+        "what": "TRADES",
+        "core": true
+      },
+      "ctrader": {
+        "symbol": "VIX",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 100.0,
+        "max_lots_live": 1000.0,
+        "_max_note": "demo API caps VIX at 100 lots; LIVE allows 1000 (Symbol Info screenshot 2026-07-05). Simulator uses max_lots_live by default; --demo-caps reverts.",
+        "lot_step": 0.1,
+        "leverage": 10,
+        "_verified": "OpenAPI 2026-07-08 (demo)",
+        "digits": 2,
+        "swap_long": -0.17,
+        "swap_short": 0.15
+      }
+    },
+    "OIL": {
+      "yf": "CL=F",
+      "market": "24h",
+      "impact_cap": 6.0,
+      "core": true,
+      "emoji": "🛢️",
+      "label": "WTI Oil",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "CL",
+        "exchange": "NYMEX",
+        "what": "TRADES",
+        "core": true
+      },
+      "ctrader": {
+        "symbol": "SPOTCRUDE",
+        "lot_size": 100,
+        "pip_position": 2,
+        "min_lots": 0.01,
+        "max_lots": 50.0,
+        "digits": 3,
+        "lot_step": 0.01,
+        "swap_long": 2.47,
+        "swap_short": -2.99,
+        "_verified": "OpenAPI 2026-07-08",
+        "leverage": 10
+      }
+    },
+    "GOLD": {
+      "yf": "GC=F",
+      "market": "24h",
+      "impact_cap": 3.0,
+      "core": false,
+      "emoji": "🥇",
+      "label": "Gold",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "GC",
+        "exchange": "COMEX",
+        "what": "TRADES",
+        "core": true
+      },
+      "ctrader": {
+        "symbol": "XAUUSD",
+        "lot_size": 100.0,
+        "pip_position": 1,
+        "min_lots": 0.01,
+        "max_lots": 50.0,
+        "leverage": 20,
+        "digits": 2,
+        "lot_step": 0.01,
+        "swap_long": -8.04,
+        "swap_short": 3.01,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "BTC": {
+      "yf": "BTC-USD",
+      "market": "24h",
+      "impact_cap": 8.0,
+      "core": false,
+      "emoji": "₿",
+      "label": "Bitcoin",
+      "ibkr": {
+        "kind": "crypto",
+        "symbol": "BTC",
+        "exchange": "PAXOS",
+        "what": "AGGTRADES",
+        "core": true
+      },
+      "binance": "BTCUSDT",
+      "ctrader": {
+        "symbol": "BTCUSD",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.01,
+        "max_lots": 25.0,
+        "leverage": 2,
+        "digits": 2,
+        "lot_step": 0.01,
+        "swap_long": -11.5,
+        "swap_short": 1.9,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "QQQ": {
+      "yf": "QQQ",
+      "market": "us",
+      "impact_cap": 3.5,
+      "core": false,
+      "emoji": "💻",
+      "label": "Nasdaq",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "QQQ",
+        "exchange": "SMART",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "QQQ.US",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 250.0,
+        "leverage": 5,
+        "digits": 2,
+        "lot_step": 0.1,
+        "swap_long": -6.14,
+        "swap_short": 0.94,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "DIA": {
+      "yf": "DIA",
+      "market": "us",
+      "impact_cap": 3.0,
+      "core": false,
+      "emoji": "🏭",
+      "label": "Dow",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "DIA",
+        "exchange": "SMART",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "DIA.US",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 250.0,
+        "leverage": 5,
+        "digits": 2,
+        "lot_step": 0.1,
+        "swap_long": -6.14,
+        "swap_short": 1.04,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "XLI": {
+      "yf": "XLI",
+      "market": "us",
+      "impact_cap": 3.5,
+      "core": false,
+      "emoji": "🔧",
+      "label": "Industrials",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "XLI",
+        "exchange": "SMART",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "XLI.US",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 250.0,
+        "leverage": 5,
+        "digits": 2,
+        "lot_step": 0.1,
+        "swap_long": -6.14,
+        "swap_short": 0.99,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "XLF": {
+      "yf": "XLF",
+      "market": "us",
+      "impact_cap": 3.5,
+      "core": false,
+      "emoji": "🏦",
+      "label": "Financials",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "XLF",
+        "exchange": "SMART",
+        "what": "TRADES"
+      },
+      "_ctrader_note": "NOT offered by Pepperstone (OpenAPI search 2026-07-08: 0 matches for XLF) — no ctrader block, simulator skips it; XLF still fully used in NLP/backtest layers"
+    },
+    "XLE": {
+      "yf": "XLE",
+      "market": "us",
+      "impact_cap": 4.0,
+      "core": false,
+      "emoji": "⛽",
+      "label": "Energy",
+      "ibkr": {
+        "kind": "stock",
+        "symbol": "XLE",
+        "exchange": "SMART",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "XLE.US",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.1,
+        "max_lots": 250.0,
+        "leverage": 5,
+        "digits": 2,
+        "lot_step": 0.1,
+        "swap_long": -6.14,
+        "swap_short": 0.99,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "COPPER": {
+      "yf": "HG=F",
+      "market": "24h",
+      "impact_cap": 4.0,
+      "core": false,
+      "emoji": "🟫",
+      "label": "Copper",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "HG",
+        "exchange": "COMEX",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "COPPER",
+        "lot_size": 2000.0,
+        "pip_position": 3,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 10,
+        "digits": 4,
+        "lot_step": 0.01,
+        "swap_long": -1.97,
+        "swap_short": 0.97,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "NATGAS": {
+      "yf": "NG=F",
+      "market": "24h",
+      "impact_cap": 6.0,
+      "core": false,
+      "emoji": "🔥",
+      "label": "NatGas",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "NG",
+        "exchange": "NYMEX",
+        "what": "TRADES"
+      },
+      "ctrader": {
+        "symbol": "NATGAS",
+        "lot_size": 10000.0,
+        "pip_position": 2,
+        "min_lots": 0.01,
+        "max_lots": 100,
+        "digits": 3,
+        "lot_step": 0.01,
+        "swap_long": -0.09,
+        "swap_short": 0.08,
+        "_verified": "OpenAPI 2026-07-08",
+        "leverage": 10
+      }
+    },
+    "EUR_USD": {
+      "yf": "EURUSD=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "💶",
+      "label": "EUR/USD",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "EURUSD",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "EURUSD",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": -0.73,
+        "swap_short": 0.22,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "USD_JPY": {
+      "yf": "JPY=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "💴",
+      "label": "USD/JPY",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "USDJPY",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "USDJPY",
+        "lot_size": 100000.0,
+        "pip_position": 2,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "digits": 3,
+        "lot_step": 0.01,
+        "swap_long": 0.32,
+        "swap_short": -1.65,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "GBP_USD": {
+      "yf": "GBPUSD=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "💷",
+      "label": "GBP/USD",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "GBPUSD",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "GBPUSD",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": -0.24,
+        "swap_short": -0.26,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "USD_CNY": {
+      "yf": "CNY=X",
+      "market": "24h",
+      "impact_cap": 1.0,
+      "core": false,
+      "emoji": "🇨🇳",
+      "label": "USD/CNY",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "USDCNH",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "USDCNH",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 20,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": 2.36,
+        "swap_short": -7.14,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "USD_CAD": {
+      "yf": "CAD=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "🇨🇦",
+      "label": "USD/CAD",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "USDCAD",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "USDCAD",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": 0.35,
+        "swap_short": -0.93,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "USD_MXN": {
+      "yf": "MXN=X",
+      "market": "24h",
+      "impact_cap": 2.5,
+      "core": false,
+      "emoji": "🇲🇽",
+      "label": "USD/MXN",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "USDMXN",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "USDMXN",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 20,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": -21.27,
+        "swap_short": 4.85,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "USD_CHF": {
+      "yf": "CHF=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "🇨🇭",
+      "label": "USD/CHF",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "USDCHF",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "USDCHF",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": 0.44,
+        "swap_short": -1.04,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    },
+    "AUD_USD": {
+      "yf": "AUDUSD=X",
+      "market": "24h",
+      "impact_cap": 1.5,
+      "core": false,
+      "emoji": "🇦🇺",
+      "label": "AUD/USD",
+      "ibkr": {
+        "kind": "fx",
+        "symbol": "AUDUSD",
+        "what": "MIDPOINT"
+      },
+      "ctrader": {
+        "symbol": "AUDUSD",
+        "lot_size": 100000.0,
+        "pip_position": 4,
+        "min_lots": 0.01,
+        "max_lots": 100.0,
+        "leverage": 30,
+        "_verified": "OpenAPI 2026-07-08",
+        "digits": 5,
+        "lot_step": 0.01,
+        "swap_long": -0.02,
+        "swap_short": -0.23
+      }
+    },
+    "US10Y": {
+      "yf": "^TNX",
+      "market": "us",
+      "impact_cap": 6.0,
+      "core": false,
+      "emoji": "📜",
+      "label": "US 10Y",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "ZN",
+        "exchange": "CBOT",
+        "what": "TRADES"
+      }
+    },
+    "US2Y": {
+      "yf": "^IRX",
+      "market": "us",
+      "impact_cap": 6.0,
+      "core": false,
+      "emoji": "📃",
+      "label": "US 2Y",
+      "ibkr": {
+        "kind": "contfut",
+        "symbol": "ZT",
+        "exchange": "CBOT",
+        "what": "TRADES"
+      }
+    },
+    "ETH": {
+      "yf": "ETH-USD",
+      "market": "24h",
+      "impact_cap": 10.0,
+      "core": false,
+      "emoji": "Ξ",
+      "label": "Ethereum",
+      "ibkr": {
+        "kind": "crypto",
+        "symbol": "ETH",
+        "exchange": "PAXOS",
+        "what": "AGGTRADES"
+      },
+      "binance": "ETHUSDT",
+      "ctrader": {
+        "symbol": "ETHUSD",
+        "lot_size": 1.0,
+        "pip_position": 1,
+        "min_lots": 0.01,
+        "max_lots": 25.0,
+        "leverage": 2,
+        "digits": 2,
+        "lot_step": 0.01,
+        "swap_long": -8.0,
+        "swap_short": -1.0,
+        "_verified": "OpenAPI 2026-07-08"
+      }
+    }
   }
 }

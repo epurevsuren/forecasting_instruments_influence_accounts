@@ -60,7 +60,7 @@ _NER_FEATURES  = list(ss.canonical._NER_KEYS)                # num_gpe, num_org,
 
 NLP_FEATURES = [
     # Source-context features: let XGBoost learn non-linear interactions between
-    # NLP signal and post origin (is_primary=1 → rank-0 TruthSocial; geo weight = credibility tier)
+    # NLP signal and post origin (is_primary=1 → rank-0 primary within its active window, ANY platform; geo weight = credibility tier)
     'is_primary', 'entity_weight', 'event_weight', 'account_rank',
     # Composite NLP scores
     'raw_score','score_policy','score_embedding','score_novelty','score_burst',
@@ -145,7 +145,7 @@ def main():
     df = labels.merge(feats, on=['platform', 'id'], how='inner', suffixes=('', '_sc'))
     n_primary = int(df['is_primary'].sum()) if 'is_primary' in df.columns else '?'
     n_twitter = len(df) - (n_primary if isinstance(n_primary, int) else 0)
-    print(f"  Merged rows: {len(df)}  (TruthSocial: {n_primary} | X/Twitter: {n_twitter})")
+    print(f"  Merged rows: {len(df)}  (primary: {n_primary} | non-primary: {n_twitter})")
 
     # NLP feature matrix — cast to float32 (is_primary is bool; booleans → 0/1 fine)
     use_nlp = [c for c in NLP_FEATURES if c in df.columns]

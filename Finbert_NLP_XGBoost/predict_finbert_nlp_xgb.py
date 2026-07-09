@@ -21,22 +21,57 @@ NY = 'America/New_York'
 _HERE          = os.path.dirname(os.path.abspath(__file__))
 _ENTITIES_FILE = os.path.join(_HERE, "..", "DP", "influence_accounts.json")
 
-def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from influence_accounts.json."""
+def _rank0_handle(when=None) -> str:
+    """Return the rank-0 TruthSocial primary handle ACTIVE at `when` (default now).
+
+    primary_accounts now holds MULTIPLE rank-0 entries across eras/platforms
+    (realDonaldTrump on X 2017-2021, POTUS on X 2021-2025, realDonaldTrump on
+    TruthSocial 2024-2028). For a LIVE prediction we want the TruthSocial rank-0
+    primary whose [active_from, expiration_date] window contains the prediction
+    time -- not just the first one listed. Falls back to the first TruthSocial
+    rank-0, then to 'us_president'.
+    """
     try:
         with open(_ENTITIES_FILE, encoding="utf-8") as f:
             accounts = json.load(f).get("primary_accounts", [])
-        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
-                    key=lambda a: a.get("rank", 99))
-        return ts[0]["account"] if ts else "us_president"
     except Exception:
         return "us_president"
+
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+
+    now = pd.Timestamp(when, tz="UTC") if when is not None else pd.Timestamp.now(tz="UTC")
+    ts = []
+    for a in accounts:
+        try:
+            if int(a.get("rank", 99)) != 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if a.get("platform") == "truthsocial":
+            ts.append(a)
+
+    # prefer the rank-0 TruthSocial primary whose active window contains `now`
+    for a in ts:
+        lo = _p(a.get("active_from"))
+        hi = _p(a.get("active_to")) or _p(a.get("expiration_date"))
+        if (lo is None or now >= lo) and (hi is None or now <= hi):
+            return str(a.get("account", "")).lstrip("@") or "us_president"
+    if ts:
+        return str(ts[0].get("account", "")).lstrip("@") or "us_president"
+    return "us_president"
 
 
 def _build_handle_country_map() -> dict:
     """
     Build {handle_lower: country_alpha2} from all entries in influence_accounts.json.
-    Covers primary_accounts (by 'account'), entities and institutions (by 'twitter_handle').
+    Covers primary_accounts, entities and institutions (all by 'account', with
+    'twitter_handle' as a legacy fallback).
     """
     try:
         with open(_ENTITIES_FILE, encoding="utf-8") as f:
@@ -46,15 +81,16 @@ def _build_handle_country_map() -> dict:
 
     out: dict = {}
     for a in data.get("primary_accounts", []):
-        h = a.get("account", "")
+        h = str(a.get("account") or a.get("twitter_handle") or "").lstrip("@")
         c = a.get("country", "")
         if h and c:
             out[h.lower()] = c
+    # entities & institutions use the 'account' field (e.g. "@netanyahu",
+    # "@DeptofWar"); older records may still carry 'twitter_handle'.
     for section in (data.get("entities", []),
                     data.get("institutions", {}).get("entries", [])):
         for e in section:
-            raw = e.get("twitter_handle") or ""
-            h = raw.lstrip("@")
+            h = str(e.get("account") or e.get("twitter_handle") or "").lstrip("@")
             c = e.get("country", "")
             if h and c:
                 out[h.lower()] = c
@@ -273,12 +309,13 @@ def _display_name_for(handle: str) -> str:
             with open(_ENTITIES_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             for a in data.get("primary_accounts", []):
-                if a.get("account"):
-                    _HANDLE_NAME[a["account"].lower()] = a.get("account_name", a.get("name", ""))
+                h = str(a.get("account") or a.get("twitter_handle") or "").lstrip("@")
+                if h:
+                    _HANDLE_NAME[h.lower()] = a.get("account_name", a.get("name", ""))
             for section in (data.get("entities", []),
                             data.get("institutions", {}).get("entries", [])):
                 for e in section:
-                    h = str(e.get("twitter_handle") or "").lstrip("@")
+                    h = str(e.get("account") or e.get("twitter_handle") or "").lstrip("@")
                     if h:
                         _HANDLE_NAME[h.lower()] = e.get("name", "")
         except Exception:

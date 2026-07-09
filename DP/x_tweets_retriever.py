@@ -149,7 +149,7 @@ def load_tracked_accounts(handles_filter=None):
         sections.append((data.get("archives", {}).get("entries", []), False))
     for entries, apply_expiry in sections:
         for entry in entries:
-            handle = entry.get("twitter_handle")
+            handle = entry.get("account")
             if not handle:
                 continue
             handle = handle.lstrip("@")

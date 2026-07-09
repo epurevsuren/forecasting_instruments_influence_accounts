@@ -63,6 +63,21 @@ CACHE_DIR = os.path.normpath(os.path.join(_HERE, "..", "IBKR", "market_data_cach
 RESULTS_DIR = os.path.join(_HERE, "backtest_results")
 OUT_DIR     = os.path.join(_HERE, "tp_sl_results")
 
+
+# cTrader class leverage per instrument (DP/instruments.json) — used to make
+# the min-pred filter LEVERAGE-AWARE: FX moves 0.1-0.4% but at 30:1 a small
+# move is a big margin-relative return; a flat 0.3% threshold silently bans
+# FX while letting capital-hungry 2:1 crypto through.
+def _leverage_map():
+    try:
+        with open(os.path.join(_HERE, "..", "DP", "instruments.json"),
+                  encoding="utf-8") as f:
+            reg = json.load(f)["instruments"]
+        return {n: v["ctrader"].get("leverage", 10)
+                for n, v in reg.items() if "ctrader" in v}
+    except Exception:
+        return {}
+
 # DEFAULTS = Peter's winning config (2026-07-02 grid search, 82% win, Σ+160%):
 # TP targets the model's 1-hour predicted move; the SL is catastrophe
 # insurance only — floored OUTSIDE 1-min wick noise so it can't be swept.
@@ -198,7 +213,17 @@ def simulate_one(bars, post_ts, direction, tp_dist_pct, sl_dist_pct,
             outcome, exit_bar, bars_held = "TP", b, k + 1
             break
 
-    exit_price = price_of(exit_bar)
+    # ORDER-REALISTIC FILLS (cTrader): a take-profit is a LIMIT order — it
+    # fills AT the TP price; a stop-loss fills at the stop price. Only a
+    # TIMEOUT exit is a market order at the bar's wap. (Exiting TP/STOP at
+    # the trigger bar's wap could even turn a hit TP into a small LOSS —
+    # impossible on the platform.)
+    if outcome == "TP":
+        exit_price = tp_price
+    elif outcome == "STOP":
+        exit_price = sl_price
+    else:
+        exit_price = price_of(exit_bar)
     pnl_pct = (exit_price - entry) / entry * 100 * (1 if direction > 0 else -1)
 
     return {
@@ -233,6 +258,10 @@ def main():
                     help=f"timeout exit after this many minutes (default {MAX_HOLD_DEFAULT})")
     ap.add_argument("--min-barcount", type=int, default=MIN_BARCOUNT,
                     help=f"skip entries on bars with 0 <= barCount < this (default {MIN_BARCOUNT})")
+    ap.add_argument("--pred-scale", type=float, default=1.0,
+                    help="multiply predicted moves by this factor BEFORE the min-pred "
+                         "filter and TP/SL sizing — calibration knob when the model "
+                         "over/under-predicts (e.g. 0.85 if predictions run ~15%% hot)")
     ap.add_argument("--min-pred", type=float, default=MIN_PRED_DEFAULT,
                     help=f"skip trades with |pred| below this %% (small predicted reward "
                          f"can't clear 1-min noise; default {MIN_PRED_DEFAULT}, 0 = off)")
@@ -258,9 +287,14 @@ def main():
         print(f"  TP = |pred| x {args.tp_mult}   SL = |pred| x {args.sl_mult}   (per-trade sizing)")
     print(f"  Max hold: {args.max_hold_min} min | min barCount: {args.min_barcount} "
           f"| stop-first on same-bar conflict")
+    lev_map = _leverage_map()
     if args.min_pred > 0 or args.sl_noise_mult > 0:
-        print(f"  Filters: min |pred| = {args.min_pred}%  |  "
-              f"SL floor = {args.sl_noise_mult} x 1-min noise")
+        print(f"  Filters: min margin-relative return = {args.min_pred * 10:.1f}% "
+              f"(min |pred| = {args.min_pred}% at 10:1; leverage-aware: FX@30:1 -> "
+              f"{args.min_pred * 10 / 30:.2f}%, crypto@2:1 -> {args.min_pred * 5:.2f}%)"
+              f"  |  SL floor = {args.sl_noise_mult} x 1-min noise")
+    if args.pred_scale != 1.0:
+        print(f"  Prediction calibration: pred x {args.pred_scale}")
     print(f"  Output (incremental append): {out_path}")
     print("=" * 78)
 
@@ -304,11 +338,13 @@ def main():
         # open would ride the SAME move twice. Skip until the position exits.
         open_until = None
         for _, p in todo.sort_values("post_ts").iterrows():
-            pred = float(p[pcol])
+            pred = float(p[pcol]) * args.pred_scale
             if pred == 0 or not np.isfinite(pred):
                 skips["zero_pred"] = skips.get("zero_pred", 0) + 1
                 continue
-            if abs(pred) < args.min_pred:
+            # leverage-aware threshold: |pred| x leverage >= min_pred x 10
+            _eff_min = args.min_pred * 10.0 / lev_map.get(inst, 10)
+            if abs(pred) < _eff_min:
                 skips["small_pred"] = skips.get("small_pred", 0) + 1
                 continue
             if open_until is not None and p["post_ts"] <= open_until:

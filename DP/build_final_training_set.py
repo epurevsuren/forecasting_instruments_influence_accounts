@@ -98,6 +98,45 @@ def _rank0_handle() -> str:
     except Exception:
         return "us_president"
 
+
+def _rank0_windows() -> dict:
+    """{(handle_lower, platform_lower|None): (from_ts|None, to_ts|None)} for ALL
+    rank-0 primary accounts. Keyed by (handle, PLATFORM) -- NOT handle alone --
+    because the SAME handle can be primary in two disjoint eras on different
+    platforms: @realDonaldTrump is rank-0 on X in 2017-2021 (45th) AND on Truth
+    Social in 2024-2028 (47th). Keying by handle alone collapses the two windows
+    (dict overwrite) and mislabels a whole presidency. The post's DATE + PLATFORM
+    decide who is primary. platform=None matches the handle on ANY platform.
+    (Kept in sync with signal_scorer._rank0_windows.)"""
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+    try:
+        with open(_ENTITIES_FILE, encoding="utf-8") as f:
+            accounts = json.load(f).get("primary_accounts", [])
+    except Exception:
+        return {}
+    out = {}
+    for a in accounts:
+        try:
+            if int(a.get("rank", 99)) != 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        h = str(a.get("account", "")).strip().lstrip("@").lower()
+        if not h:
+            continue
+        p = str(a.get("platform", "")).strip().lower()
+        if p in ("", "n/a", "none", "null"):
+            p = None
+        out[(h, p)] = (_p(a.get("active_from")),
+                       _p(a.get("active_to")) or _p(a.get("expiration_date")))
+    return out
+
 # DuckDB table names
 # posts_scored   unified NLP-scored posts (TruthSocial primary accounts + X/Twitter geo)
 # posts_labeled  posts joined with market-impact labels for model training
@@ -167,9 +206,33 @@ def load_scored():
     if 'platform' not in scored.columns:
         scored['platform'] = 'truthsocial'
     if 'is_primary' not in scored.columns:
-        # rank-0 TruthSocial only — secondary TS accounts are NOT is_primary
+        # rank-0 PRIMARY within its ACTIVE WINDOW (platform + time aware) --
+        # matches signal_scorer: Trump T2 on TruthSocial, Trump T1 / Biden on X in
+        # their eras. Same handle can recur on a different platform in a disjoint
+        # era (realDonaldTrump: X 45th vs TruthSocial 47th); date + platform pick primary.
         _ar = scored['account_rank'].fillna(99).astype(float) if 'account_rank' in scored.columns else pd.Series(99.0, index=scored.index)
-        scored['is_primary'] = (scored['platform'] == 'truthsocial') & (_ar == 0)
+        _wins = _rank0_windows()
+        _dt = pd.to_datetime(scored['date'], format='mixed', utc=True, errors='coerce')
+        _acc_l = (scored['account'].fillna("").astype(str).str.lstrip("@").str.lower()
+                  if 'account' in scored.columns else pd.Series("", index=scored.index))
+        _plat_l = (scored['platform'].fillna("").astype(str).str.strip().str.lower()
+                   if 'platform' in scored.columns else pd.Series("", index=scored.index))
+        _in_win = pd.Series(False, index=scored.index)
+        for (_h, _p), (_lo, _hi) in _wins.items():
+            _m = (_acc_l == _h)
+            if _p is not None:                       # same handle, different platform/era
+                _m &= (_plat_l == _p)
+            if not _m.any():
+                continue
+            if _lo is not None:
+                _m &= (_dt >= _lo)
+            if _hi is not None:
+                _m &= (_dt <= _hi)
+            _in_win |= _m
+        if _wins:
+            scored['is_primary'] = (_ar == 0) & _in_win
+        else:   # no windows declared — legacy TruthSocial-only behaviour
+            scored['is_primary'] = (scored['platform'] == 'truthsocial') & (_ar == 0)
     if 'entity_weight' not in scored.columns:
         scored['entity_weight'] = 1.0
     if 'event_weight' not in scored.columns:
@@ -178,7 +241,7 @@ def load_scored():
     scored = scored.sort_values('date').reset_index(drop=True)
     n_primary = int(scored['is_primary'].sum())
     n_twitter = len(scored) - n_primary
-    print(f"  Posts loaded: {len(scored)}  (TruthSocial: {n_primary} | X/Twitter: {n_twitter})")
+    print(f"  Posts loaded: {len(scored)}  (primary: {n_primary} | non-primary: {n_twitter})")
     scored['session']    = scored['date'].apply(market_session)
     scored['nlp_signal'] = scored.apply(compute_nlp_signal, axis=1)
     print(f"  NLP signal: mean={scored['nlp_signal'].mean():.3f}, "
@@ -610,7 +673,7 @@ def train_columns(impact_cols):
     # platform / is_primary / entity_weight / event_weight give XGB source-awareness.
     # sample_weight already incorporates them, but explicit columns let the model
     # learn non-linear interactions (e.g. geo tweet + high event_weight → high impact).
-    # is_primary is a bool (1.0 = rank-0 TruthSocial only; 0.0 = secondary TruthSocial or X/Twitter geo).
+    # is_primary is a bool (1.0 = rank-0 primary within its active window, ANY platform; 0.0 = everything else).
     base = ['id', 'date', 'text', 'platform', 'is_primary',
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']

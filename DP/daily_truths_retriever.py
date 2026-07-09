@@ -2,13 +2,14 @@
 daily_truths_retriever.py
 =========================
 Daily, incremental retriever for Truth Social posts. Accounts to retrieve are
-driven by the `primary_accounts` list in DP/influence_accounts.json — no
-account is hardcoded here, so adding a future candidate (e.g. for the 2028
+every account whose platform is "truthsocial" across the primary_accounts,
+entities, and institutions sections of DP/influence_accounts.json — no account
+is hardcoded here, so adding a future TruthSocial handle (e.g. for the 2028
 election) only requires updating that JSON file.
 
 What this script does
 ---------------------
-For each primary account listed in influence_accounts.json:
+For each TruthSocial account listed in influence_accounts.json:
   * loads the ids already in truth_social.csv for that account,
   * pulls only recent statuses (from the last captured post, with a small
     overlap window to catch any posts missed on a previous run),
@@ -81,15 +82,20 @@ COLUMNS          = ["id", "account", "date", "text", "url",
 
 
 # --------------------------------------------------------- account loading ----
-def load_primary_accounts() -> list[dict]:
+def load_truthsocial_accounts() -> list[dict]:
     """
-    Return the `primary_accounts` list from influence_accounts.json.
+    Return EVERY account with platform == "truthsocial" across the
+    primary_accounts, entities, and institutions sections of
+    influence_accounts.json (deduplicated by handle).
 
-    Each entry is expected to have at minimum:
-        { "account": "realDonaldTrump", "name": "Donald J. Trump", ... }
+    TruthSocial is the Republican-leaning platform: today that is
+    @realDonaldTrump (primary_accounts) and @JDVance1 (entities); the
+    institutions section has none yet but is scanned anyway so a future
+    TruthSocial office/agency handle is picked up with no code change.
+    Adding any TruthSocial account = edit the JSON only.
 
-    Adding a new TruthSocial account for a future candidate only requires
-    appending an entry to influence_accounts.json — no code change needed.
+    Each returned entry keeps its original JSON fields, but its 'account'
+    handle is normalized (leading '@' stripped) to match truth_social.csv.
     """
     try:
         with open(ENTITIES_FILE, encoding="utf-8") as f:
@@ -97,12 +103,33 @@ def load_primary_accounts() -> list[dict]:
     except FileNotFoundError:
         sys.exit(f"❌ {ENTITIES_FILE} not found — cannot determine accounts to retrieve.")
 
-    accounts = data.get("primary_accounts", [])
-    if not accounts:
-        sys.exit("❌ 'primary_accounts' list is empty in influence_accounts.json.")
+    # Scan all three account-bearing sections. institutions is a dict with an
+    # "entries" list; primary_accounts and entities are plain lists.
+    sections = (
+        data.get("primary_accounts", [])
+        + data.get("entities", [])
+        + data.get("institutions", {}).get("entries", [])
+    )
+    if not sections:
+        sys.exit("❌ No primary_accounts / entities / institutions found in influence_accounts.json.")
 
-    # Only TruthSocial accounts are relevant for this retriever
-    ts_accounts = [a for a in accounts if a.get("platform") == "truthsocial"]
+    # Only TruthSocial accounts are relevant for this retriever; dedup by handle
+    # (e.g. the same handle listed in two sections) keeping the first occurrence.
+    ts_accounts, seen = [], set()
+    for a in sections:
+        if a.get("platform") != "truthsocial":
+            continue
+        handle = str(a.get("account") or a.get("twitter_handle") or "").strip().lstrip("@")
+        if not handle or handle.lower() in seen:
+            continue
+        seen.add(handle.lower())
+        entry = dict(a)
+        entry["account"] = handle          # normalized (no leading '@')
+        ts_accounts.append(entry)
+
+    if not ts_accounts:
+        sys.exit("❌ No accounts with platform='truthsocial' found across "
+                 "primary_accounts / entities / institutions.")
 
     # EXPIRY FILTER: skip only accounts whose window has ENDED (active_to /
     # expiration_date strictly in the past — resigned, dead, out of office).
@@ -125,7 +152,7 @@ def load_primary_accounts() -> list[dict]:
     if skipped:
         print(f"⏭️  Skipping {len(skipped)} expired account(s): {', '.join(skipped)}")
     if not live:
-        sys.exit("❌ No non-expired primary_accounts with platform='truthsocial' found.")
+        sys.exit("❌ No non-expired TruthSocial accounts found.")
     return live
 
 
@@ -313,7 +340,8 @@ def main():
                     help="YYYYMMDD or YYYY-MM-DD: backfill from this date through now.")
     ap.add_argument("--account",
                     help="Restrict retrieval to a single TruthSocial handle "
-                         "(e.g. realDonaldTrump). Default: all primary accounts.")
+                         "(e.g. realDonaldTrump). Default: all TruthSocial accounts "
+                         "in primary_accounts / entities / institutions.")
     ap.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS,
                     help=f"Daily-mode overlap before the last stored post "
                          f"(default {LOOKBACK_DAYS}).")
@@ -328,14 +356,16 @@ def main():
     elif args.since:
         created_after = parse_date(args.since)
 
-    # Load account list from influence_accounts.json so no account
-    # is ever hardcoded here. Adding a 2028 candidate = edit the JSON only.
-    all_accounts = load_primary_accounts()
+    # Load account list from influence_accounts.json so no account is ever
+    # hardcoded here: every TruthSocial account across primary_accounts,
+    # entities, and institutions. Adding one = edit the JSON only.
+    all_accounts = load_truthsocial_accounts()
     if args.account:
-        all_accounts = [a for a in all_accounts
-                        if a["account"].lower() == args.account.lower()]
+        want = args.account.strip().lstrip("@").lower()
+        all_accounts = [a for a in all_accounts if a["account"].lower() == want]
         if not all_accounts:
-            sys.exit(f"❌ Account '{args.account}' not found in primary_accounts.")
+            sys.exit(f"❌ Account '{args.account}' not found among TruthSocial "
+                     f"accounts in primary_accounts / entities / institutions.")
 
     total_added = 0
     for acct in all_accounts:

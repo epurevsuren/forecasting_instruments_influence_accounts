@@ -8,6 +8,7 @@ tp_sl_results/
 backtest_results/
 logs/
 ctrader_results/
+config_backups/
 
 # Ignore file extensions
 *.csv

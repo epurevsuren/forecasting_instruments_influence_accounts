@@ -83,12 +83,14 @@ def _rank0_handle() -> str:
 
 def _rank0_windows() -> dict:
     """
-    {handle_lower: (from_ts|None, to_ts|None)} for ALL rank-0 primary accounts,
-    ANY platform. Multiple rank-0 entries with disjoint active windows support
-    election handovers and back-simulation: Trump T2 on TruthSocial
-    (2025-01-20 -> 2029-01-20), Trump T1 / Biden on X in their eras, and the
-    NEXT president (JD Vance? a Trump kid?) whenever they're added. The post's
-    DATE decides who is primary at that moment.
+    {(handle_lower, platform_lower|None): (from_ts|None, to_ts|None)} for ALL
+    rank-0 primary accounts. Keyed by (handle, PLATFORM) -- NOT handle alone --
+    because the SAME handle can be the primary in two disjoint eras on different
+    platforms: @realDonaldTrump is rank-0 on X in 2017-2021 (45th term) AND on
+    Truth Social in 2024-2028 (47th term). Keying by handle alone would collapse
+    the two windows (dict overwrite) and mislabel a whole presidency. The post's
+    DATE + PLATFORM decide who is primary at that moment. platform=None matches
+    the handle on ANY platform (defensive, for rank-0 rows with no platform set).
     """
     def _p(x):
         if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
@@ -111,12 +113,15 @@ def _rank0_windows() -> dict:
                 continue
         except (TypeError, ValueError):
             continue
-        h = str(a.get("account", "")).strip().lower()
+        h = str(a.get("account", "")).strip().lstrip("@").lower()
         if not h:
             continue
+        p = str(a.get("platform", "")).strip().lower()
+        if p in ("", "n/a", "none", "null"):
+            p = None
         lo = _p(a.get("active_from"))
         hi = _p(a.get("active_to")) or _p(a.get("expiration_date"))
-        out[h] = (lo, hi)
+        out[(h, p)] = (lo, hi)
     return out
 
 
@@ -444,17 +449,22 @@ def _prepare_feed_df(feed: pd.DataFrame) -> pd.DataFrame:
     # is_primary: used in _apply_entity_event_weight and stored in posts_scored for XGBoost
     if "is_primary" not in feed.columns:
         # is_primary = rank-0 PRIMARY ACCOUNT within its ACTIVE WINDOW.
-        # Platform-agnostic + time-aware for election handovers/back-sim:
-        # Trump T2 is rank-0 on TruthSocial, but Trump T1 / Biden / the next
-        # president may be rank-0 on X in THEIR era. Multiple rank-0 entries
-        # with disjoint windows are allowed — the post date picks the primary.
+        # Platform + time aware for election handovers/back-sim: Trump T2 is
+        # rank-0 on TruthSocial, but Trump T1 / Biden / the next president may be
+        # rank-0 on X in THEIR era. The SAME handle can recur on a different
+        # platform in a disjoint era (realDonaldTrump: X 45th vs TruthSocial
+        # 47th) — the post date + platform pick the primary.
         _acct_rank = feed["account_rank"].fillna(99).astype(float) if "account_rank" in feed.columns else pd.Series(99.0, index=feed.index)
         _wins = _rank0_windows()
-        _acc_l = (feed["account"].fillna("").astype(str).str.lower()
+        _acc_l = (feed["account"].fillna("").astype(str).str.lstrip("@").str.lower()
                   if "account" in feed.columns else pd.Series("", index=feed.index))
+        _plat_l = (feed["platform"].fillna("").astype(str).str.strip().str.lower()
+                   if "platform" in feed.columns else pd.Series("", index=feed.index))
         _in_win = pd.Series(False, index=feed.index)
-        for _h, (_lo, _hi) in _wins.items():
+        for (_h, _p), (_lo, _hi) in _wins.items():
             _m = (_acc_l == _h)
+            if _p is not None:                       # same handle, different platform/era
+                _m &= (_plat_l == _p)
             if not _m.any():
                 continue
             if _lo is not None:

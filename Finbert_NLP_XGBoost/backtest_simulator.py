@@ -108,17 +108,50 @@ DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
 _ENTITIES_FILE = os.path.join(_DP, "influence_accounts.json")
 
-def _rank0_handle() -> str:
-    """Return the rank-0 TruthSocial account handle from influence_accounts.json."""
+def _rank0_handle(when=None) -> str:
+    """Return the rank-0 TruthSocial primary handle ACTIVE at `when` (default now).
+
+    primary_accounts now holds MULTIPLE rank-0 entries across eras/platforms
+    (realDonaldTrump on X 2017-2021, POTUS on X 2021-2025, realDonaldTrump on
+    TruthSocial 2024-2028). Used here only as the default `account` for a scored
+    row that lacks one, so pick the TruthSocial rank-0 primary whose
+    [active_from, expiration_date] window contains `when`; fall back to the first
+    TruthSocial rank-0, then 'us_president'. Mirrors predict_finbert_nlp_xgb.
+    """
     try:
         import json
         with open(_ENTITIES_FILE, encoding="utf-8") as f:
             accounts = json.load(f).get("primary_accounts", [])
-        ts = sorted([a for a in accounts if a.get("platform") == "truthsocial"],
-                    key=lambda a: a.get("rank", 99))
-        return ts[0]["account"] if ts else "us_president"
     except Exception:
         return "us_president"
+
+    def _p(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return pd.Timestamp(x, tz="UTC")
+        except Exception:
+            return None
+
+    now = pd.Timestamp(when, tz="UTC") if when is not None else pd.Timestamp.now(tz="UTC")
+    ts = []
+    for a in accounts:
+        try:
+            if int(a.get("rank", 99)) != 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if a.get("platform") == "truthsocial":
+            ts.append(a)
+
+    for a in ts:
+        lo = _p(a.get("active_from"))
+        hi = _p(a.get("active_to")) or _p(a.get("expiration_date"))
+        if (lo is None or now >= lo) and (hi is None or now <= hi):
+            return str(a.get("account", "")).lstrip("@") or "us_president"
+    if ts:
+        return str(ts[0].get("account", "")).lstrip("@") or "us_president"
+    return "us_president"
 
 
 # ============================================================ yfinance helpers ----
@@ -454,9 +487,10 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         platform  = str(row.get('platform', 'truthsocial'))
         account   = str(row.get('account', _rank0_handle()))
         acct_name = str(row.get('account_name', account))
-        # is_primary comes from posts_scored (rank-0 TruthSocial only).
-        # Don't override with platform check — a secondary TruthSocial account
-        # (rank > 0, e.g. a future candidate) is not is_primary.
+        # is_primary comes from posts_scored: rank-0 primary WITHIN its active
+        # window, on EITHER platform (Trump T2 on TruthSocial, Trump T1 / Biden
+        # @POTUS on X in their eras). Don't override with a platform check — a
+        # secondary account (rank > 0) or an out-of-window post is not is_primary.
         is_primary = bool(row.get('is_primary', False))
         country = PR._country_for(account)
         ctry_str = f"  [{country}]" if country else ""
