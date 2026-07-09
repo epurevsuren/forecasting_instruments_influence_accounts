@@ -9,6 +9,9 @@ backtest_results/
 logs/
 ctrader_results/
 config_backups/
+stock-data-intraday-minute-bar/
+FX-1-Minute-Data/
+
 
 # Ignore file extensions
 *.csv
