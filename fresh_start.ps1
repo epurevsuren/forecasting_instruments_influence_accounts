@@ -29,7 +29,7 @@ cd ..\Finbert_NLP_XGBoost
 uv run python train_finbert_nlp_xgb.py
 
 # 9. Direction backtest over the full window (until = now, NY time)
-.\run_backtest.bat 202607040000 --from 202411010000
+.\run_backtest.bat 202607090000 --from 201611010000
 
 # 10. Layer-2 TP/SL simulation (auto-picks the latest backtest CSV)
 uv run python simulate_tp_sl.py

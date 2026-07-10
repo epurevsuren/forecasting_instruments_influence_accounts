@@ -7,13 +7,25 @@ locally as CSV files. Re-runs read the cache and only fetch what is missing.
 Bar sizes : 1m, 5m, 15m, 30m  (each gets its own CSV)
 
 DEFAULT BEHAVIOUR (no arguments):
-  For each instrument, reads the latest date already in its 30-min CSV and fetches
-  forward to now. New instruments with no CSV start from now - 2 years.
+  Fetches 1m, 15m AND 30m bars. For each instrument and each of those sizes,
+  reads the latest date already in that size's CSV and fetches forward to now.
+  New instruments with no CSV start from now - 2 years. (5m exists but is only
+  fetched when asked for explicitly via --bar-size.)
+  Crypto (BTC, ETH) is EXCLUDED by default — it is fetched from Binance
+  (fetch_binance_history.py). Fetch it from IBKR only via --instruments BTC.
 
 WITH ARGUMENTS:
   python fetch_ibkr_history.py --bar-size 15m --from 20241101 --until 20260101
-  Fills only what is missing inside that window (already-cached months
-  are skipped automatically).
+  Backfills the window, deciding coverage by DATE: a month is fetched if it has
+  any missing business day inside the window, so interior HOLES (e.g. a run that
+  stopped mid-June while July already exists) are filled — not skipped. Existing
+  bars are kept for dates already present. --bar-size accepts several sizes
+  (e.g. --bar-size 1m 30m).
+
+REPAIRING DISTORTED DATA:
+  python fetch_ibkr_history.py --refetch --from 20260601 --instruments SPY VIX --bar-size 1m
+  --refetch CLEARS existing bars in [--from, --until] first, then re-fetches them
+  fresh, so the new bars REPLACE the old (distorted) ones.
 
 CSV naming  : {name}_{N}min.csv  e.g. SPY_30min.csv, SPY_1min.csv
 
@@ -85,6 +97,10 @@ BAR_CONFIG = {
     "30m": ("30 mins", "30min",  "1 M",  11, ["90 D", "120 D", "180 D", "270 D", "365 D"]),
 }
 
+# Bar sizes fetched when --bar-size is not given (each in its own CSV).
+# 5m is intentionally excluded — available on demand via --bar-size 5m.
+DEFAULT_BAR_SIZES = ["1m", "15m", "30m"]
+
 # Set True to fetch ONLY the 5 core instruments (~20 min).
 CORE_ONLY = False
 
@@ -123,6 +139,12 @@ INSTRUMENTS = [(name, _build_contract(v["ibkr"]), v["ibkr"]["what"])
 
 CORE_NAMES = {name for name, v in _REGISTRY.items()
               if v.get("ibkr", {}).get("core")}
+
+# Crypto is fetched from Binance (fetch_binance_history.py), NOT IBKR, so it is
+# EXCLUDED from the default and --core-only runs. Still fetchable on demand via
+# an explicit --instruments BTC / ETH.
+CRYPTO_NAMES = {name for name, v in _REGISTRY.items()
+                if v.get("ibkr", {}).get("kind") == "crypto"}
 
 # Bare futures symbols (investing.com style) -> IBKR exchange. Ad-hoc
 # --instruments tokens not in instruments.json resolve through this first —
@@ -230,11 +252,52 @@ def _csv_latest_date(name, suffix):
 # ==========================================
 # Per-instrument fetcher
 # ==========================================
+def _ibkr_duration(span) -> str:
+    """IBKR durationStr sized to `span` (a Timedelta, + a 60s buffer), so a
+    default resume fetches ONLY [last cached bar -> now] instead of a fixed week/
+    month. <= 1 day -> request in seconds; otherwise in days."""
+    total = int(span.total_seconds())
+    secs = max(60, total + 60)                  # small buffer so the last bar is covered
+    if secs <= 86400:                           # <= 1 day -> request in seconds (minimal)
+        return f"{secs} S"
+    days = (total + 86399) // 86400             # ceil to whole days
+    return f"{days} D"
+
+
+def _month_days_covered(existing_days, m, since, until) -> bool:
+    """True if EVERY business day of month `m` that falls inside [since, until]
+    already has >=1 bar in the cache. Used to decide, at DATE granularity, whether
+    a month can be skipped — so an interior hole (e.g. June 19-30 missing while
+    July exists) is detected and re-fetched instead of being skipped as 'cached'.
+    Business days (Mon-Fri) are a trading-calendar proxy; a missing holiday just
+    triggers a harmless re-fetch of that month."""
+    lo = max(m.normalize(), since.floor("D"))
+    m_end = (m + pd.offsets.MonthBegin(1)) - pd.Timedelta(days=1)
+    hi = min(m_end.normalize(), until.floor("D"))
+    if hi < lo:
+        return True
+    for d in pd.bdate_range(lo, hi):
+        if d not in existing_days:
+            return False
+    return True
+
+
 def fetch_one(ib, name, contract, what_to_show, manifest,
-              since, until, suffix, bar_size_str, chunk, throttle, contfut_durations):
+              since, until, suffix, bar_size_str, chunk, throttle, contfut_durations,
+              default_mode=False, refetch=False):
     """
-    Fetch bars for one instrument over [since, until], skipping cached months.
+    Fetch bars for one instrument over [since, until].
     `since` and `until` are UTC Timestamps.
+
+    Coverage is decided by DATE, not by month:
+      * default mode  -> since = last cached bar; the run resumes from there and
+        always (re)fetches through the current window, filling the partial tail.
+      * --from backfill -> a month is skipped only if EVERY business day it spans
+        inside [since, until] is already cached (so interior holes are re-fetched).
+      * --refetch -> existing bars in [since, until] are cleared first, so the
+        freshly-fetched bars REPLACE them (use to repair distorted data).
+    Dedup on write keeps existing bars for overlapping dates (refetch pre-clears
+    the window so its fresh bars win).
     """
     cache_file   = os.path.join(CACHE_DIR, f"{name}_{suffix}.csv")
     manifest_key = f"{name}_{suffix}"
@@ -274,24 +337,28 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             else:
                 gap_msg = " | window fully cached"
 
-            # Refresh the current live month only in default mode (no --from),
-            # detected by since being recent (<= 35 days ago).
-            now_month   = pd.Timestamp.now(tz="UTC").strftime("%Y-%m")
-            is_live_run = (
-                (pd.Timestamp.now(tz="UTC") - until) < pd.Timedelta(days=2) and
-                (pd.Timestamp.now(tz="UTC") - since) < pd.Timedelta(days=35)
-            )
-            if is_live_run and cache_latest == now_month:
-                cached_months.discard(cache_latest)
-                refresh_msg = f", refreshing {cache_latest}"
-            else:
-                refresh_msg = ""
+            # Default mode RESUMES from the last cached bar: the request for the
+            # current window is sized to exactly [last bar -> now] (see
+            # _ibkr_duration), and no month is skipped merely because it holds
+            # some bars — coverage is decided per business day, so interior holes
+            # are re-fetched. A historical --from backfill sets default_mode=False.
+            resume_msg = ", resuming from last cached bar" if default_mode else ""
 
             print(f"  ℹ️  {name} ({suffix}): cache {cache_earliest} → {cache_latest} "
-                  f"({len(existing):,} bars){gap_msg}{refresh_msg}")
+                  f"({len(existing):,} bars){gap_msg}{resume_msg}")
     else:
         existing      = pd.DataFrame()
         cached_months = set()
+
+    # ── --refetch: clear existing bars in [since, until] so fresh ones replace ──
+    if refetch and len(existing):
+        in_win = (existing["date"] >= since) & (existing["date"] <= until)
+        n_drop = int(in_win.sum())
+        if n_drop:
+            existing = existing[~in_win].reset_index(drop=True)
+            cached_months = set(existing["date"].dt.strftime("%Y-%m").unique()) if len(existing) else set()
+            print(f"     ♻️  --refetch: cleared {n_drop:,} {name} {suffix} bars in "
+                  f"[{since.date()} .. {until.date()}] — will re-fetch fresh")
 
     # ── Qualify contract ──────────────────────────────────────────────────────
     try:
@@ -463,15 +530,26 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
     # Work from a live copy of existing so we can save incrementally.
     combined = existing.copy() if len(existing) else pd.DataFrame()
 
+    # Days already present, for DATE-level (not month-level) skip decisions.
+    existing_days = set(existing["date"].dt.floor("D")) if len(existing) else set()
+    until_mkey    = until.strftime("%Y-%m")
+
     # 1m bars use weekly sub-chunking: "1 W" chunk is too small for a full month
     # in one request, so we slice the month into weekly windows and combine.
     use_weekly_sub = chunk.endswith(" W")
 
     for m in months:
         mkey = m.strftime("%Y-%m")
-        if mkey in cached_months:
-            skipped += 1
-            continue
+
+        # Skip a month ONLY when it is already covered on every business day it
+        # spans in-window (date granularity — an interior hole is NOT skipped).
+        # Never skip on --refetch; in default mode never skip the current window's
+        # month, so today's partial tail is always topped up.
+        if not refetch:
+            force = default_mode and mkey == until_mkey
+            if not force and _month_days_covered(existing_days, m, since, until):
+                skipped += 1
+                continue
 
         if consecutive_empty >= 2 and fetched == 0:
             print(f"     ⏭️  {name}: no data on first 2 months -- likely unsubscribed, skipping rest")
@@ -481,27 +559,34 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         next_month = m + pd.offsets.MonthBegin(1)
         limit_ts   = min(next_month, until + pd.Timedelta(days=1))
 
-        # Build list of (start, end) sub-windows within this month.
+        # (start, end) sub-windows covering [max(m, since), limit_ts]. The first
+        # month starts at `since` (not month start), and each request's duration
+        # is SIZED TO ITS WINDOW (not a fixed week/month) — so a default resume
+        # pulls only [last cached bar -> now]. 1m is sliced weekly (IBKR bar cap).
+        win_start = max(m, since)
         if use_weekly_sub:
-            sub_periods = []
-            cur_w = m
+            sub_windows = []
+            cur_w = win_start
             while cur_w < limit_ts:
                 end_w = min(cur_w + pd.Timedelta(weeks=1), limit_ts)
-                sub_periods.append(end_w)
+                sub_windows.append((cur_w, end_w))
                 cur_w = end_w
         else:
-            sub_periods = [limit_ts]
+            sub_windows = [(win_start, limit_ts)]
 
         print(f"     → {name} ({suffix}) {mkey} ...", end="", flush=True)
         month_bars = []
 
-        for end_ts in sub_periods:
-            end_dt = end_ts.strftime("%Y%m%d %H:%M:%S")
+        for start_w, end_w in sub_windows:
+            if end_w <= start_w:
+                continue
+            end_dt  = end_w.strftime("%Y%m%d %H:%M:%S")
+            dur_str = _ibkr_duration(end_w - start_w)
             for attempt in range(1, 4):
                 try:
                     bars = ib.reqHistoricalData(
                         qualified[0] if isinstance(qualified, list) else contract,
-                        endDateTime=end_dt, durationStr=chunk,
+                        endDateTime=end_dt, durationStr=dur_str,
                         barSizeSetting=bar_size_str, whatToShow=what_to_show,
                         useRTH=0, formatDate=2, timeout=60,
                     )
@@ -547,11 +632,12 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         print(f"     ❌ {name}: {len(failed_months)} months failed/empty")
 
     if fetched:
+        n_new = len(combined) - len(existing)
         manifest[manifest_key] = {"status": "ok", "rows": len(combined),
                                   "first": str(combined["date"].min()),
                                   "last":  str(combined["date"].max())}
         print(f"  ✅ {name:<12} {len(combined):>6} bars  "
-              f"(fetched {fetched} mo, cached {skipped} mo)")
+              f"(+{n_new:,} new, {skipped} mo already covered)")
     elif len(existing):
         print(f"  💾 {name:<12} {len(existing):>6} bars  [cached, no change]")
         manifest[manifest_key] = {"status": "ok", "rows": len(existing)}
@@ -584,9 +670,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="Fetch IBKR historical bars into market_data_cache/.",
     )
-    ap.add_argument("--bar-size", dest="bar_size", default="30m",
-                    choices=list(BAR_CONFIG.keys()),
-                    help="Bar size to fetch (default: 30m). Each size stored in its own CSV.")
+    ap.add_argument("--bar-size", dest="bar_sizes", nargs="+", default=None,
+                    choices=list(BAR_CONFIG.keys()), metavar="SIZE",
+                    help="Bar size(s) to fetch, space-separated. Default: 1m 15m 30m "
+                         "(each stored in its own CSV). E.g. --bar-size 5m  or  --bar-size 1m 30m.")
     ap.add_argument("--from", dest="since", metavar="YYYYMMDD[hhmm]", default=None,
                     help="Start of fetch window. Default: per-instrument latest cached date.")
     ap.add_argument("--until", metavar="YYYYMMDD[hhmm]", default=None,
@@ -598,21 +685,27 @@ def main():
                          "silver, ZC -> CBOT corn, ES -> CME e-mini), unknown "
                          "symbols fall back to stock. Bars land in the same cache.")
     ap.add_argument("--core-only", action="store_true",
-                    help="Fetch only SPY VIX OIL GOLD BTC.")
+                    help="Fetch only the core instruments (SPY VIX OIL GOLD; crypto excluded — "
+                         "it comes from Binance).")
+    ap.add_argument("--refetch", action="store_true",
+                    help="Clear existing bars in the [--from, --until] window and re-fetch them "
+                         "fresh (repairs distorted/corrupted data). Pair with --from and "
+                         "--instruments, e.g. --refetch --from 20260601 --instruments SPY VIX --bar-size 1m.")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--host", default=HOST)
     ap.add_argument("--client-id", type=int, default=CLIENT_ID)
     args = ap.parse_args()
 
-    bar_size_str, suffix, chunk, throttle, contfut_durations = BAR_CONFIG[args.bar_size]
+    bar_sizes = args.bar_sizes if args.bar_sizes else DEFAULT_BAR_SIZES
+    sizes_str = " ".join(bar_sizes)
 
     global_until = parse_stamp(args.until) if args.until else pd.Timestamp.now(tz="UTC")
     global_since = parse_stamp(args.since) if args.since else None
 
     print("=" * 60)
-    print(f"  IBKR HISTORICAL DATA FETCHER -- {args.bar_size} bars")
+    print(f"  IBKR HISTORICAL DATA FETCHER -- {sizes_str} bars")
     print("=" * 60)
-    print(f"  Bar size : {args.bar_size}  ->  {suffix}.csv per instrument")
+    print(f"  Bar sizes: {sizes_str}  ->  one CSV each per instrument")
     print(f"  Until    : {global_until.strftime('%Y-%m-%d %H:%M UTC')}")
     if global_since:
         print(f"  Since    : {global_since.strftime('%Y-%m-%d')}  (--from, backfill mode)")
@@ -634,8 +727,9 @@ def main():
     print("✅ Connected\n")
 
     if args.instruments:
-        # Registry names resolve from instruments.json; any OTHER bare symbol
-        # resolves investing.com style via resolve_symbol() (futures first).
+        # Explicit selection — fetch EXACTLY what's named (crypto included if
+        # asked). Registry names resolve from instruments.json; any OTHER bare
+        # symbol resolves investing.com style via resolve_symbol() (futures first).
         registry = {x[0]: x for x in INSTRUMENTS}
         todo = []
         for token in args.instruments:
@@ -646,35 +740,54 @@ def main():
                 todo.append(resolve_symbol(ib, name))
         mode = ", ".join(x[0] for x in todo)
     elif args.core_only or CORE_ONLY:
-        todo = [x for x in INSTRUMENTS if x[0] in CORE_NAMES]
-        mode = "5 CORE only"
+        # core set minus crypto (crypto comes from Binance)
+        todo = [x for x in INSTRUMENTS if x[0] in CORE_NAMES and x[0] not in CRYPTO_NAMES]
+        mode = "CORE only"
     else:
-        todo = INSTRUMENTS
-        mode = f"all {len(INSTRUMENTS)}"
-    print(f"📥 Fetching {mode}  ({args.bar_size} bars)")
-    print(f"  ~{throttle}s between requests to respect pacing limits\n")
+        # default: everything EXCEPT crypto (crypto comes from Binance)
+        todo = [x for x in INSTRUMENTS if x[0] not in CRYPTO_NAMES]
+        mode = f"all {len(todo)} (non-crypto)"
+
+    # Transparency: on any non-explicit run, note the crypto we deliberately skip.
+    if not args.instruments and CRYPTO_NAMES:
+        _c = sorted(CRYPTO_NAMES)
+        print(f"  ⏭️  skipping crypto ({', '.join(_c)}) — fetched via Binance "
+              f"(fetch_binance_history.py); use --instruments {_c[0]} to force IBKR.")
+    print(f"📥 Fetching {mode}  ({sizes_str} bars)\n")
 
     t0 = time.time()
-    for name, contract, wts in todo:
-        if global_since is not None:
-            since = global_since
-        else:
-            latest = _csv_latest_date(name, suffix)
-            if latest is not None:
-                since = latest - pd.Timedelta(hours=1)
+    stopped = False
+    # Outer loop over bar sizes so a single IBKR connection fetches all of them.
+    for bar_size in bar_sizes:
+        bar_size_str, suffix, chunk, throttle, contfut_durations = BAR_CONFIG[bar_size]
+        print("─" * 60)
+        print(f"  ▶  {bar_size} bars  ->  {suffix}.csv   (~{throttle}s between requests)")
+        print("─" * 60)
+
+        for name, contract, wts in todo:
+            if global_since is not None:
+                since = global_since
             else:
-                since = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=2)
+                latest = _csv_latest_date(name, suffix)
+                if latest is not None:
+                    since = latest - pd.Timedelta(hours=1)
+                else:
+                    since = pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=2)
 
-        if since >= global_until:
-            print(f"  💾 {name:<12} already up to date ({since.date()})")
-            continue
+            if since >= global_until:
+                print(f"  💾 {name:<12} already up to date ({since.date()})")
+                continue
 
-        try:
-            fetch_one(ib, name, contract, wts, manifest,
-                      since, global_until,
-                      suffix, bar_size_str, chunk, throttle, contfut_durations)
-        except KeyboardInterrupt:
-            print("\n🛑 Stopped by user.")
+            try:
+                fetch_one(ib, name, contract, wts, manifest,
+                          since, global_until,
+                          suffix, bar_size_str, chunk, throttle, contfut_durations,
+                          default_mode=(global_since is None), refetch=args.refetch)
+            except KeyboardInterrupt:
+                print("\n🛑 Stopped by user.")
+                stopped = True
+                break
+        if stopped:
             break
 
     ib.disconnect()
