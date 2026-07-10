@@ -167,20 +167,46 @@ def union_fill(existing, incoming, cols, prefer_existing=True, con=None) -> pd.D
             con.close()
 
 
-def write_csv(dst: str, source, cols: list, con=None) -> None:
-    """Write `cols` from `source` (DataFrame or CSV path) to `dst`, sorted by
-    date, in the EXACT cache format (tz-aware UTC date -> 'YYYY-MM-DD HH:MM:SS
-    +00:00'). Byte-compatible with the existing CSVs."""
+def latest_date(source, con=None):
+    """Fast max(date) of a cache CSV (or DataFrame) as a tz-aware UTC Timestamp,
+    or None. Reads only the date column via DuckDB — no full load."""
+    if isinstance(source, str) and not os.path.exists(source):
+        return None
     own = con is None
     con = con or connect()
     try:
         src = _src(con, source)
+        r = con.execute(f"SELECT max(date::TIMESTAMPTZ) FROM {src}").fetchone()[0]
+        return pd.Timestamp(r) if r is not None else None
+    finally:
+        try:
+            con.unregister("_bars_src")
+        except Exception:
+            pass
+        if own:
+            con.close()
+
+
+def write_csv(dst: str, source, cols: list, con=None) -> None:
+    """Write `cols` from `source` (DataFrame or CSV path) to `dst`, sorted by
+    date and DEDUPED by date — keeping the LAST occurrence in input order (the
+    freshest fetched bar) so no duplicate timestamp can ever be written — in the
+    EXACT cache format (tz-aware UTC date -> 'YYYY-MM-DD HH:MM:SS+00:00'; byte-
+    compatible). Atomic: writes a temp file then renames it into place."""
+    own = con is None
+    con = con or connect()
+    tmp = dst + ".tmp"
+    try:
+        src = _src(con, source)
         rest = ", ".join(f'"{c}"' for c in cols if c != "date")
         con.execute(
-            f"COPY (SELECT strftime(date::TIMESTAMPTZ, '%Y-%m-%d %H:%M:%S') || '+00:00' AS date, "
-            f"{rest} FROM {src} ORDER BY date::TIMESTAMPTZ) "
-            f"TO '{dst}' (HEADER, DELIMITER ',')"
+            f"COPY (WITH _u AS (SELECT *, row_number() OVER () AS _rid FROM {src}), "
+            f"_d AS (SELECT *, row_number() OVER (PARTITION BY date::TIMESTAMPTZ ORDER BY _rid DESC) AS _rn FROM _u) "
+            f"SELECT strftime(date::TIMESTAMPTZ, '%Y-%m-%d %H:%M:%S') || '+00:00' AS date, {rest} "
+            f"FROM _d WHERE _rn = 1 ORDER BY date::TIMESTAMPTZ) "
+            f"TO '{tmp}' (HEADER, DELIMITER ',')"
         )
+        os.replace(tmp, dst)
     finally:
         try:
             con.unregister("_bars_src")

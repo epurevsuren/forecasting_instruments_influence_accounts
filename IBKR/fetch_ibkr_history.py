@@ -38,6 +38,8 @@ import json
 import time
 import datetime
 import pandas as pd
+import bars as barsdb   # DuckDB engine: read / dedup-write cache CSVs. Aliased because
+                        # `bars` is a local var (the fetched bar list) inside fetch_one.
 from ib_async import IB, Stock, Future, Index, Forex, Crypto, ContFuture
 
 # Contract delivery schedules for expired-contract backfill.
@@ -236,15 +238,10 @@ def month_starts(since, until):
 
 
 def _csv_latest_date(name, suffix):
-    """Return the latest date in the cache CSV for (name, suffix), or None."""
-    path = os.path.join(CACHE_DIR, f"{name}_{suffix}.csv")
-    if not os.path.exists(path):
-        return None
+    """Return the latest date in the cache CSV for (name, suffix), or None.
+    Uses DuckDB (bars.latest_date) — reads only max(date), no full load."""
     try:
-        df = pd.read_csv(path, usecols=["date"])
-        if df.empty:
-            return None
-        return pd.to_datetime(df["date"], utc=True).max()
+        return barsdb.latest_date(os.path.join(CACHE_DIR, f"{name}_{suffix}.csv"))
     except Exception:
         return None
 
@@ -304,12 +301,15 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
 
     # ── Load existing cache ───────────────────────────────────────────────────
     if os.path.exists(cache_file):
-        existing = pd.read_csv(cache_file, parse_dates=["date"])
-        existing["date"] = pd.to_datetime(existing["date"], utc=True)
-        cached_months = set(
-            m for m in existing["date"].dt.strftime("%Y-%m").unique()
-            if isinstance(m, str)
-        )
+        existing = barsdb.read(cache_file)          # DuckDB read (tz-aware UTC date)
+        if existing is None or len(existing) == 0 or "date" not in existing.columns:
+            existing = pd.DataFrame()
+            cached_months = set()
+        else:
+            cached_months = set(
+                m for m in existing["date"].dt.strftime("%Y-%m").unique()
+                if isinstance(m, str)
+            )
         if cached_months:
             cache_earliest = min(cached_months)
             cache_latest   = max(cached_months)
@@ -409,7 +409,7 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             combined = (combined.drop_duplicates(subset=["date"], keep="last")
                         .sort_values("date").reset_index(drop=True))
             try:
-                safe_to_csv(combined, cache_file)   # write-on-each-fetch
+                barsdb.write_csv(cache_file, combined, list(combined.columns))  # DuckDB dedup-write
             except KeyboardInterrupt:
                 print(f"\n⚠️  Ctrl+C -- saved {len(combined):,} bars, stopping.")
                 raise
@@ -617,7 +617,7 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             combined = (combined.drop_duplicates(subset=["date"])
                         .sort_values("date").reset_index(drop=True))
             try:
-                safe_to_csv(combined, cache_file)
+                barsdb.write_csv(cache_file, combined, list(combined.columns))  # DuckDB dedup-write
                 cached_months.add(mkey)
             except KeyboardInterrupt:
                 cached_months.add(mkey)
