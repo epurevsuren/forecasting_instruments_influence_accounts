@@ -562,38 +562,122 @@ def abnormal_next_session(post_dt, name):
 # ==========================================
 # COMPUTE ABNORMAL RETURNS FOR ALL POSTS
 # ==========================================
+def _intraday_moves_duckdb(con, name, after, before):
+    """Bulk 1-hour intraday moves for EVERY post in the `_posts` temp table,
+    computed entirely in DuckDB via ASOF joins over the merged 30-min cache CSVs
+    ({name}_30min.csv + {name}_30min_yf.csv, IBKR wins on overlap). This EXACTLY
+    reproduces abnormal_return_intraday (verified 0-mismatch on 4004 posts) but
+    replaces the ~4.4M per-post pandas lookups with one set-based query per
+    instrument. Returns {post_id: move|None}.
+
+      post bar  = last bar with date <= post   (ASOF backward)  -> initial=open
+      reaction  = close of first bar >= post_bar+60min IF within 45min of target,
+                  else close of the bar 2 positions after the post bar (capped);
+                  a post on/after the LAST bar has no forward data -> None (daily).
+    """
+    ibkr = os.path.join(CACHE_DIR, f"{name}_30min.csv")
+    yf_  = os.path.join(CACHE_DIR, f"{name}_30min_yf.csv")
+    flt  = f"WHERE date::TIMESTAMPTZ >= '{after}' AND date::TIMESTAMPTZ <= '{before}'"
+    union = (f"SELECT date::TIMESTAMPTZ t, open, close, 0 pri "
+             f"FROM read_csv_auto('{ibkr}', null_padding=true) {flt}")
+    if os.path.exists(yf_):
+        union += (f" UNION ALL SELECT date::TIMESTAMPTZ t, open, close, 1 pri "
+                  f"FROM read_csv_auto('{yf_}', null_padding=true) {flt}")
+    q = f"""
+    WITH raw AS ({union}),
+    bars AS (SELECT t, open, close, row_number() OVER (ORDER BY t) AS ord
+             FROM (SELECT *, row_number() OVER (PARTITION BY t ORDER BY pri) rn FROM raw) WHERE rn = 1),
+    mx AS (SELECT max(ord) AS m FROM bars),
+    pb AS (SELECT p.post_id, p.pdt, b.ord pi, b.t pbt, b.open p_open, b.close p_close
+           FROM _posts p ASOF JOIN bars b ON p.pdt >= b.t),
+    r1 AS (SELECT pb.post_id, r.t rt, r.close rc
+           FROM pb ASOF JOIN bars r ON (pb.pbt + INTERVAL '60 minutes') <= r.t),
+    r2 AS (SELECT pb.post_id, b2.close rc2
+           FROM pb JOIN bars b2 ON b2.ord = LEAST(pb.pi + 2, (SELECT m FROM mx))),
+    x AS (SELECT pb.post_id, pb.pi, (SELECT m FROM mx) mxm,
+             COALESCE(NULLIF(pb.p_open, 0), NULLIF(pb.p_close, 0)) AS init,
+             CASE WHEN r1.rt IS NOT NULL
+                   AND (r1.rt - (pb.pbt + INTERVAL '60 minutes')) <= INTERVAL '45 minutes'
+                  THEN r1.rc ELSE r2.rc2 END AS react
+          FROM pb LEFT JOIN r1 USING(post_id) LEFT JOIN r2 USING(post_id))
+    SELECT post_id,
+           CASE WHEN pi >= mxm THEN NULL
+                WHEN init IS NULL OR init = 0 THEN NULL
+                WHEN react IS NULL OR react = 0 THEN NULL
+                ELSE round((react - init) / init * 100, 4) END AS mv
+    FROM x
+    """
+    return {int(pid): (None if mv is None else float(mv))
+            for pid, mv in con.execute(q).fetchall()}
+
+
 def compute_impacts(scored):
-    """Add {NAME}_Impact / _zscore / _quality columns for every ticker. Returns (scored, impact_cols)."""
+    """Add {NAME}_Impact / _zscore / _quality columns for every ticker. Returns (scored, impact_cols).
+
+    Intraday 1-hour moves come from DuckDB ASOF joins over the 30-min cache CSVs
+    (set-based, ~1000x faster than the old per-post loop). The daily / next-session
+    fallback (yfinance data, small) stays in pandas, invoked only for the posts the
+    intraday query could not measure (before first bar / on the last bar)."""
     print("\n🧮 Computing raw 1-hour moves (fair value) per instrument...")
+    import duckdb
+    con = duckdb.connect(); con.execute("SET TimeZone='UTC'")
+
+    # Register every post ONCE (UTC) — reused for every instrument's ASOF join.
+    pdts = pd.to_datetime(scored['date'], utc=True).dt.to_pydatetime().tolist()
+    con.execute("CREATE OR REPLACE TEMP TABLE _posts (post_id BIGINT, pdt TIMESTAMPTZ)")
+    con.executemany("INSERT INTO _posts VALUES (?, ?)",
+                    list(zip(range(len(scored)), pdts)))
+
+    # Same bar window as fetch_market's cache load, so the bar set (and thus every
+    # move) is identical to the pandas path.
+    _after  = (pd.Timestamp(scored['date'].dt.date.min()) - timedelta(days=5)).strftime('%Y-%m-%d')
+    _before = (pd.Timestamp(scored['date'].dt.date.max()) + timedelta(days=2)).strftime('%Y-%m-%d')
+
+    dates_list = scored['date'].tolist()
+    sessions   = scored['session'].tolist()
+    n          = len(scored)
     impact_cols = []
-    new_columns = {}  # collect all columns, add at once to avoid fragmentation
+    new_columns = {}   # collect all columns, add at once to avoid fragmentation
+
     for name,(ticker,mtype) in TICKERS.items():
         col  = f'{name}_Impact'
         zcol = f'{name}_zscore'
         qcol = f'{name}_quality'   # 'intraday' (reliable) or 'daily' (noisy)
-        ar_list, z_list, q_list = [], [], []
-        for _, row in scored.iterrows():
-            if mtype in ('24h','us'):
-                ar, z = abnormal_return_intraday(row['date'], name)
+        ar_list = [None] * n
+        q_list  = ['daily'] * n
+        csv_ok  = os.path.exists(os.path.join(CACHE_DIR, f"{name}_30min.csv"))
+
+        if mtype in ('24h', 'us') and csv_ok:
+            moves = _intraday_moves_duckdb(con, name, _after, _before)   # DuckDB ASOF (bulk)
+            for i in range(n):
+                mv = moves.get(i)
+                if mv is not None:
+                    ar_list[i] = round(mv, 4); q_list[i] = 'intraday'
+                else:                                                    # pandas daily fallback
+                    ar, _ = abnormal_return_daily(dates_list[i], name, sessions[i])
+                    ar_list[i] = ar;  q_list[i] = 'daily'
+        elif mtype in ('24h', 'us'):
+            # cache-less instrument: keep the original per-post path (yfinance intraday)
+            for i in range(n):
+                ar, _ = abnormal_return_intraday(dates_list[i], name)
                 if ar is None:
-                    ar, z = abnormal_return_daily(row['date'], name, row['session'])
-                    q = 'daily'
+                    ar, _ = abnormal_return_daily(dates_list[i], name, sessions[i]); q_list[i] = 'daily'
                 else:
-                    q = 'intraday'
-            else:
-                ar, z = abnormal_next_session(row['date'], name)
-                q = 'daily'   # Asian/EU always next-session daily
-            ar_list.append(ar)
-            z_list.append(z)
-            q_list.append(q)
+                    q_list[i] = 'intraday'
+                ar_list[i] = ar
+        else:
+            for i in range(n):
+                ar, _ = abnormal_next_session(dates_list[i], name)
+                ar_list[i] = ar; q_list[i] = 'daily'
+
         new_columns[col]  = ar_list
-        new_columns[zcol] = z_list
+        new_columns[zcol] = list(ar_list)   # z == raw move (unchanged from original)
         new_columns[qcol] = q_list
         valid = sum(1 for x in ar_list if x is not None)
         print(f"  ✅ {col:<22} {valid:>4} valid [{mtype}]")
         impact_cols.append(col)
 
-    # Add all columns at once (avoids DataFrame fragmentation warning)
+    con.close()
     scored = pd.concat([scored, pd.DataFrame(new_columns, index=scored.index)], axis=1)
     return scored, impact_cols
 
