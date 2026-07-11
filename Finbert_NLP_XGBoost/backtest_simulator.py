@@ -156,69 +156,125 @@ def _rank0_handle(when=None) -> str:
 
 # ============================================================ yfinance helpers ----
 # Inlined from the former build_test_training_set.py (deleted — no longer a separate file).
-# Used only by recompute_near_cutoff_actuals() to refresh partial reaction bars
-# for posts within --near-window-min of the --until cutoff.
+# ==========================================================================
+# NEAR-CUTOFF PARTIAL REACTION  —  OFFSET-SAFE (no bar may extend past --until)
+# ==========================================================================
+# For posts tweeted within --near-window-min of --until, the stored 1-hour
+# *_Impact can encode price action AFTER --until, which would leak the future
+# into the backtest. We recompute a PARTIAL reaction post -> min(post+60, until)
+# from the LOCAL market_data_cache bars, read with DuckDB (on-disk filtered so
+# the huge 1-min CSVs never fully load), STRICTLY truncated at --until:
+#   * a bar is usable ONLY if its WHOLE interval finishes at/before --until
+#     (bar_start + interval <= until) — a bar STRADDLING the cutoff is dropped,
+#     otherwise its close would reveal price after the offset (a hint) and the
+#     backtest would be unrealistic;
+#   * intervals: 1min preferred, then 15min, then 30min — never 5min;
+#   * yfinance is used ONLY as a fallback for the recent tail the cache lacks.
+FINE_REACH_DAYS = 59   # yfinance intraday (<=30m) reaches back ~60 calendar days
+REACT_MIN       = 60   # the 1-hour reaction window baked into *_Impact
+_CACHE_IVS = (("1min", 1), ("15min", 15), ("30min", 30))   # 1min first; NO 5min
 
-FINE_REACH_DAYS = 59   # yfinance fine intervals (≤30m) go back ~60 calendar days
 
-BAR = pd.Timedelta('30min')   # default fallback bar width
-
-
-def pick_interval(elapsed_min: float) -> str:
-    """Choose the finest yfinance interval that covers elapsed_min minutes."""
-    if elapsed_min <= 5:
-        return '1m'
-    if elapsed_min <= 15:
-        return '5m'
-    if elapsed_min <= 30:
-        return '15m'
-    return '30m'
+def _to_utc(ts) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
 
 
-def fetch_fine(interval: str, until: pd.Timestamp) -> dict:
-    """
-    Fetch intraday bars at `interval` for all B.TICKERS up to `until`.
-    Returns {short_name: DataFrame} or {} on failure.
-    """
-    import yfinance as yf
-    lookback = 7 if interval == '1m' else 60   # yfinance 1m limit = 7 days
-    start = until - pd.Timedelta(days=lookback)
-    result = {}
-    for name, (yf_sym, _) in B.TICKERS.items():
-        try:
-            df = yf.download(yf_sym,
-                             start=start,
-                             end=until + pd.Timedelta(hours=1),
-                             interval=interval,
-                             auto_adjust=True, progress=False)
-            if df.empty:
+def _ts_lit(ts) -> str:
+    """UTC datetime -> a DuckDB TIMESTAMPTZ literal."""
+    return "TIMESTAMPTZ '" + _to_utc(ts).strftime("%Y-%m-%d %H:%M:%S") + "+00'"
+
+
+def _col(d, name):
+    """yfinance column -> list of floats (handles the single-symbol MultiIndex)."""
+    s = d[name]
+    try:
+        if getattr(s, "ndim", 1) > 1:
+            s = s.iloc[:, 0]
+    except Exception:
+        pass
+    return [float(x) for x in s.values]
+
+
+def _reaction_from_slice(slice_iv, post_utc, until_utc, react_end_utc):
+    """Leak-free partial reaction % from a small {iv: [(t_utc, open, close)...]}
+    slice (bars sorted ascending). initial = OPEN of the bar containing the post
+    (matches build_final_training_set); final = CLOSE of the LAST bar whose whole
+    interval ends at/before `until` (and after the post bar, within the reaction
+    window). Prefers 1min. Returns None if not measurable."""
+    for iv, mins in _CACHE_IVS:
+        rows = slice_iv.get(iv)
+        if not rows:
+            continue
+        w = pd.Timedelta(minutes=mins)
+        init = init_t = None
+        for t, o, c in rows:                       # last bar with t <= post
+            if t <= post_utc:
+                init, init_t = o, t
+            else:
+                break
+        if init is None or init == 0:
+            continue
+        fin = None
+        for t, o, c in rows:                       # last bar fully <= until, after post bar
+            if t > init_t and (t + w) <= until_utc and t <= react_end_utc:
+                fin = c
+        if fin is None:
+            continue
+        return (float(fin) - float(init)) / float(init) * 100.0
+    return None
+
+
+def _cache_slice(name, lo, until):
+    """{iv: [(t_utc, open, close)...]} from market_data_cache for [lo, until],
+    read via DuckDB — only the tiny matching window is materialised, so the big
+    CSVs never fully load. {} when the cache has no bars in that window."""
+    import duckdb
+    con = duckdb.connect(); con.execute("SET TimeZone='UTC'")
+    out = {}
+    try:
+        for iv, _ in _CACHE_IVS:
+            path = os.path.join(B.CACHE_DIR, f"{name}_{iv}.csv")
+            if not os.path.exists(path):
                 continue
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-            df.index = df.index.tz_convert(NY)
-            result[name] = df
-        except Exception:
-            pass
-    return result
+            rows = con.execute(
+                f"SELECT date::TIMESTAMPTZ, open, close "
+                f"FROM read_csv_auto('{path}', null_padding=true) "
+                f"WHERE date::TIMESTAMPTZ >= {_ts_lit(lo)} AND date::TIMESTAMPTZ <= {_ts_lit(until)} "
+                f"ORDER BY 1"
+            ).fetchall()
+            if rows:
+                out[iv] = [(_to_utc(t), o, c) for t, o, c in rows]
+    finally:
+        con.close()
+    return out
 
 
-def short_reaction_move(bars, width: pd.Timedelta,
-                        post_ts: pd.Timestamp, until: pd.Timestamp):
-    """
-    % price move starting at post_ts over `width`, truncated at `until`.
-    Returns None if no bars fall in the window.
-    """
-    if bars is None or (hasattr(bars, 'empty') and bars.empty):
-        return None
-    end = min(post_ts + width, until)
-    window = bars[(bars.index >= post_ts) & (bars.index <= end)]
-    if len(window) < 1:
-        return None
-    open_price  = float(window['Close'].iloc[0])
-    close_price = float(window['Close'].iloc[-1])
-    if open_price == 0:
-        return None
-    return (close_price - open_price) / open_price * 100.0
+def _yf_slice(name, lo, until):
+    """Fallback slice from yfinance for the recent tail the cache lacks. 1-min
+    bars when within yfinance's ~7-day 1m reach, else 30-min. Same tuple format
+    (UTC). yfinance bar index is the bar START, so the same bar-end <= until
+    cutoff in _reaction_from_slice keeps it offset-safe."""
+    import yfinance as yf
+    spec = B.TICKERS.get(name)
+    if not spec:
+        return {}
+    days_back = (pd.Timestamp.now(tz="UTC") - _to_utc(until)).days
+    iv, key = ("1m", "1min") if days_back <= 6 else ("30m", "30min")
+    try:
+        d = yf.download(spec[0], start=(_to_utc(lo) - pd.Timedelta(days=1)),
+                        end=(_to_utc(until) + pd.Timedelta(hours=1)),
+                        interval=iv, auto_adjust=True, progress=False)
+        if d.empty:
+            return {}
+        idx = d.index
+        idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        rows = [(pd.Timestamp(t), o, c)
+                for t, o, c in zip(idx, _col(d, "Open"), _col(d, "Close"))
+                if _to_utc(lo) <= pd.Timestamp(t) <= _to_utc(until)]
+        return {key: rows} if rows else {}
+    except Exception:
+        return {}
 
 DIR_THRESHOLD_DEFAULT = 0.1   # |actual| %% move must exceed this to count toward direction accuracy
 NEAR_WINDOW_DEFAULT   = 60    # minutes — matches the 1h reaction window baked into *_Impact
@@ -411,39 +467,34 @@ def recompute_near_cutoff_actuals(df, until, impact_cols, near_window_min):
     near = df[near_mask]
     df.loc[near_mask, 'is_near'] = True
     print(f"\n⏱️  {near_mask.sum()} post(s) within {near_window_min}min of --until — "
-          f"recomputing PARTIAL reaction with fine yfinance bars (truncated at --until)...")
+          f"recomputing PARTIAL reaction from cached bars (DuckDB, 1min→15min→30min), "
+          f"strictly truncated at --until (no bar allowed past the offset)...")
 
-    days_back = (pd.Timestamp.now(tz=NY) - until).days
-    fine_ok = days_back <= FINE_REACH_DAYS
-    intervals_needed = sorted({pick_interval(min(m, 60)) for m in elapsed_min[near_mask]})
+    until_utc = _to_utc(until)
+    # One tiny window covers every near post's containing bar + its reaction window.
+    lo    = _to_utc(near['date_ny'].min()) - pd.Timedelta(minutes=35)
+    names = [c.replace('_Impact', '') for c in impact_cols]
 
-    fine = {}
-    fallback30 = None
-    if fine_ok:
-        for iv in intervals_needed:
-            fine[iv] = fetch_fine(iv, until)
-    else:
-        print(f"   ⚠️  --until is {days_back} days back — beyond yfinance's "
-              f"~{FINE_REACH_DAYS}-day fine-interval reach; using 30m bars only.")
-    # always have a 30m fallback ready (cheap single call per ticker, only fetched if needed)
-    def get_fallback30():
-        nonlocal fallback30
-        if fallback30 is None:
-            fallback30 = fetch_fine('30m', until)
-        return fallback30
+    # Read each instrument's bars for [lo, until] ONCE (cache first; yfinance only
+    # for the recent tail the cache doesn't cover).
+    slices, n_yf = {}, 0
+    for name in names:
+        s = _cache_slice(name, lo, until)
+        if not s:
+            s = _yf_slice(name, lo, until)
+            if s:
+                n_yf += 1
+        slices[name] = s
+    if n_yf:
+        print(f"   ℹ️  {n_yf} instrument(s) not in the cache for this window — "
+              f"used yfinance tail bars (same --until bar cutoff).")
 
     for idx in near.index:
-        row = df.loc[idx]
-        elapsed = min(elapsed_min[idx], 60)
-        iv = pick_interval(elapsed)
-        width = pd.Timedelta(minutes=int(iv[:-1]))
+        post_utc  = _to_utc(df.loc[idx, 'date_ny'])
+        react_end = min(post_utc + pd.Timedelta(minutes=REACT_MIN), until_utc)
         for col in impact_cols:
             name = col.replace('_Impact', '')
-            bars = fine.get(iv, {}).get(name)
-            move = short_reaction_move(bars, width, row['date_ny'], until)
-            if move is None:
-                fb = get_fallback30().get(name)
-                move = short_reaction_move(fb, BAR, row['date_ny'], until)
+            move = _reaction_from_slice(slices.get(name, {}), post_utc, until_utc, react_end)
             df.at[idx, col] = move if move is not None else 0.0
     return df
 
