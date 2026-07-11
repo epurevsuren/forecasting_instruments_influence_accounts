@@ -194,12 +194,9 @@ def main():
     w = df['sample_weight'].fillna(0.3).values if 'sample_weight' in df.columns else None
     sig = df['sample_weight'].fillna(0.3).values if 'sample_weight' in df.columns else np.full(len(df),0.5)
 
-    json.dump({"finbert":FINBERT,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
-               "nlp_features":use_nlp,"instruments":INSTRUMENTS},
-              open(f"{OUT_DIR}/config.json","w"))
-
     print("\n🌲 Training [FinBERT(CLS+mean)+NLP] → XGBoost...\n")
     report = {}
+    calibration = {}   # per-instrument magnitude scale, fitted OUT-OF-SAMPLE
     for inst in INSTRUMENTS:
         col = f"{inst}_Impact"
         if col not in df.columns: continue
@@ -227,15 +224,42 @@ def main():
         imp = m.feature_importances_
         nlp_share = imp[nlp_start:].sum() / max(imp.sum(),1e-9)
 
+        # MAGNITUDE CALIBRATION — XGBoost squared-error predictions shrink
+        # toward the mean (regression dilution: many near-zero training rows,
+        # capped heavy tails), so |pred| systematically underestimates |actual|
+        # even when direction correlation is high (decade backtest: actual ≈
+        # 1.1-3.0 x pred per instrument, corr 0.79-0.94). Fit
+        #     actual = k x pred   (regression through the origin)
+        # on the HOLDOUT split only (in-sample preds are overfit -> k≈1 lie),
+        # k clipped to [0.5, 4.0], meaningful moves only. predict/backtest
+        # multiply raw model output by k so predicted PERCENTAGES are usable
+        # for TP sizing, not just direction.
+        cal_mask = np.abs(yte) > 0.05
+        if cal_mask.sum() >= 10 and (pred[cal_mask] ** 2).sum() > 1e-9:
+            k_cal = float((pred[cal_mask] * yte[cal_mask]).sum()
+                          / (pred[cal_mask] ** 2).sum())
+            k_cal = float(np.clip(k_cal, 0.5, 4.0))
+        else:
+            k_cal = 1.0
+        calibration[inst] = round(k_cal, 3)
+
         m.save_model(f"{OUT_DIR}/{col}.json")
         report[inst] = {"mae":round(mae,4),"r2":round(r2,3),
                         "dir_acc":round(float(dir_acc),3) if dir_acc==dir_acc else None,
                         "noise_pred":round(float(noise_pred),4),
                         "nlp_share":round(float(nlp_share),3),
+                        "calibration_k":calibration[inst],
                         "best_iter":int(m.best_iteration or 0)}
         flag = "✅" if r2>0.1 else ("🟡" if r2>0 else "🔴")
         da = f"dir={dir_acc:.0%}" if dir_acc==dir_acc else "dir=n/a"
-        print(f"  {flag} {inst:<10} R²={r2:+.3f}  {da}  noise|p|={noise_pred:.3f}  NLP={nlp_share:.0%}")
+        print(f"  {flag} {inst:<10} R²={r2:+.3f}  {da}  noise|p|={noise_pred:.3f}  "
+              f"NLP={nlp_share:.0%}  k={calibration[inst]:.2f}")
+
+    # config.json written AFTER training so it carries the fitted calibration
+    json.dump({"finbert":FINBERT,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
+               "nlp_features":use_nlp,"instruments":INSTRUMENTS,
+               "calibration":calibration},
+              open(f"{OUT_DIR}/config.json","w"))
 
     eval_df = pd.DataFrame([{"instrument": k, **v} for k, v in report.items()])
     db.write_table(EVAL_TABLE, eval_df)

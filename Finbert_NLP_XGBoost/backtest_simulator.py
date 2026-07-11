@@ -506,7 +506,15 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     instruments = cfg['instruments']
     label_meta = {inst: (emoji, name) for inst, emoji, name in PR.LABELS}
 
-    preds = {inst: models[inst].predict(X) for inst in models}
+    # per-instrument magnitude calibration (fitted on the train holdout;
+    # actual = k x raw_pred — fixes squared-error shrinkage so predicted
+    # PERCENTAGES track actual moves, not just direction)
+    _cal = cfg.get("calibration", {})
+    preds = {inst: models[inst].predict(X) * _cal.get(inst, 1.0) for inst in models}
+    if _cal:
+        print(f"  🎚️  Magnitude calibration applied "
+              f"(k per instrument, e.g. " +
+              ", ".join(f"{i}×{_cal[i]:.2f}" for i in list(_cal)[:5]) + " ...)")
 
     # Chain handling lives in the PRODUCTION module (PR.chain_factor, called
     # by gate_multiplier) — the backtest only resets its in-process state so
@@ -631,6 +639,52 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         csv_rows.append(csv_row)
 
     return stats, td_stats, csv_rows
+
+
+def print_magnitude_summary(csv_rows, instruments, dir_threshold):
+    """
+    MAGNITUDE ACCURACY — the second scoreboard Peter asked for: how well do
+    predicted PERCENTAGES track actual moves (not just direction)? Per
+    instrument, over undamped rows with meaningful actuals:
+      k     = actual-vs-pred slope (regression through origin; 1.0 = calibrated)
+      corr  = Pearson correlation (direction+shape quality)
+      MdAPE = median |pred-actual| / |actual| (typical % error of the magnitude)
+    """
+    import numpy as _np
+    print("\n" + "=" * 78)
+    print(f"  MAGNITUDE ACCURACY  (predicted %% vs actual %%, undamped rows, "
+          f"|actual| >= {dir_threshold}%)")
+    print("=" * 78)
+    print(f"  {'instrument':<10} {'n':>5} {'k=act/pred':>10} {'corr':>6} "
+          f"{'mean|p|':>8} {'mean|a|':>8} {'MdAPE':>7}")
+    agg_p, agg_a = [], []
+    for inst in instruments:
+        p, a = [], []
+        for r in csv_rows:
+            if r.get('total_mult', 1.0) != 1.0:
+                continue
+            pv, av = r.get(f'{inst}_pred'), r.get(f'{inst}_actual')
+            if pv is None or av is None or abs(av) < dir_threshold:
+                continue
+            p.append(pv); a.append(av)
+        if len(p) < 8:
+            continue
+        p, a = _np.array(p), _np.array(a)
+        k = float((p * a).sum() / max((p * p).sum(), 1e-9))
+        corr = float(_np.corrcoef(p, a)[0, 1])
+        mdape = float(_np.median(_np.abs(p - a) / _np.abs(a)))
+        agg_p.append(p); agg_a.append(a)
+        flag = "✅" if 0.7 <= k <= 1.4 else ("🟡" if 0.5 <= k <= 2.0 else "🔴")
+        print(f"  {flag} {inst:<8} {len(p):>5} {k:>10.2f} {corr:>6.2f} "
+              f"{_np.abs(p).mean():>8.3f} {_np.abs(a).mean():>8.3f} {mdape:>6.0%}")
+    if agg_p:
+        P, A = _np.concatenate(agg_p), _np.concatenate(agg_a)
+        K = float((P * A).sum() / max((P * P).sum(), 1e-9))
+        print("-" * 78)
+        print(f"  OVERALL   n={len(P)}  k={K:.2f} (want ~1.0)  "
+              f"corr={_np.corrcoef(P, A)[0, 1]:.3f}  "
+              f"MdAPE={_np.median(_np.abs(P - A) / _np.abs(A)):.0%}")
+    print("=" * 78)
 
 
 def print_summary(stats, dir_threshold):
@@ -942,6 +996,8 @@ def main():
     stats, td_stats, csv_rows = run_backtest(df, X, cfg, models, impact_cols, args.dir_threshold, trade_threshold)
 
     print_summary(stats, args.dir_threshold)
+    print_magnitude_summary(csv_rows, [i for i in instruments if i in models],
+                            args.dir_threshold)
     print_trade_skip_summary(td_stats, trade_threshold, args.dir_threshold)
     print_filtered_accuracy(td_stats, args.dir_threshold)
     write_trade_accuracy(td_stats, args.model_dir, trade_threshold, since, until)

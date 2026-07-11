@@ -662,10 +662,11 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     mult *= tfactor
 
     out = {}
+    cal = cfg.get("calibration", {})   # per-instrument magnitude scale (train holdout fit)
     for inst,_,_ in LABELS:
         if inst in models:
             raw = float(models[inst].predict(X)[0])
-            out[inst] = raw * mult
+            out[inst] = raw * cal.get(inst, 1.0) * mult
     return out, signal, gate, tfactor, tlabel
 
 
