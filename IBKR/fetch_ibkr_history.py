@@ -384,7 +384,7 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         combined = existing.copy() if len(existing) else pd.DataFrame()
         got_new  = False
 
-        def _flush(bar_list, before=None):
+        def _flush(bar_list, before=None, after=None):
             """Merge fetched bars into `combined` and write to disk IMMEDIATELY
             (incremental + resumable). The caller does the printing.
 
@@ -401,6 +401,8 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             df = df[df["date"] <= until]
             if before is not None:
                 df = df[df["date"] < before]
+            if after is not None:                    # --refetch: keep only the requested window
+                df = df[df["date"] >= after]
             if df.empty:
                 return
             base = [combined] if len(combined) else []
@@ -421,8 +423,12 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             len(existing) > 0 and
             existing["date"].max() >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)
         )
-        if cache_is_fresh:
-            print(f"     💾 {name}: cached up to {existing['date'].max().date()}, skipping recent fetch")
+        if cache_is_fresh or refetch:
+            if refetch:
+                print(f"     ♻️  {name}: --refetch → refilling [{since.date()} .. {until.date()}] "
+                      f"from dated contracts (skipping the recent ContFuture fetch)")
+            else:
+                print(f"     💾 {name}: cached up to {existing['date'].max().date()}, skipping recent fetch")
         else:
             for dur in contfut_durations:
                 print(f"     → {name} ({suffix}) ContFuture {dur} ...", end="", flush=True)
@@ -452,23 +458,39 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
         else:
             cf_earliest = until
 
-        gap_end   = cf_earliest - pd.Timedelta(days=1)
-        gap_start = since
-
         base_sym = contract.symbol
         exch     = contract.exchange
-        expiries = _expired_months(base_sym, gap_start, gap_end)
 
-        if expiries:
-            print(f"     🔙 {name}: backfilling {len(expiries)} expired contracts "
-                  f"({expiries[0]} -> {expiries[-1]})")
+        if refetch:
+            # --refetch cleared [since, until]; refill it directly from the dated
+            # contracts that traded during that window. Widen the delivery-month
+            # search ~one quarter each side so a contract ROLL inside the window is
+            # covered (e.g. ZN rolls Mar->Jun); every fetched bar is then clipped to
+            # [since, until] and dedup keeps the LATEST-expiry (post-roll) contract
+            # on any overlap, matching the continuous-future stitch. The cached-month
+            # skip is bypassed since those months are being replaced on purpose.
+            expiries = _expired_months(base_sym,
+                                       since - pd.Timedelta(days=95),
+                                       until + pd.Timedelta(days=95))
+            skip_cached_months = False
+            if expiries:
+                print(f"     🔁 {name}: refetching {len(expiries)} dated contract(s) "
+                      f"covering [{since.date()} .. {until.date()}] "
+                      f"({expiries[0]} -> {expiries[-1]})")
+        else:
+            gap_end  = cf_earliest - pd.Timedelta(days=1)
+            expiries = _expired_months(base_sym, since, gap_end)
+            skip_cached_months = True
+            if expiries:
+                print(f"     🔙 {name}: backfilling {len(expiries)} expired contracts "
+                      f"({expiries[0]} -> {expiries[-1]})")
 
         # Smaller bar sizes need shorter backfill windows to stay under IBKR bar limits.
         backfill_dur = "30 D" if suffix in ("1min", "5min") else "90 D"
 
         for ym in expiries:
             ym_month = f"{ym[:4]}-{ym[4:6]}"
-            if ym_month in cached_months:
+            if skip_cached_months and ym_month in cached_months:
                 continue
             fut = Future(symbol=base_sym, exchange=exch, currency="USD",
                          lastTradeDateOrContractMonth=ym)
@@ -490,10 +512,15 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
                     useRTH=0, formatDate=2, timeout=90,
                 )
                 if bars:
-                    # clip to < cf_earliest so the continuous-future bars keep
-                    # ownership of their region (preserves the old "ContFuture
-                    # wins the overlap" behavior); written to disk immediately.
-                    _flush(bars, before=cf_earliest)
+                    if refetch:
+                        # clip to the requested window; dedup keep='last' + ascending
+                        # expiry order → the post-roll contract wins any overlap.
+                        _flush(bars, after=since)
+                    else:
+                        # clip to < cf_earliest so the continuous-future bars keep
+                        # ownership of their region (preserves the old "ContFuture
+                        # wins the overlap" behavior); written to disk immediately.
+                        _flush(bars, before=cf_earliest)
                     print(f" {len(bars)} bars")
                 else:
                     print(" empty")
