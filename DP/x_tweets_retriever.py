@@ -142,7 +142,7 @@ def load_tracked_accounts(handles_filter=None):
     # (e.g. @JoeBiden, @POTUS46Archive, former PMs). They are NEVER fetched on a
     # default/scheduled run -- only when the user explicitly passes --handles --
     # and their expiry is ignored so their historical tweets can be backfilled.
-    accounts, seen, skipped = [], set(), []
+    accounts, seen, skipped, non_x = [], set(), [], []
     sections = [(data.get("entities", []), True),
                 (data.get("institutions", {}).get("entries", []), True)]
     if handles_filter:
@@ -153,6 +153,14 @@ def load_tracked_accounts(handles_filter=None):
             if not handle:
                 continue
             handle = handle.lstrip("@")
+            # X/Twitter retriever ONLY — skip accounts whose platform is Truth
+            # Social (e.g. @JDVance1, whose X handle is @JDVance and which does not
+            # exist on X). Those are fetched by daily_truths_retriever.py instead.
+            if str(entry.get("platform", "")).strip().lower() == "truthsocial":
+                if handle.lower() not in seen:
+                    non_x.append(handle)
+                    seen.add(handle.lower())
+                continue
             if handle.lower() in seen:
                 continue
             seen.add(handle.lower())
@@ -160,6 +168,9 @@ def load_tracked_accounts(handles_filter=None):
                 skipped.append(handle)
                 continue
             accounts.append({"handle": handle, "name": entry.get("name", handle)})
+    if non_x:
+        print(f"[skip] {len(non_x)} Truth Social account(s) not fetched by the X retriever "
+              f"(handled by daily_truths_retriever.py): {', '.join(non_x)}")
     if skipped:
         print(f"[skip] {len(skipped)} expired account(s) not fetched: {', '.join(skipped)}")
 
