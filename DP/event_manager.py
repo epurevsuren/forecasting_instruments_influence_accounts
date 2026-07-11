@@ -147,18 +147,60 @@ class EventManager:
                 results.append({**ev, "_weight": self.get_weight(ev["id"])})
         return sorted(results, key=lambda x: x["_weight"], reverse=True)
 
-    def get_account_multiplier(self, account_handle: str) -> float:
+    @staticmethod
+    def _parse_date(x):
+        if x is None or str(x).strip().upper() in ("", "N/A", "NONE", "NULL"):
+            return None
+        try:
+            return date.fromisoformat(str(x).strip()[:10])
+        except (ValueError, TypeError):
+            return None
+
+    def get_weight_at(self, event_id: str, at_date) -> float:
+        """
+        POINT-IN-TIME weight for back-simulation: 0.0 when `at_date` falls
+        outside [start_date, end_date]. Inside the window:
+          * CLOSED (historical) events count as ACTIVE — their status TODAY
+            says 'ended', but at that date they were live (a 2020-03 post
+            must feel covid at full weight, not today's 0.1 'ended' weight);
+          * OPEN events (end_date N/A) keep their CURRENT status nuance
+            (escalating 1.3 / paused 0.4 ...) — that IS the present.
+        """
+        ev = self.get_event(event_id)
+        if ev is None:
+            return 0.0
+        d = at_date if isinstance(at_date, date) else self._parse_date(at_date)
+        if d is None:
+            return self.get_weight(event_id)
+        start = self._parse_date(ev.get("start_date"))
+        end   = self._parse_date(ev.get("end_date"))
+        if start is not None and d < start:
+            return 0.0
+        if end is not None and d > end:
+            return 0.0
+        pm = PRIORITY_MULTIPLIERS.get(ev.get("priority", ""), 0.0)
+        if end is None:      # still open -> live status nuance applies
+            sw = STATUS_WEIGHTS.get(ev.get("status", ""), 0.0)
+        else:                # closed historical event, in-window -> it was ACTIVE
+            sw = STATUS_WEIGHTS["active"]
+        return round(sw * pm, 4)
+
+    def get_account_multiplier(self, account_handle: str, at_date=None) -> float:
         """
         Single multiplier for a tracked account = max weight across all
         events that affect it. Returns 1.0 if no events match (neutral).
 
-        Use this to scale the signal scorer's post-level score:
-            adjusted_score = base_score * em.get_account_multiplier(account)
+        at_date (date | 'YYYY-MM-DD' | None): when given, weights are
+        POINT-IN-TIME (see get_weight_at) so historical posts carry the
+        event landscape of THEIR day, not today's statuses.
         """
         evs = self.get_account_events(account_handle)
         if not evs:
             return 1.0
-        return max(ev["_weight"] for ev in evs)
+        if at_date is None:
+            return max(ev["_weight"] for ev in evs)
+        w = max(self.get_weight_at(ev["id"], at_date) for ev in evs)
+        return w if w > 0 else 1.0
 
     def get_all_multipliers(self) -> dict[str, float]:
         """Return {account_handle: multiplier} for every account in any event."""

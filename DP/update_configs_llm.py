@@ -340,7 +340,7 @@ def validate(deltas, sc, acc, ev):
             rejects.append(f"new_flags: invalid/duplicate: {f}")
 
     for a in (deltas.get("new_accounts") or [])[:MAX_NEW_ACCOUNTS]:
-        h = str(a.get("twitter_handle", "")).lstrip("@")
+        h = str(a.get("account") or a.get("twitter_handle") or "").lstrip("@")
         ok = (a.get("name") and _HANDLE_RE.match(h or "-")
               and h.lower() not in existing_handles
               and _COUNTRY_RE.match(str(a.get("country", "")))
@@ -428,7 +428,7 @@ def apply_deltas(clean, sc, acc, ev, ts):
                 "country": a["country"], "role": a.get("category", "leader"),
                 "category": a["category"], "mention_count": 1,
                 "platform": "x_twitter",
-                "twitter_handle": "@" + str(a["twitter_handle"]).lstrip("@"),
+                "account": "@" + str(a["twitter_handle"]).lstrip("@"),
                 "active_from": a["active_from"], "active_to": a.get("active_to"),
                 "expiration_date": "N/A",
                 "note": f"[LLM curator {ts}] {a.get('reason', '')}"})
@@ -436,8 +436,9 @@ def apply_deltas(clean, sc, acc, ev, ts):
                            f"(window {a['active_from']} -> {a.get('active_to') or 'open'})")
         for h, inc in clean["increment_mentions"].items():
             for e in acc.get("entities", []):
-                if str(e.get("twitter_handle", "")).lstrip("@").lower() == h.lower():
-                    e["mention_count"] = int(e.get("mention_count", 0)) + inc
+                eh = str(e.get("account") or e.get("twitter_handle") or "").lstrip("@").lower()
+                if eh == h.lower():
+                    e["mention_count"] = int(e.get("mention_count") or 0) + inc
                     changed.append(f"accounts: {h} mention_count +{inc}")
         for w in clean["close_account_window"]:
             hl = w["handle"].lower()

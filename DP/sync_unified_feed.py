@@ -95,13 +95,14 @@ def _build_entity_map() -> dict:
     em = EventManager()
     out: dict = {}
 
-    # Named geo leaders / election candidates
+    # Named geo leaders / election candidates ('account' is the current field;
+    # 'twitter_handle' accepted as legacy fallback)
     for ent in data.get("entities", []):
-        raw = ent.get("twitter_handle")
+        raw = ent.get("account") or ent.get("twitter_handle")
         if not raw:
-            continue
-        h = raw.lstrip("@")
-        mc = int(ent.get("mention_count", 0))
+            continue                       # reserved slots have account: null
+        h = str(raw).lstrip("@")
+        mc = int(ent.get("mention_count") or 0)
         # Explicit entity_weight overrides the mention_count formula.
         # Use this for election candidates whose market impact doesn't correlate
         # with how often the current rank-0 account has mentioned them
@@ -113,7 +114,7 @@ def _build_entity_map() -> dict:
         out[h.lower()] = {
             "handle":        h,
             "name":          ent.get("name", h),
-            "rank":          int(ent.get("rank", 99)),
+            "rank":          int(ent.get("rank") or 99),
             "mention_count": mc,
             "entity_weight": ew,
             "event_weight":  em.get_account_multiplier(h),
@@ -121,10 +122,10 @@ def _build_entity_map() -> dict:
 
     # Institutions (no mention_count)
     for inst in data.get("institutions", {}).get("entries", []):
-        raw = inst.get("twitter_handle")
+        raw = inst.get("account") or inst.get("twitter_handle")
         if not raw:
             continue
-        h = raw.lstrip("@")
+        h = str(raw).lstrip("@")
         ew = INSTITUTION_WEIGHTS.get(h, 0.50)
         out[h.lower()] = {
             "handle":        h,
@@ -132,6 +133,28 @@ def _build_entity_map() -> dict:
             "rank":          None,
             "mention_count": None,
             "entity_weight": ew,
+            "event_weight":  em.get_account_multiplier(h),
+        }
+
+    # ARCHIVES: former leaders / archived office handles (Abe, Boris, Pompeo,
+    # @POTUS46Archive...). Their historical tweets are in x_tweets.csv for
+    # back-simulation. Inside their active window they were REAL leaders —
+    # give them a solid base weight (explicit entity_weight, else 0.50);
+    # outside the window _apply_active_windows damps them x0.05 anyway.
+    # Don't overwrite live entries when an alias collapses to the same handle.
+    for arc in data.get("archives", {}).get("entries", []):
+        raw = arc.get("account") or arc.get("twitter_handle")
+        if not raw:
+            continue
+        h = str(raw).lstrip("@")
+        if h.lower() in out:
+            continue
+        out[h.lower()] = {
+            "handle":        h,
+            "name":          arc.get("name", h),
+            "rank":          None,
+            "mention_count": None,
+            "entity_weight": float(arc.get("entity_weight", 0.50)),
             "event_weight":  em.get_account_multiplier(h),
         }
 
@@ -425,7 +448,7 @@ def _successor_links() -> list:
         if h:
             wmap[h] = float(a.get("entity_weight", 1.0))
     for e in data.get("entities", []):
-        h = (e.get("twitter_handle") or "").lstrip("@").lower()
+        h = (e.get("account") or e.get("twitter_handle") or "").lstrip("@").lower()
         if not h:
             continue
         if "entity_weight" in e:
@@ -529,6 +552,37 @@ def _apply_active_windows(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ------------------------------------------------ date-aware event weights ----
+
+def _apply_event_weights(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    POINT-IN-TIME event weights: the account maps assign event_weight from
+    TODAY's event statuses, which is wrong for back-simulation — a 2020-03
+    Trump post must carry covid at full weight (the event was live), and a
+    2017 post must NOT carry the 2022 Ukraine war. Overwrites event_weight
+    row-wise via EventManager.get_account_multiplier(handle, at_date=post
+    date). Cached per (handle, date) — cheap even on 40k+ posts.
+    """
+    if df.empty:
+        return df
+    em = EventManager()
+    dt  = pd.to_datetime(df["date"], format="mixed", utc=True).dt.date
+    acc = df["account"].fillna("").astype(str)
+    cache: dict = {}
+
+    def _w(h, d):
+        key = (h.lower(), d)
+        if key not in cache:
+            cache[key] = em.get_account_multiplier(h, at_date=d)
+        return cache[key]
+
+    df["event_weight"] = [_w(h, d) for h, d in zip(acc, dt)]
+    n_hist = sum(1 for v in cache.values() if v != 1.0)
+    print(f"  🗓️  Point-in-time event weights applied "
+          f"({len(cache)} account-day pairs, {n_hist} with active events)")
+    return df
+
+
 # -------------------------------------------------------------- sync main ----
 
 def sync(full: bool = False) -> int:
@@ -556,6 +610,8 @@ def sync(full: bool = False) -> int:
 
     # Back-simulation support: damp weights outside each account's active window
     combined = _apply_active_windows(combined)
+    # ...and give every post the event landscape of ITS day, not today's
+    combined = _apply_event_weights(combined)
 
     if full:
         db.write_table(FEED_TABLE, combined)
