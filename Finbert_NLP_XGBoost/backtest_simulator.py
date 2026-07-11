@@ -328,8 +328,11 @@ def gate_multiplier(row):
     parts = []
     if pd.notna(row.get('policy_intensity_score')):
         parts.append(min(float(row['policy_intensity_score']) / 8.0, 1.0))
-    if pd.notna(row.get('hawkish_risk_score')):
-        parts.append(min(float(row['hawkish_risk_score']) / 5.0, 1.0))
+    # domain risk = stronger of war (hawkish) and non-war (macro) impact —
+    # SAME formula as predict_finbert_nlp_xgb.predict()
+    _h = float(row.get('hawkish_risk_score') or 0.0)
+    _m = float(row.get('macro_risk_score') or 0.0) if pd.notna(row.get('macro_risk_score')) else 0.0
+    parts.append(max(min(_h / 5.0, 1.0), min(_m / 5.0, 1.0)))
     if pd.notna(row.get('sample_weight')):
         parts.append(float(row['sample_weight']))
     signal = float(np.mean(parts)) if parts else 0.5

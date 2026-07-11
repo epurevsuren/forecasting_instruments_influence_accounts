@@ -627,8 +627,11 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     parts = []
     if feats.get('policy_intensity_score') is not None:
         parts.append(min(float(feats['policy_intensity_score']) / 8.0, 1.0))
-    if feats.get('hawkish_risk_score') is not None:
-        parts.append(min(float(feats['hawkish_risk_score']) / 5.0, 1.0))
+    # domain risk = stronger of war (hawkish) and non-war (macro: crypto/
+    # COVID/Fed/banking) — hawkish-only gating killed every non-war era post
+    dom = min(float(feats.get('hawkish_risk_score') or 0.0) / 5.0, 1.0)
+    dom = max(dom, min(float(feats.get('macro_risk_score') or 0.0) / 5.0, 1.0))
+    parts.append(dom)
     if feats.get('sample_weight') is not None:
         parts.append(float(feats['sample_weight']))
     signal = float(np.mean(parts)) if parts else float(feats.get('raw_score', 0.5))

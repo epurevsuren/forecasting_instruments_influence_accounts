@@ -185,12 +185,19 @@ def market_session(dt):
 
 
 def compute_nlp_signal(row):
-    """Normalized NLP signal per post (0-1): policy intensity + hawkish risk + sample weight."""
+    """Normalized NLP signal per post (0-1): policy intensity + domain risk
+    (the STRONGER of war/hawkish and non-war/macro — crypto, COVID, Fed,
+    banking) + sample weight. Hawkish-only anchoring silently zeroed every
+    non-war era post."""
     parts = []
     if 'policy_intensity_score' in row.index and pd.notna(row['policy_intensity_score']):
         parts.append(min(row['policy_intensity_score'] / 8.0, 1.0))  # ~8 = strong
+    dom = 0.0
     if 'hawkish_risk_score' in row.index and pd.notna(row['hawkish_risk_score']):
-        parts.append(min(row['hawkish_risk_score'] / 5.0, 1.0))
+        dom = min(row['hawkish_risk_score'] / 5.0, 1.0)
+    if 'macro_risk_score' in row.index and pd.notna(row['macro_risk_score']):
+        dom = max(dom, min(row['macro_risk_score'] / 5.0, 1.0))
+    parts.append(dom)
     if 'sample_weight' in row.index and pd.notna(row['sample_weight']):
         parts.append(row['sample_weight'])
     return float(np.mean(parts)) if parts else 0.0

@@ -243,6 +243,23 @@ def compute_composite_scores(df):
         df.get("flag_stimulus", 0) + df.get("flag_energy_policy", 0)
         + df.get("flag_industrial_policy", 0) + df.get("flag_deregulation", 0)
     )
+    # MACRO/NON-WAR market impact — the counterpart to hawkish_risk_score.
+    # Without it, crypto/COVID/Fed/banking posts scored hawkish=0 and died at
+    # every hawkish-anchored formula (sample_weight, nlp_signal, predict gate):
+    # all 76 crypto-flagged posts averaged sample_weight 0.10, zero reached
+    # HIGH_SIGNAL — Trump's July-2019 bitcoin tweet (BTC moved +0.73%) was
+    # gated to nothing. Weights favour the single-flag domains that must be
+    # able to clear the gate alone.
+    # crypto/health are SINGLE binary flags while hawkish accumulates counts
+    # (several flags + NER geo terms) — x4 puts one fired domain flag on the
+    # same scale as an active war post, so a pure crypto/COVID bombshell can
+    # clear the gate alone.
+    df["macro_risk_score"] = (
+        4 * df.get("flag_crypto_policy", 0) + 4 * df.get("flag_public_health", 0)
+        + 2 * df.get("flag_interest_rate", 0) + 2 * df.get("flag_financial_system", 0)
+        + df.get("flag_stimulus", 0) + df.get("flag_tax_policy", 0)
+        + df.get("flag_energy_policy", 0) + df.get("flag_ai_chip_policy", 0)
+    )
     return df
 
 
@@ -440,9 +457,12 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
         + 0.1 * out.get("score_burst",   1.0),
         0, 1))
 
+    # domain risk = the STRONGER of war (hawkish) and non-war (macro: crypto/
+    # covid/Fed/banking) impact — either domain can carry a post to full weight
     base_sw = float(np.clip(
         0.5 * out["raw_score"]
-        + 0.3 * out.get("hawkish_risk_score_norm", 0.0)
+        + 0.3 * max(out.get("hawkish_risk_score_norm", 0.0),
+                    out.get("macro_risk_score_norm", 0.0))
         + 0.2 * out.get("score_relative", 1.0) / 5.0,
         0.05, 1.0))
 
@@ -613,14 +633,21 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
         batch["score_relative"] = np.clip(rel, 0.0, 5.0)
 
     # — Normalized composites (stable config divisors) —
-    for c in ["policy_intensity_score", "hawkish_risk_score", "growth_policy_score"]:
+    for c in ["policy_intensity_score", "hawkish_risk_score", "growth_policy_score",
+              "macro_risk_score"]:
         div = norm_div.get(c, 0)
+        if c not in batch.columns:
+            batch[c] = 0
         batch[f"{c}_norm"] = np.clip(batch[c] / div, 0, 1) if div else 0.0
 
     # — Base sample_weight then entity/event discount —
+    # domain risk = the STRONGER of war (hawkish) and non-war (macro) impact:
+    # crypto/COVID/Fed/banking posts previously had hawkish=0 and could NEVER
+    # earn training trust regardless of content (all 76 crypto posts sw~0.10).
     base_sw = np.clip(
         0.5 * batch["raw_score"]
-        + 0.3 * batch["hawkish_risk_score_norm"]
+        + 0.3 * np.maximum(batch["hawkish_risk_score_norm"],
+                           batch["macro_risk_score_norm"])
         + 0.2 * batch["score_relative"] / 5.0,
         0.05, 1.0)
     batch["sample_weight"] = base_sw

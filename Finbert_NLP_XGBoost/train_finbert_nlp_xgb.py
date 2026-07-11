@@ -66,7 +66,9 @@ NLP_FEATURES = [
     'raw_score','score_policy','score_embedding','score_novelty','score_burst',
     'score_caps','score_relative',
     'policy_intensity_score','hawkish_risk_score','growth_policy_score',
+    'macro_risk_score',
     'policy_intensity_score_norm','hawkish_risk_score_norm','growth_policy_score_norm',
+    'macro_risk_score_norm',
     # Policy flag indicators (dynamic, from scorer_config.json)
     *_FLAG_FEATURES,
     # NER / linguistic counts (dynamic, from the canonical scorer)
@@ -196,21 +198,30 @@ def main():
 
     print("\n🌲 Training [FinBERT(CLS+mean)+NLP] → XGBoost...\n")
     report = {}
-    calibration = {}   # per-instrument magnitude scale, fitted OUT-OF-SAMPLE
+    calibration = {}      # per-instrument magnitude scale, fitted OUT-OF-SAMPLE
+    calibration_tp = {}   # conservative TP quantile (40th pct of actual/pred)
     for inst in INSTRUMENTS:
         col = f"{inst}_Impact"
         if col not in df.columns: continue
         y = df[col].fillna(0.0).values
         idx = np.arange(len(df))
-        Xtr,Xte,ytr,yte,wtr,_,itr,ite = train_test_split(
-            X,y,w,idx,test_size=0.15,random_state=42)
+        # THREE-WAY SPLIT: train 70% / early-stop 15% / CALIB 15%.
+        # Early stopping selects best_iteration ON its eval set, which flatters
+        # predictions there — fitting calibration (and reporting metrics) on
+        # that same set under-estimated the shrinkage (fitted k~1.2 while the
+        # decade backtest showed residual k~2.3). The calib split is touched
+        # by NOTHING during fitting.
+        Xtr,Xrest,ytr,yrest,wtr,_,itr,irest = train_test_split(
+            X,y,w,idx,test_size=0.30,random_state=42)
+        Xes,Xte,yes,yte,ies,ite = train_test_split(
+            Xrest,yrest,irest,test_size=0.50,random_state=42)
 
         m = xgb.XGBRegressor(
             n_estimators=600, max_depth=6, learning_rate=0.03,
             subsample=0.8, colsample_bytree=0.5, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
             early_stopping_rounds=40, n_jobs=-1, random_state=42)
-        m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xte,yte)],verbose=False)
+        m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],verbose=False)
         pred = m.predict(Xte)
 
         mae,r2 = mean_absolute_error(yte,pred), r2_score(yte,pred)
@@ -243,6 +254,20 @@ def main():
             k_cal = 1.0
         calibration[inst] = round(k_cal, 3)
 
+        # TP QUANTILE — the mean-calibrated prediction OVERSHOOTS the actual
+        # move on ~half of posts (that's what a mean is). For TP placement we
+        # want a level MOST winners actually reach: k_tp = 40th percentile of
+        # actual/calibrated-pred ratios (direction-signed), so ~60% of correct
+        # -direction moves reach the TP even before counting intrabar wicks.
+        # Layer-2 usage: --tp-mult <k_tp> (per-instrument values in config).
+        _pm = cal_mask & (np.abs(pred) > 1e-6)
+        if _pm.sum() >= 10:
+            ratios = (yte[_pm] * np.sign(pred[_pm])) / (np.abs(pred[_pm]) * k_cal)
+            k_tp = float(np.clip(np.percentile(ratios, 40), 0.2, 1.5))
+        else:
+            k_tp = 0.7
+        calibration_tp[inst] = round(k_tp, 3)
+
         m.save_model(f"{OUT_DIR}/{col}.json")
         report[inst] = {"mae":round(mae,4),"r2":round(r2,3),
                         "dir_acc":round(float(dir_acc),3) if dir_acc==dir_acc else None,
@@ -258,8 +283,11 @@ def main():
     # config.json written AFTER training so it carries the fitted calibration
     json.dump({"finbert":FINBERT,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
                "nlp_features":use_nlp,"instruments":INSTRUMENTS,
-               "calibration":calibration},
+               "calibration":calibration,"calibration_tp":calibration_tp},
               open(f"{OUT_DIR}/config.json","w"))
+    print("\n🎯 TP quantiles (Layer-2 --tp-mult per instrument, 40th pct of "
+          "actual/calibrated-pred):")
+    print("   " + "  ".join(f"{i}:{v:.2f}" for i, v in calibration_tp.items()))
 
     eval_df = pd.DataFrame([{"instrument": k, **v} for k, v in report.items()])
     db.write_table(EVAL_TABLE, eval_df)

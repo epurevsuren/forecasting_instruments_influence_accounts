@@ -159,7 +159,8 @@
   "norm_divisors": {
     "policy_intensity_score": 25.0,
     "hawkish_risk_score": 11.0,
-    "growth_policy_score": 2.0
+    "growth_policy_score": 2.0,
+    "macro_risk_score": 5.0
   },
   "_norm_note": "norm_divisors: max values from training data, used to normalize single-post composites."
 }
