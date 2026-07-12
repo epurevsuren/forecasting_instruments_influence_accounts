@@ -235,7 +235,20 @@ def main():
             subsample=0.8, colsample_bytree=0.5, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
             early_stopping_rounds=40, n_jobs=-1, random_state=42)
-        m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],verbose=False)
+        # FEATURE WEIGHTS: 1536 FinBERT dims drown the ~50 NLP features at
+        # colsample 0.5 — the trained models gave NLP only ~3% importance, so
+        # flag_crypto_policy was invisible and the BTC model flatlined
+        # (R²=0.000, mean|pred| 0.03%). Weighting NLP columns 20x makes the
+        # column sampler CONSIDER them ~40% of the time; trees still keep an
+        # NLP split only if it actually reduces loss.
+        _fw = np.ones(X.shape[1], dtype=np.float32)
+        _fw[nlp_start:] = 20.0
+        try:
+            m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],
+                  feature_weights=_fw,verbose=False)
+        except TypeError:   # xgboost < 2.1: sklearn fit lacks feature_weights
+            print("  ⚠️  xgboost too old for feature_weights — run: uv add 'xgboost>=2.1'")
+            m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],verbose=False)
         pred = m.predict(Xte)
 
         mae,r2 = mean_absolute_error(yte,pred), r2_score(yte,pred)
@@ -271,12 +284,15 @@ def main():
         # TP QUANTILE — the mean-calibrated prediction OVERSHOOTS the actual
         # move on ~half of posts (that's what a mean is). For TP placement we
         # want a level MOST winners actually reach: k_tp = 40th percentile of
-        # actual/calibrated-pred ratios (direction-signed), so ~60% of correct
-        # -direction moves reach the TP even before counting intrabar wicks.
+        # actual/calibrated-pred ratios AMONG CORRECT-DIRECTION rows only.
+        # (Signed ratios collapsed the percentile below zero — every k_tp
+        # pinned at the 0.2 clip floor — because wrong-direction rows are a
+        # ~45% negative tail; the SL handles those, TP placement shouldn't.)
         # Layer-2 usage: --tp-mult <k_tp> (per-instrument values in config).
         _pm = cal_mask & (np.abs(pred) > 1e-6)
-        if _pm.sum() >= 10:
-            ratios = (yte[_pm] * np.sign(pred[_pm])) / (np.abs(pred[_pm]) * k_cal)
+        ratios = (yte[_pm] * np.sign(pred[_pm])) / (np.abs(pred[_pm]) * k_cal)
+        ratios = ratios[ratios > 0]                 # correct-direction rows only
+        if len(ratios) >= 10:
             k_tp = float(np.clip(np.percentile(ratios, 40), 0.2, 1.5))
         else:
             k_tp = 0.7

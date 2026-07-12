@@ -342,8 +342,12 @@ def main():
             if pred == 0 or not np.isfinite(pred):
                 skips["zero_pred"] = skips.get("zero_pred", 0) + 1
                 continue
-            # leverage-aware threshold: |pred| x leverage >= min_pred x 10
-            _eff_min = args.min_pred * 10.0 / lev_map.get(inst, 10)
+            # leverage-aware threshold: |pred| x leverage >= min_pred x 10,
+            # CAPPED at 1.0% absolute — 2:1 crypto would otherwise need 1.5%
+            # predicted, filtering BTC/ETH out entirely even though their
+            # absolute moves are the largest in the book and they alone trade
+            # 24/7 (after-hours posts have no other venue).
+            _eff_min = min(args.min_pred * 10.0 / lev_map.get(inst, 10), 1.0)
             if abs(pred) < _eff_min:
                 skips["small_pred"] = skips.get("small_pred", 0) + 1
                 continue
