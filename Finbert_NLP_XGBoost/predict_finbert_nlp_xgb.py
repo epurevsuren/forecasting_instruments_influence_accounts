@@ -624,17 +624,15 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     X = np.hstack([finbert_embed(text), nlp_vec])
 
     import math
-    parts = []
-    if feats.get('policy_intensity_score') is not None:
-        parts.append(min(float(feats['policy_intensity_score']) / 8.0, 1.0))
-    # domain risk = stronger of war (hawkish) and non-war (macro: crypto/
-    # COVID/Fed/banking) — hawkish-only gating killed every non-war era post
+    # DOMAIN-WEIGHTED signal (0.25 policy / 0.45 domain / 0.30 weight) — same
+    # formula as build_final_training_set.compute_nlp_signal. A flat mean let
+    # structurally-low policy_intensity drag single-domain posts (crypto/
+    # COVID/Fed) under the gate regardless of domain strength.
+    pis = min(float(feats.get('policy_intensity_score') or 0.0) / 8.0, 1.0)
     dom = min(float(feats.get('hawkish_risk_score') or 0.0) / 5.0, 1.0)
     dom = max(dom, min(float(feats.get('macro_risk_score') or 0.0) / 5.0, 1.0))
-    parts.append(dom)
-    if feats.get('sample_weight') is not None:
-        parts.append(float(feats['sample_weight']))
-    signal = float(np.mean(parts)) if parts else float(feats.get('raw_score', 0.5))
+    sw = float(feats.get('sample_weight') or 0.0)
+    signal = float(0.25 * pis + 0.45 * dom + 0.30 * sw)
     gate = 1.0/(1.0+math.exp(-GATE_K*(signal-GATE_MID))) if GATE_ENABLED else 1.0
     mult = 1.0 if gate >= 0.5 else gate
 

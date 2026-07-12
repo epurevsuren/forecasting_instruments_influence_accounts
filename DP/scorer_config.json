@@ -14,11 +14,10 @@
     "quarantine", "vaccinate", "shutdown", "bail", "hike", "taper", "print",
     "denuclearize", "impeach"
   ],
+  "_geo_terms_note": "DIRECTION AUDIT: geopolitical_terms feeds hawkish_risk_score, so it may contain ONLY escalatory/war-direction words. Peace-direction words (ceasefire, summit, denuclearization) live in flag_peace_deescalation; macro-domain words (pandemic, stimulus, inflation, bailout...) live in their domain flags feeding macro_risk_score — putting them here inflated hawkish for COVID/Fed posts (wrong direction).",
   "geopolitical_terms": [
     "war", "attack", "missile", "military", "sanction", "tariff", "conflict",
-    "blockade", "ceasefire", "nuclear", "summit", "denuclearization",
-    "pandemic", "lockdown", "quarantine", "vaccine", "stimulus",
-    "inflation", "recession", "bailout", "impeachment", "brexit"
+    "blockade", "nuclear", "invasion", "airstrike", "escalation", "brexit"
   ],
   "policy_flags": {
     "flag_peace_deescalation": [
@@ -31,7 +30,10 @@
       "agreement reached", "deal is done", "deal is complete",
       "fully agreed by and between", "hostages released", "hostages will be released",
       "normalization", "diplomatic solution", "negotiated settlement",
-      "lasting peace", "historic peace"
+      "lasting peace", "historic peace",
+      "denuclearization", "denuclearize", "summit with", "historic summit",
+      "singapore summit", "deal will be made", "serious negotiations",
+      "signed a letter", "great progress", "no longer a nuclear threat"
     ],
     "flag_escalation": [
       "escalation", "escalating", "expanding this war", "ballistic missile",
@@ -76,12 +78,11 @@
     ],
     "flag_sanctions": [
       "sanction", "secondary sanctions", "economic sanctions", "embargo",
-      "asset freeze", "blacklist", "nuclear weapons", "no nuclear",
-      "deal will be made", "serious negotiations"
+      "asset freeze", "blacklist", "nuclear weapons", "no nuclear"
     ],
     "flag_war_geopolitics": [
       "iran", "ukraine", "russia", "china", "taiwan", "israel", "gaza",
-      "missile", "attack", "military", "bombing", "ceasefire", "blockade",
+      "missile", "attack", "military", "bombing", "blockade",
       "strait of hormuz", "troops", "navy", "airstrike", "conflict", "emir",
       "crown prince", "nuclear", "secretary of war", "joint chiefs", "assault", "hegseth",
       "north korea", "kim jong un", "rocket man", "fire and fury", "syria",

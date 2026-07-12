@@ -325,17 +325,14 @@ def embed_texts(texts):
 def gate_multiplier(row):
     """Same NLP-gate + temporal-gate formula as predict_finbert_nlp_xgb.predict()."""
     import math
-    parts = []
-    if pd.notna(row.get('policy_intensity_score')):
-        parts.append(min(float(row['policy_intensity_score']) / 8.0, 1.0))
-    # domain risk = stronger of war (hawkish) and non-war (macro) impact —
-    # SAME formula as predict_finbert_nlp_xgb.predict()
-    _h = float(row.get('hawkish_risk_score') or 0.0)
+    # DOMAIN-WEIGHTED signal — SAME formula as predict_finbert_nlp_xgb.predict()
+    pis = min(float(row.get('policy_intensity_score') or 0.0) / 8.0, 1.0) \
+        if pd.notna(row.get('policy_intensity_score')) else 0.0
+    _h = float(row.get('hawkish_risk_score') or 0.0) if pd.notna(row.get('hawkish_risk_score')) else 0.0
     _m = float(row.get('macro_risk_score') or 0.0) if pd.notna(row.get('macro_risk_score')) else 0.0
-    parts.append(max(min(_h / 5.0, 1.0), min(_m / 5.0, 1.0)))
-    if pd.notna(row.get('sample_weight')):
-        parts.append(float(row['sample_weight']))
-    signal = float(np.mean(parts)) if parts else 0.5
+    dom = max(min(_h / 5.0, 1.0), min(_m / 5.0, 1.0))
+    sw = float(row.get('sample_weight') or 0.0) if pd.notna(row.get('sample_weight')) else 0.0
+    signal = float(0.25 * pis + 0.45 * dom + 0.30 * sw)
     if PR.GATE_ENABLED:
         gate = 1.0 / (1.0 + math.exp(-PR.GATE_K * (signal - PR.GATE_MID)))
     else:

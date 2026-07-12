@@ -189,18 +189,17 @@ def compute_nlp_signal(row):
     (the STRONGER of war/hawkish and non-war/macro — crypto, COVID, Fed,
     banking) + sample weight. Hawkish-only anchoring silently zeroed every
     non-war era post."""
-    parts = []
-    if 'policy_intensity_score' in row.index and pd.notna(row['policy_intensity_score']):
-        parts.append(min(row['policy_intensity_score'] / 8.0, 1.0))  # ~8 = strong
-    dom = 0.0
-    if 'hawkish_risk_score' in row.index and pd.notna(row['hawkish_risk_score']):
-        dom = min(row['hawkish_risk_score'] / 5.0, 1.0)
+    # DOMAIN-WEIGHTED, not a flat mean: a flat mean lets low policy_intensity
+    # (structural for single-domain posts — the bitcoin tweet scores pis=1 ->
+    # 0.125) drag a strong domain signal under the 0.5 HIGH_SIGNAL bar.
+    # Weights 0.25/0.45/0.30: one fully-fired domain + moderate sample_weight
+    # clears 0.5; no-domain posts (endorsements) stay far below.
+    pis = min(float(row.get('policy_intensity_score') or 0.0) / 8.0, 1.0)
+    dom = min(float(row.get('hawkish_risk_score') or 0.0) / 5.0, 1.0)
     if 'macro_risk_score' in row.index and pd.notna(row['macro_risk_score']):
-        dom = max(dom, min(row['macro_risk_score'] / 5.0, 1.0))
-    parts.append(dom)
-    if 'sample_weight' in row.index and pd.notna(row['sample_weight']):
-        parts.append(row['sample_weight'])
-    return float(np.mean(parts)) if parts else 0.0
+        dom = max(dom, min(float(row['macro_risk_score']) / 5.0, 1.0))
+    sw = float(row.get('sample_weight') or 0.0)
+    return float(0.25 * pis + 0.45 * dom + 0.30 * sw)
 
 
 def load_scored():
@@ -680,6 +679,33 @@ def compute_impacts(scored):
         new_columns[col]  = ar_list
         new_columns[zcol] = list(ar_list)   # z == raw move (unchanged from original)
         new_columns[qcol] = q_list
+
+        # VOL REGIME at post time: rolling 30-day std (%) of daily open->close
+        # moves, sampled at each post's date. 2017 crypto mania poisoned BTC
+        # training (random tweets wore ±4.5% labels because EVERYTHING moved
+        # 5%/hour) — training down-weights rows from crazy-vol regimes per
+        # instrument so tweet-impact is learned from normal regimes.
+        vcol = f'{name}_vol30'
+        if name in daily:
+            try:
+                mv = ((daily[name]['Close'] - daily[name]['Open'])
+                      / daily[name]['Open'] * 100).dropna()
+                roll = mv.rolling(30, min_periods=10).std()
+                vidx = sorted(roll.index)
+                vmap = roll.to_dict()
+                def _vol_at(dt):
+                    d0 = dt.date()
+                    for back in range(0, 8):        # last available <= post date
+                        key = d0 - timedelta(days=back)
+                        if key in vmap and pd.notna(vmap[key]):
+                            return round(float(vmap[key]), 4)
+                    return None
+                new_columns[vcol] = [_vol_at(dates_list[i]) for i in range(n)]
+            except Exception:
+                new_columns[vcol] = [None] * n
+        else:
+            new_columns[vcol] = [None] * n
+
         valid = sum(1 for x in ar_list if x is not None)
         print(f"  ✅ {col:<22} {valid:>4} valid [{mtype}]")
         impact_cols.append(col)
@@ -728,16 +754,26 @@ def finalize(scored, impact_cols):
     # moves. Followers keep their (contaminated) label but at 0.3x trust.
     # NOTE: incremental runs only see chains WITHIN the new batch — fine in
     # practice, since chained posts arrive in the same daily batch.
+    # A follower ESCAPES the damp when its nlp_signal beats the chain leader's
+    # by >0.10 — the bombshell-comes-second rule, SAME semantics as the
+    # trading chain guard (PR.chain_factor). Without this, thread tweet #2
+    # carrying the actual content (the July-2019 bitcoin tweet: signal 0.47
+    # x0.3 = 0.14) could never reach HIGH_SIGNAL no matter what it said.
     scored = scored.sort_values('date')
-    _last: dict = {}
+    _last: dict = {}          # account -> {'ts': date, 'sig': leader nlp_signal}
     _damp = []
     for _, r in scored.iterrows():
         k = str(r.get('account', '')).lower()
+        sig = float(r.get('nlp_signal') or 0.0)
         prev = _last.get(k)
-        is_follower = (prev is not None and
-                       (r['date'] - prev) <= pd.Timedelta(minutes=CHAIN_LABEL_WINDOW_MIN))
-        _damp.append(CHAIN_LABEL_DAMP if is_follower else 1.0)
-        _last[k] = r['date']
+        in_chain = (prev is not None and
+                    (r['date'] - prev['ts']) <= pd.Timedelta(minutes=CHAIN_LABEL_WINDOW_MIN))
+        if in_chain and sig <= prev['sig'] + 0.10:
+            _damp.append(CHAIN_LABEL_DAMP)          # true recap/continuation
+            _last[k] = {'ts': r['date'], 'sig': prev['sig']}   # extend chain
+        else:
+            _damp.append(1.0)                        # leader OR stronger follower
+            _last[k] = {'ts': r['date'], 'sig': sig}
     n_damped = sum(1 for d in _damp if d < 1.0)
     if n_damped:
         print(f"  🔗 {n_damped} chain-follower post(s): sample_weight ×{CHAIN_LABEL_DAMP} "
@@ -757,6 +793,22 @@ def finalize(scored, impact_cols):
                   f"(closed market): sample_weight ×{DAILY_LABEL_DAMP}")
             scored.loc[daily_mask, 'sample_weight'] = (
                 scored.loc[daily_mask, 'sample_weight'] * DAILY_LABEL_DAMP).round(4)
+
+    # MACRO CO-MOVEMENT damp: when the WHOLE equity complex moved hard in the
+    # post's window but the post itself is low-signal, the label is a macro
+    # shock wearing a tweet's name (WHO vaccine posts labeled with Feb-2021
+    # VIX -14 days; the Epstein post wearing VIX -12). The market moved WITH
+    # other news, not because of this post — halve training trust.
+    _b_cols = [c for c in ('SPY_Impact', 'QQQ_Impact', 'DIA_Impact')
+               if c in scored.columns]
+    if len(_b_cols) == 3 and 'nlp_signal' in scored.columns:
+        _broad = (scored[_b_cols].abs() > 0.8).all(axis=1)
+        _comove = _broad & (scored['nlp_signal'] < 0.45)
+        if _comove.any():
+            print(f"  🌊 {int(_comove.sum())} low-signal post(s) inside market-wide "
+                  f"shocks: sample_weight ×0.5 (macro co-movement, not tweet impact)")
+            scored.loc[_comove, 'sample_weight'] = (
+                scored.loc[_comove, 'sample_weight'] * 0.5).round(4)
     return scored
 
 
@@ -768,7 +820,8 @@ def train_columns(impact_cols):
     base = ['id', 'date', 'text', 'platform', 'is_primary',
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']
-    return base + impact_cols
+    vol_cols = [f'{n}_vol30' for n in TICKERS]   # vol regime at post time
+    return base + impact_cols + vol_cols
 
 
 # ==========================================

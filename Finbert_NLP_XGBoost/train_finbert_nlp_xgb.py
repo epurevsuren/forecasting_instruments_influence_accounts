@@ -204,6 +204,20 @@ def main():
         col = f"{inst}_Impact"
         if col not in df.columns: continue
         y = df[col].fillna(0.0).values
+        # VOL-REGIME TRAINING WEIGHTS: rows from crazy-vol regimes carry
+        # labels dominated by ambient noise, not tweet impact (2017 crypto
+        # mania poisoned BTC: mean|label| huge on random tweets; ETH escaped
+        # only because its bars start 2017-08). Down-weight per instrument by
+        # median_vol/vol30(post date), clipped [0.33, 2.0] — quiet regimes
+        # count slightly more, chaos regimes count a third.
+        w_inst = w.copy() if w is not None else np.ones(len(df))
+        vcol = f'{inst}_vol30'
+        if vcol in df.columns:
+            v = pd.to_numeric(df[vcol], errors='coerce')
+            med = float(v.median()) if v.notna().sum() > 50 else None
+            if med and med > 0:
+                adj = np.clip(med / v.fillna(med).values, 0.33, 2.0)
+                w_inst = w_inst * adj
         idx = np.arange(len(df))
         # THREE-WAY SPLIT: train 70% / early-stop 15% / CALIB 15%.
         # Early stopping selects best_iteration ON its eval set, which flatters
@@ -212,7 +226,7 @@ def main():
         # decade backtest showed residual k~2.3). The calib split is touched
         # by NOTHING during fitting.
         Xtr,Xrest,ytr,yrest,wtr,_,itr,irest = train_test_split(
-            X,y,w,idx,test_size=0.30,random_state=42)
+            X,y,w_inst,idx,test_size=0.30,random_state=42)
         Xes,Xte,yes,yte,ies,ite = train_test_split(
             Xrest,yrest,irest,test_size=0.50,random_state=42)
 
