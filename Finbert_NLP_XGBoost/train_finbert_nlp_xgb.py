@@ -216,7 +216,10 @@ def main():
             v = pd.to_numeric(df[vcol], errors='coerce')
             med = float(v.median()) if v.notna().sum() > 50 else None
             if med and med > 0:
-                adj = np.clip(med / v.fillna(med).values, 0.33, 2.0)
+                # Prevent divide by zero if vol30 contains exact 0.0s
+                v_vals = v.fillna(med).values
+                v_vals = np.where(v_vals == 0, 1e-9, v_vals)
+                adj = np.clip(med / v_vals, 0.33, 2.0)
                 w_inst = w_inst * adj
         idx = np.arange(len(df))
         # THREE-WAY SPLIT: train 70% / early-stop 15% / CALIB 15%.
@@ -230,25 +233,20 @@ def main():
         Xes,Xte,yes,yte,ies,ite = train_test_split(
             Xrest,yrest,irest,test_size=0.50,random_state=42)
 
+        # FEATURE WEIGHTS: 1536 FinBERT dims drown the ~50 NLP features at
+        # colsample 0.5 — the trained models gave NLP only ~3% importance...
+        _fw = np.ones(X.shape[1], dtype=np.float32)
+        _fw[nlp_start:] = 20.0
+
         m = xgb.XGBRegressor(
             n_estimators=600, max_depth=6, learning_rate=0.03,
             subsample=0.8, colsample_bytree=0.5, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
-            early_stopping_rounds=40, n_jobs=-1, random_state=42)
-        # FEATURE WEIGHTS: 1536 FinBERT dims drown the ~50 NLP features at
-        # colsample 0.5 — the trained models gave NLP only ~3% importance, so
-        # flag_crypto_policy was invisible and the BTC model flatlined
-        # (R²=0.000, mean|pred| 0.03%). Weighting NLP columns 20x makes the
-        # column sampler CONSIDER them ~40% of the time; trees still keep an
-        # NLP split only if it actually reduces loss.
-        _fw = np.ones(X.shape[1], dtype=np.float32)
-        _fw[nlp_start:] = 20.0
-        try:
-            m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],
-                  feature_weights=_fw,verbose=False)
-        except TypeError:   # xgboost < 2.1: sklearn fit lacks feature_weights
-            print("  ⚠️  xgboost too old for feature_weights — run: uv add 'xgboost>=2.1'")
-            m.fit(Xtr,ytr,sample_weight=wtr,eval_set=[(Xes,yes)],verbose=False)
+            early_stopping_rounds=40, n_jobs=-1, random_state=42,
+            feature_weights=_fw) # Passed in the constructor for modern XGBoost APIs
+
+        m.fit(Xtr, ytr, sample_weight=wtr, eval_set=[(Xes, yes)], verbose=False)
+        
         pred = m.predict(Xte)
 
         mae,r2 = mean_absolute_error(yte,pred), r2_score(yte,pred)
