@@ -267,14 +267,27 @@ def main():
         # 1.1-3.0 x pred per instrument, corr 0.79-0.94). Fit
         #     actual = k x pred   (regression through the origin)
         # on the HOLDOUT split only (in-sample preds are overfit -> k≈1 lie),
-        # k clipped to [0.5, 4.0], meaningful moves only. predict/backtest
+        # k clipped to [0.25, 20.0], trade-region rows only. predict/backtest
         # multiply raw model output by k so predicted PERCENTAGES are usable
         # for TP sizing, not just direction.
-        cal_mask = np.abs(yte) > 0.05
+        # TRADE-REGION FIT (2026-07-15): fitting k over ALL calib rows let
+        # tens of thousands of near-zero noise posts dominate the regression —
+        # BTC trade rows ran ~11x actual/pred while the all-rows fit said 1.5
+        # (BTC starved of Layer-2 trades), and US2Y over-predicted ~7x while
+        # its fit said "amplify 2.1x" (over-prediction loses money). We only
+        # ACT on the high-|pred| tail, so fit k WHERE WE TRADE: calib rows
+        # with |pred| in the top decile (fallback top quartile, then all).
+        # Clip widened [0.5,4] -> [0.25,20] so a real 17x correction fits.
+        abs_p = np.abs(pred)
+        cal_mask = np.zeros(len(pred), dtype=bool)
+        for _q in (90, 75, 0):
+            cal_mask = (abs_p >= np.percentile(abs_p, _q)) & (np.abs(yte) > 0.05)
+            if cal_mask.sum() >= 30:
+                break
         if cal_mask.sum() >= 10 and (pred[cal_mask] ** 2).sum() > 1e-9:
             k_cal = float((pred[cal_mask] * yte[cal_mask]).sum()
                           / (pred[cal_mask] ** 2).sum())
-            k_cal = float(np.clip(k_cal, 0.5, 4.0))
+            k_cal = float(np.clip(k_cal, 0.25, 20.0))
         else:
             k_cal = 1.0
         calibration[inst] = round(k_cal, 3)

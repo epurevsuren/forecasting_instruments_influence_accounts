@@ -291,7 +291,8 @@ def main():
     if args.min_pred > 0 or args.sl_noise_mult > 0:
         print(f"  Filters: min margin-relative return = {args.min_pred * 10:.1f}% "
               f"(min |pred| = {args.min_pred}% at 10:1; leverage-aware: FX@30:1 -> "
-              f"{args.min_pred * 10 / 30:.2f}%, crypto@2:1 -> {args.min_pred * 5:.2f}%)"
+              f"{args.min_pred * 10 / 30:.2f}%, crypto@2:1 -> "
+              f"{min(args.min_pred * 5, 1.0):.2f}% [capped 1.00%])"
               f"  |  SL floor = {args.sl_noise_mult} x 1-min noise")
     if args.pred_scale != 1.0:
         print(f"  Prediction calibration: pred x {args.pred_scale}")
