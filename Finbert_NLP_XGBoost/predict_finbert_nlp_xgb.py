@@ -47,6 +47,24 @@ _MACRO_COMPONENTS = [        # (flag column, weight, events.json domain)
 ]
 
 
+def finbert_sentiment_from_emb(emb, cfg):
+    """FinBERT's DESIGNED output (Araci 2019): 3-class sentiment
+    probabilities from the model's own pooler+classifier applied to raw
+    CLS vectors (first 768 dims of the cached 1536 embedding).
+    Returns (n,3) [P(pos), P(neg), P(pos)-P(neg)], or None if the model
+    set was trained without the sentiment head."""
+    h = cfg.get("_sent_head")
+    if h is None:
+        return None
+    pool = np.tanh(emb[:, :768] @ h["Wp"].T + h["bp"])
+    lg = pool @ h["Wc"].T + h["bc"]
+    lg = lg - lg.max(axis=1, keepdims=True)
+    pr = np.exp(lg); pr /= pr.sum(axis=1, keepdims=True)
+    p, n = int(h["pos"]), int(h["neg"])
+    return np.column_stack([pr[:, p], pr[:, n],
+                            pr[:, p] - pr[:, n]]).astype(np.float32)
+
+
 def project_emb(emb, cfg):
     """Apply the training-time PCA projection when the model set was trained
     on compressed embeddings (config 'emb_pca'); identity for older models."""
@@ -593,6 +611,12 @@ def load(model_dir=None):
         _z = np.load(os.path.join(model_dir, "emb_pca.npz"))
         cfg["_emb_pca_mats"] = (_z["mean"], _z["components"])
 
+    # FinBERT sentiment head (canonical 3-class probabilities) — see
+    # finbert_sentiment_from_emb(). Saved by train when models use it.
+    _shp = os.path.join(model_dir, "finbert_sent_head.npz")
+    if os.path.exists(_shp):
+        cfg["_sent_head"] = dict(np.load(_shp))
+
     # CONFIG-DRIFT NOTICE: scorer_config.json evolves daily (LLM-updated), but
     # this model only uses the feature list frozen at ITS train time
     # (cfg['nlp_features']). Newer flags are scored+stored in the DB but
@@ -675,8 +699,13 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
         event_weight=event_weight,
         is_primary=is_primary,
     )
+    emb = finbert_embed(text)
+    _sent = finbert_sentiment_from_emb(emb, cfg)
+    if _sent is not None:   # inject canonical FinBERT sentiment features
+        feats['finbert_pos'], feats['finbert_neg'], feats['finbert_sent'] = \
+            (float(v) for v in _sent[0])
     nlp_vec = np.array([[float(feats.get(c, 0.0)) for c in cfg['nlp_features']]])
-    X = np.hstack([project_emb(finbert_embed(text), cfg), nlp_vec])
+    X = np.hstack([project_emb(emb, cfg), nlp_vec])
 
     import math
     # DOMAIN-WEIGHTED signal (0.25 policy / 0.45 domain / 0.30 weight) — same

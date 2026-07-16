@@ -194,6 +194,40 @@ def main():
     X_emb = np.vstack([cache[pid] for pid in platform_ids])
 
     # ------------------------------------------------------------------
+    # FINBERT SENTIMENT HEAD (2026-07-16): use FinBERT the way it was
+    # DESIGNED (Araci 2019; ProsusAI/finbert = classifier fine-tuned on the
+    # Financial PhraseBank): 3-class sentiment PROBABILITIES, canonical
+    # score = P(pos) - P(neg). We had been discarding the trained head and
+    # feeding raw hidden states — the NLP-only challenger proved those add
+    # nothing. Probs are computed EXACTLY from cached CLS vectors by
+    # applying the model's own pooler+classifier weights (no re-embedding;
+    # BertForSequenceClassification: softmax(Wc·tanh(Wp·cls+bp)+bc)).
+    # Head saved to finbert_sent_head.npz so predict/backtest match.
+    # ------------------------------------------------------------------
+    print("  🎭 FinBERT sentiment head over cached CLS vectors...")
+    _m = AutoModelForSequenceClassification.from_pretrained(FINBERT)
+    _Wp = _m.bert.pooler.dense.weight.detach().numpy().astype(np.float32)
+    _bp = _m.bert.pooler.dense.bias.detach().numpy().astype(np.float32)
+    _Wc = _m.classifier.weight.detach().numpy().astype(np.float32)
+    _bc = _m.classifier.bias.detach().numpy().astype(np.float32)
+    _id2l = {int(k): str(v).lower() for k, v in _m.config.id2label.items()}
+    _pos = next(i for i, l in _id2l.items() if l.startswith('pos'))
+    _neg = next(i for i, l in _id2l.items() if l.startswith('neg'))
+    del _m
+    _pool = np.tanh(X_emb[:, :768] @ _Wp.T + _bp)
+    _lg = _pool @ _Wc.T + _bc
+    _lg -= _lg.max(axis=1, keepdims=True)
+    _pr = np.exp(_lg); _pr /= _pr.sum(axis=1, keepdims=True)
+    sent_block = np.column_stack([_pr[:, _pos], _pr[:, _neg],
+                                  _pr[:, _pos] - _pr[:, _neg]]).astype(np.float32)
+    X_nlp = np.hstack([X_nlp, sent_block])
+    use_nlp = list(use_nlp) + ['finbert_pos', 'finbert_neg', 'finbert_sent']
+    np.savez(os.path.join(OUT_DIR, "finbert_sent_head.npz"),
+             Wp=_Wp, bp=_bp, Wc=_Wc, bc=_bc, pos=_pos, neg=_neg)
+    print(f"     mean sentiment={sent_block[:, 2].mean():+.3f}  "
+          f"💾 finbert_sent_head.npz saved")
+
+    # ------------------------------------------------------------------
     # EMBEDDING COMPRESSION (2026-07-16): 1536 raw FinBERT dims drown the
     # ~53 NLP features — trees pick NLP ~3% of the time and every model
     # flatlines (BTC/ETH/FX predict <0.1% forever -> zero trades).
@@ -332,7 +366,11 @@ def main():
         if cal_mask.sum() >= 5 and (pred_cal[cal_mask] ** 2).sum() > 1e-9:
             k_cal = float((pred_cal[cal_mask] * ycal[cal_mask]).sum()
                           / (pred_cal[cal_mask] ** 2).sum())
-            k_cal = float(np.clip(k_cal, 0.25, 20.0))
+            # floor 0.25 -> 0.02 (2026-07-16): US10Y/US2Y/NATGAS models
+            # over-predict 25-100x on the quiet 2025-26 calib window (R²
+            # -600 class); a 0.25 floor still left them 5-25x hot. An
+            # honest tiny k mutes a broken model instead of trading it.
+            k_cal = float(np.clip(k_cal, 0.02, 20.0))
         else:
             k_cal = 1.0
             

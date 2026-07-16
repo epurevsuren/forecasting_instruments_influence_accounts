@@ -992,6 +992,13 @@ def main():
             df[c] = 0.0
         use_nlp = cfg['nlp_features']
     X_nlp = df[use_nlp].fillna(0.0).values.astype(np.float32)
+    # FinBERT sentiment features are NOT in the DB — compute them from the
+    # raw CLS vectors exactly as train did (must happen BEFORE projection)
+    _sent = PR.finbert_sentiment_from_emb(X_emb, cfg)
+    if _sent is not None:
+        for _i, _n in enumerate(('finbert_pos', 'finbert_neg', 'finbert_sent')):
+            if _n in use_nlp:
+                X_nlp[:, use_nlp.index(_n)] = _sent[:, _i]
     X_emb = PR.project_emb(X_emb, cfg)   # PCA projection if model was trained compressed
     X = np.hstack([X_emb, X_nlp])
     print(f"\n  Feature matrix: {X.shape} "
