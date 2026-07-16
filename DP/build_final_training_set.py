@@ -82,6 +82,17 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import db  # DuckDB helper (DP/db.py) -> ../database.db
 import json
+from event_manager import EventManager
+_EM = EventManager()   # event-window domain gating for nlp_signal
+
+# HIGH_SIGNAL selectivity bar on finalized sample_weight (= event-gated,
+# damped nlp_signal). Tuned 2026-07-16 on the full decade: with event-window
+# gating, bar 0.53 yields ~2,000 pre-damp posts (finalize damps trim toward
+# Peter's 1,000-2,000 target); 0.50 gave 3,183 (too loose — that's how the
+# table bloated to 3,303), 0.55 cut the canonical Jul-2019 bitcoin tweet
+# (gated signal 0.538). Checkpoints: Emir-Iran 0.876 in, bitcoin 0.538 in,
+# Israel-Fiji embassy fluff 0.242 out, 2017 'vaccine' posts gated to ~0.
+HS_BAR = 0.53
 
 CACHE_DIR      = os.path.join(_HERE, "..", "IBKR", "market_data_cache")
 _ENTITIES_FILE = os.path.join(_HERE, "influence_accounts.json")
@@ -184,11 +195,45 @@ def market_session(dt):
     else:                           return 'after_hours'
 
 
+# macro_risk_score components (mirror signal_scorer weights 4/4/2/2/1/1/1/1)
+# each mapped to the events.json domain that must be LIVE at post date for
+# the flag to count. EVENT-WINDOW GATING (2026-07-16, Peter: "vaccine posts
+# scored well in 2017 but it wasn't even the COVID era"): keyword flags fire
+# on vocabulary alone, era-blind — a 2017 'vaccine' mention got the same +4
+# as a 2020 lockdown post. Now each component is scaled by
+# _EM.domain_activity(domain, post_date): 0 outside every matching event
+# window, priority multiplier (1.0/0.6/0.3) inside.
+_MACRO_COMPONENTS = [
+    ('flag_crypto_policy',    4.0, 'crypto_policy'),
+    ('flag_public_health',    4.0, 'public_health'),
+    ('flag_interest_rate',    2.0, 'interest_rate'),
+    ('flag_financial_system', 2.0, 'financial_system'),
+    ('flag_stimulus',         1.0, 'stimulus'),
+    ('flag_tax_policy',       1.0, 'tax_policy'),
+    ('flag_energy_policy',    1.0, 'energy_policy'),
+    ('flag_ai_chip_policy',   1.0, 'ai_chip_policy'),
+]
+
+
+def gated_macro_score(row, post_date):
+    """macro_risk_score recomputed with event-window gates (0..~14, /5 norm)."""
+    s = 0.0
+    for colf, wt, domn in _MACRO_COMPONENTS:
+        v = row.get(colf)
+        if v is not None and not pd.isna(v) and float(v) > 0:
+            g = _EM.domain_activity(domn, post_date)
+            if g > 0:
+                s += wt * float(v) * g
+    return s
+
+
 def compute_nlp_signal(row):
     """Normalized NLP signal per post (0-1): policy intensity + domain risk
     (the STRONGER of war/hawkish and non-war/macro — crypto, COVID, Fed,
     banking) + sample weight. Hawkish-only anchoring silently zeroed every
-    non-war era post."""
+    non-war era post. The macro term is EVENT-WINDOW GATED (see above);
+    war/hawkish stays ungated — escalations break suddenly, before any
+    curator can add an event."""
     # DOMAIN-WEIGHTED, not a flat mean: a flat mean lets low policy_intensity
     # (structural for single-domain posts — the bitcoin tweet scores pis=1 ->
     # 0.125) drag a strong domain signal under the 0.5 HIGH_SIGNAL bar.
@@ -196,8 +241,7 @@ def compute_nlp_signal(row):
     # clears 0.5; no-domain posts (endorsements) stay far below.
     pis = min(float(row.get('policy_intensity_score') or 0.0) / 8.0, 1.0)
     dom = min(float(row.get('hawkish_risk_score') or 0.0) / 5.0, 1.0)
-    if 'macro_risk_score' in row.index and pd.notna(row['macro_risk_score']):
-        dom = max(dom, min(float(row['macro_risk_score']) / 5.0, 1.0))
+    dom = max(dom, min(gated_macro_score(row, row.get('date')) / 5.0, 1.0))
     sw = float(row.get('sample_weight') or 0.0)
     return float(0.25 * pis + 0.45 * dom + 0.30 * sw)
 
@@ -533,7 +577,12 @@ def abnormal_return_daily(post_dt, name, session):
         day = next((x for x in reversed(dates) if x <= post_date), None)
     else:
         day = next((x for x in dates if x > post_date), None)
-    if day is None:
+    # SANITY BOUND (2026-07-15): without it, a post BEFORE the instrument's
+    # first bar matched the FIRST day in history — every pre-listing ETH post
+    # (Feb-Aug 2017) wore ETH's first trading day's +3.9654% as its "actual",
+    # and 6 of them scored as fake TRADE wins in the backtest. A label is only
+    # real if the session is within a few days of the post (weekends/holidays).
+    if day is None or abs((day - post_date).days) > 4:
         return None, None
     try:
         initial, close = opens[day], closes[day]
@@ -553,7 +602,9 @@ def abnormal_next_session(post_dt, name):
     closes, opens = d['Close'], d['Open']
     dates = sorted(closes.index)
     nd = next((x for x in dates if x > post_dt.date()), None)
-    if nd is None:
+    # same sanity bound as abnormal_return_daily (pre-listing posts must NOT
+    # match the instrument's first bar months later)
+    if nd is None or (nd - post_dt.date()).days > 4:
         return None, None
     try:
         o, c = opens[nd], closes[nd]
@@ -874,7 +925,7 @@ def main_full():
     db.write_table(FINAL_TABLE, scored[train_cols])
     print(f"\n💾 Saved {FINAL_TABLE} ({len(scored)} rows)")
 
-    hs = scored[scored['sample_weight'] > 0.5][train_cols]
+    hs = scored[scored['sample_weight'] > HS_BAR][train_cols]
     db.write_table(HS_TABLE, hs)
     print(f"💾 Saved {HS_TABLE} ({len(hs)} rows)")
 
@@ -1003,7 +1054,7 @@ def main_incremental():
     db.append_table(FINAL_TABLE, out_final)
     print(f"\n💾 Appended {len(out_final)} rows -> {FINAL_TABLE}")
 
-    hs = out_final[new['sample_weight'].values > 0.5]
+    hs = out_final[new['sample_weight'].values > HS_BAR]
     if len(hs):
         db.append_table(HS_TABLE, hs)
     print(f"💾 Appended {len(hs)} high-signal rows -> {HS_TABLE}")

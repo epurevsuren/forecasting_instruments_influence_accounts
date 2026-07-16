@@ -149,6 +149,10 @@ def main():
     n_twitter = len(df) - (n_primary if isinstance(n_primary, int) else 0)
     print(f"  Merged rows: {len(df)}  (primary: {n_primary} | non-primary: {n_twitter})")
 
+    # Date order is required by the chronological CALIB slice below (X/y/w
+    # all align to this order). Does NOT affect train/early-stop randomness.
+    df = df.sort_values('date').reset_index(drop=True)
+
     # NLP feature matrix — cast to float32 (is_primary is bool; booleans → 0/1 fine)
     use_nlp = [c for c in NLP_FEATURES if c in df.columns]
     missing  = [c for c in NLP_FEATURES if c not in df.columns]
@@ -189,9 +193,33 @@ def main():
 
     X_emb = np.vstack([cache[pid] for pid in platform_ids])
 
+    # ------------------------------------------------------------------
+    # EMBEDDING COMPRESSION (2026-07-16): 1536 raw FinBERT dims drown the
+    # ~53 NLP features — trees pick NLP ~3% of the time and every model
+    # flatlines (BTC/ETH/FX predict <0.1% forever -> zero trades).
+    # feature_weights was a dead end: measured on synthetic 1536+53 data,
+    # a 20x weight lifts NLP share only 4.4% -> 6.4% (it merely biases
+    # colsample sampling). PCA to EMB_PCA_DIM keeps the embedding's main
+    # semantic directions while making NLP ~30% of columns BY CONSTRUCTION.
+    # Fitted on the chronological TRAIN slice only (no lookahead); saved to
+    # emb_pca.npz so predict/backtest apply the identical projection.
+    # ------------------------------------------------------------------
+    EMB_PCA_DIM = 128
+    from sklearn.decomposition import PCA
+    _i70 = int(len(df) * 0.70)          # same boundary as the split below
+    print(f"  🔻 PCA {X_emb.shape[1]} -> {EMB_PCA_DIM} dims (fit on first 70% = train slice)...")
+    _pca = PCA(n_components=EMB_PCA_DIM, svd_solver='randomized',
+               random_state=42).fit(X_emb[:_i70])
+    _evr = float(_pca.explained_variance_ratio_.sum())
+    X_emb = _pca.transform(X_emb).astype(np.float32)
+    np.savez(os.path.join(OUT_DIR, "emb_pca.npz"),
+             mean=_pca.mean_.astype(np.float32),
+             components=_pca.components_.astype(np.float32))
+    print(f"     explained variance: {_evr:.1%}  💾 emb_pca.npz saved")
+
     X = np.hstack([X_emb, X_nlp])
     nlp_start = X_emb.shape[1]   # index where NLP features begin
-    print(f"  Combined: {X.shape[1]} dims ({X_emb.shape[1]} FinBERT + {len(use_nlp)} NLP)")
+    print(f"  Combined: {X.shape[1]} dims ({X_emb.shape[1]} FinBERT-PCA + {len(use_nlp)} NLP)")
 
     w = df['sample_weight'].fillna(0.3).values if 'sample_weight' in df.columns else None
     sig = df['sample_weight'].fillna(0.3).values if 'sample_weight' in df.columns else np.full(len(df),0.5)
@@ -204,109 +232,135 @@ def main():
         col = f"{inst}_Impact"
         if col not in df.columns: continue
         y = df[col].fillna(0.0).values
-        # VOL-REGIME TRAINING WEIGHTS: rows from crazy-vol regimes carry
-        # labels dominated by ambient noise, not tweet impact (2017 crypto
-        # mania poisoned BTC: mean|label| huge on random tweets; ETH escaped
-        # only because its bars start 2017-08). Down-weight per instrument by
-        # median_vol/vol30(post date), clipped [0.33, 2.0] — quiet regimes
-        # count slightly more, chaos regimes count a third.
-        w_inst = w.copy() if w is not None else np.ones(len(df))
+        idx = np.arange(len(df))
+        
+        # ---------------------------------------------------------
+        # 1. STRICT 4-WAY CHRONOLOGICAL SPLIT (The Lookahead Fix)
+        # ---------------------------------------------------------
+        N = len(df)
+        i_tr  = int(N * 0.70)  # 70% Train
+        i_es  = int(N * 0.85)  # 15% Early Stop
+        i_cal = int(N * 0.93)  #  8% Magnitude Calibration
+                               #  7% Take Profit Calibration (Remainder)
+
+        Xtr,  ytr,  itr  = X[:i_tr], y[:i_tr], idx[:i_tr]
+        Xes,  yes,  ies  = X[i_tr:i_es], y[i_tr:i_es], idx[i_tr:i_es]
+        Xcal, ycal, ical = X[i_es:i_cal], y[i_es:i_cal], idx[i_es:i_cal]
+        Xtp,  ytp,  itp  = X[i_cal:], y[i_cal:], idx[i_cal:]
+        
+        # We still want an aggregate "Test" set for reporting R2 / MAE / etc.
+        Xte, yte, ite = X[i_es:], y[i_es:], idx[i_es:]
+
+        # ---------------------------------------------------------
+        # 2. VOLATILITY ADJUSTMENT (The Median Leak Fix)
+        # ---------------------------------------------------------
+        # We now calculate the median STRICTLY on the training slice
+        w_tr = w[:i_tr].copy() if w is not None else np.ones(len(ytr))
+        
         vcol = f'{inst}_vol30'
         if vcol in df.columns:
-            v = pd.to_numeric(df[vcol], errors='coerce')
-            med = float(v.median()) if v.notna().sum() > 50 else None
+            v_train = pd.to_numeric(df.iloc[:i_tr][vcol], errors='coerce')
+            med = float(v_train.median()) if v_train.notna().sum() > 50 else None
+            
             if med and med > 0:
-                # Prevent divide by zero if vol30 contains exact 0.0s
-                v_vals = v.fillna(med).values
+                # Apply only to training weights
+                v_vals = v_train.fillna(med).values
                 v_vals = np.where(v_vals == 0, 1e-9, v_vals)
+                # Floor 0.33, NOT 0.10 — the 0.10 floor (tried 2026-07-15)
+                # collapsed every model (SPY corr 0.71->0.34, mean|pred| /10):
+                # high-vol30 regimes (COVID, tariff waves, SVB) hold most of
+                # the REAL impact examples; the proxy can't tell "crazy
+                # because of the post" from "crazy ambient", so crushing
+                # those rows to 10% removed the signal itself.
                 adj = np.clip(med / v_vals, 0.33, 2.0)
-                w_inst = w_inst * adj
-        idx = np.arange(len(df))
-        # THREE-WAY SPLIT: train 70% / early-stop 15% / CALIB 15%.
-        # Early stopping selects best_iteration ON its eval set, which flatters
-        # predictions there — fitting calibration (and reporting metrics) on
-        # that same set under-estimated the shrinkage (fitted k~1.2 while the
-        # decade backtest showed residual k~2.3). The calib split is touched
-        # by NOTHING during fitting.
-        Xtr,Xrest,ytr,yrest,wtr,_,itr,irest = train_test_split(
-            X,y,w_inst,idx,test_size=0.30,random_state=42)
-        Xes,Xte,yes,yte,ies,ite = train_test_split(
-            Xrest,yrest,irest,test_size=0.50,random_state=42)
+                w_tr = w_tr * adj
 
-        # FEATURE WEIGHTS: 1536 FinBERT dims drown the ~50 NLP features at
-        # colsample 0.5 — the trained models gave NLP only ~3% importance...
-        _fw = np.ones(X.shape[1], dtype=np.float32)
-        _fw[nlp_start:] = 20.0
-
+        # (feature_weights REMOVED 2026-07-16: measured dead end — 20x weight
+        # lifted NLP importance only 4.4%->6.4%; it only biases colsample
+        # sampling. Replaced by the PCA compression above.)
         m = xgb.XGBRegressor(
             n_estimators=600, max_depth=6, learning_rate=0.03,
             subsample=0.8, colsample_bytree=0.5, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
-            early_stopping_rounds=40, n_jobs=-1, random_state=42,
-            feature_weights=_fw) # Passed in the constructor for modern XGBoost APIs
+            early_stopping_rounds=40, n_jobs=-1, random_state=42)
 
-        m.fit(Xtr, ytr, sample_weight=wtr, eval_set=[(Xes, yes)], verbose=False)
+        m.fit(Xtr, ytr, sample_weight=w_tr, eval_set=[(Xes, yes)], verbose=False)
+
+        # NLP-ONLY CHALLENGER — same split, NLP features only. Answers "is
+        # FinBERT earning its 128 columns?" per instrument, in every train
+        # log. If the challenger matches/beats the full model repeatedly,
+        # the embedding is decoration and should be dropped for that
+        # instrument. Diagnostic only — champion model is still saved.
+        m_nlp = xgb.XGBRegressor(
+            n_estimators=400, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
+            early_stopping_rounds=40, n_jobs=-1, random_state=42)
+        m_nlp.fit(Xtr[:, nlp_start:], ytr, sample_weight=w_tr,
+                  eval_set=[(Xes[:, nlp_start:], yes)], verbose=False)
         
-        pred = m.predict(Xte)
+        # Overall Test Predictions for Reporting
+        pred_te = m.predict(Xte)
 
-        mae,r2 = mean_absolute_error(yte,pred), r2_score(yte,pred)
-        # directional accuracy on meaningful moves (|true|>0.1)
+        mae, r2 = mean_absolute_error(yte, pred_te), r2_score(yte, pred_te)
         mask = np.abs(yte) > 0.1
-        dir_acc = (np.sign(pred[mask])==np.sign(yte[mask])).mean() if mask.sum()>0 else float('nan')
-        # noise check: mean |pred| on low-signal test posts (should be small)
-        noise_mask = sig[ite] < 0.3
-        noise_pred = np.abs(pred[noise_mask]).mean() if noise_mask.sum()>0 else 0.0
-        # feature importance: NLP share
-        imp = m.feature_importances_
-        nlp_share = imp[nlp_start:].sum() / max(imp.sum(),1e-9)
+        dir_acc = (np.sign(pred_te[mask])==np.sign(yte[mask])).mean() if mask.sum()>0 else float('nan')
 
-        # MAGNITUDE CALIBRATION — XGBoost squared-error predictions shrink
-        # toward the mean (regression dilution: many near-zero training rows,
-        # capped heavy tails), so |pred| systematically underestimates |actual|
-        # even when direction correlation is high (decade backtest: actual ≈
-        # 1.1-3.0 x pred per instrument, corr 0.79-0.94). Fit
-        #     actual = k x pred   (regression through the origin)
-        # on the HOLDOUT split only (in-sample preds are overfit -> k≈1 lie),
-        # k clipped to [0.25, 20.0], trade-region rows only. predict/backtest
-        # multiply raw model output by k so predicted PERCENTAGES are usable
-        # for TP sizing, not just direction.
-        # TRADE-REGION FIT (2026-07-15): fitting k over ALL calib rows let
-        # tens of thousands of near-zero noise posts dominate the regression —
-        # BTC trade rows ran ~11x actual/pred while the all-rows fit said 1.5
-        # (BTC starved of Layer-2 trades), and US2Y over-predicted ~7x while
-        # its fit said "amplify 2.1x" (over-prediction loses money). We only
-        # ACT on the high-|pred| tail, so fit k WHERE WE TRADE: calib rows
-        # with |pred| in the top decile (fallback top quartile, then all).
-        # Clip widened [0.5,4] -> [0.25,20] so a real 17x correction fits.
-        abs_p = np.abs(pred)
-        cal_mask = np.zeros(len(pred), dtype=bool)
+        # challenger metrics on the same test window
+        pred_nlp = m_nlp.predict(Xte[:, nlp_start:])
+        r2_nlp = r2_score(yte, pred_nlp)
+        dir_nlp = (np.sign(pred_nlp[mask])==np.sign(yte[mask])).mean() if mask.sum()>0 else float('nan')
+        
+        noise_mask = sig[ite] < 0.3
+        noise_pred = np.abs(pred_te[noise_mask]).mean() if noise_mask.sum()>0 else 0.0
+        
+        imp = m.feature_importances_
+        nlp_share = imp[nlp_start:].sum() / max(imp.sum(), 1e-9)
+
+        # ---------------------------------------------------------
+        # 3. MAGNITUDE CALIBRATION (Fitted only on Xcal)
+        # ---------------------------------------------------------
+        pred_cal = m.predict(Xcal)
+        abs_p_cal = np.abs(pred_cal)
+        cal_mask = np.zeros(len(pred_cal), dtype=bool)
+        
         for _q in (90, 75, 0):
-            cal_mask = (abs_p >= np.percentile(abs_p, _q)) & (np.abs(yte) > 0.05)
-            if cal_mask.sum() >= 30:
+            cal_mask = (abs_p_cal >= np.percentile(abs_p_cal, _q)) & (np.abs(ycal) > 0.05)
+            if cal_mask.sum() >= 15: # Lowered minimums slightly for the smaller split
                 break
-        if cal_mask.sum() >= 10 and (pred[cal_mask] ** 2).sum() > 1e-9:
-            k_cal = float((pred[cal_mask] * yte[cal_mask]).sum()
-                          / (pred[cal_mask] ** 2).sum())
+                
+        if cal_mask.sum() >= 5 and (pred_cal[cal_mask] ** 2).sum() > 1e-9:
+            k_cal = float((pred_cal[cal_mask] * ycal[cal_mask]).sum()
+                          / (pred_cal[cal_mask] ** 2).sum())
             k_cal = float(np.clip(k_cal, 0.25, 20.0))
         else:
             k_cal = 1.0
+            
         calibration[inst] = round(k_cal, 3)
 
-        # TP QUANTILE — the mean-calibrated prediction OVERSHOOTS the actual
-        # move on ~half of posts (that's what a mean is). For TP placement we
-        # want a level MOST winners actually reach: k_tp = 40th percentile of
-        # actual/calibrated-pred ratios AMONG CORRECT-DIRECTION rows only.
-        # (Signed ratios collapsed the percentile below zero — every k_tp
-        # pinned at the 0.2 clip floor — because wrong-direction rows are a
-        # ~45% negative tail; the SL handles those, TP placement shouldn't.)
-        # Layer-2 usage: --tp-mult <k_tp> (per-instrument values in config).
-        _pm = cal_mask & (np.abs(pred) > 1e-6)
-        ratios = (yte[_pm] * np.sign(pred[_pm])) / (np.abs(pred[_pm]) * k_cal)
-        ratios = ratios[ratios > 0]                 # correct-direction rows only
-        if len(ratios) >= 10:
+        # ---------------------------------------------------------
+        # 4. TAKE PROFIT CALIBRATION (Fitted only on Xtp)
+        # ---------------------------------------------------------
+        # The Chained Leak Fix: We use entirely unseen data to evaluate 
+        # how k_cal performs, ensuring k_tp is an honest out-of-sample estimate.
+        pred_tp = m.predict(Xtp)
+        abs_p_tp = np.abs(pred_tp)
+        tp_mask = np.zeros(len(pred_tp), dtype=bool)
+        
+        for _q in (90, 75, 0):
+            tp_mask = (abs_p_tp >= np.percentile(abs_p_tp, _q)) & (abs_p_tp > 1e-6)
+            if tp_mask.sum() >= 15: 
+                break
+                
+        _pm = tp_mask & (abs_p_tp > 1e-6)
+        ratios = (ytp[_pm] * np.sign(pred_tp[_pm])) / (np.abs(pred_tp[_pm]) * k_cal)
+        ratios = ratios[ratios > 0]                 
+        
+        if len(ratios) >= 5:
             k_tp = float(np.clip(np.percentile(ratios, 40), 0.2, 1.5))
         else:
             k_tp = 0.7
+            
         calibration_tp[inst] = round(k_tp, 3)
 
         m.save_model(f"{OUT_DIR}/{col}.json")
@@ -316,13 +370,17 @@ def main():
                         "nlp_share":round(float(nlp_share),3),
                         "calibration_k":calibration[inst],
                         "best_iter":int(m.best_iteration or 0)}
+        
         flag = "✅" if r2>0.1 else ("🟡" if r2>0 else "🔴")
         da = f"dir={dir_acc:.0%}" if dir_acc==dir_acc else "dir=n/a"
+        _da_nlp = f"{dir_nlp:.0%}" if dir_nlp == dir_nlp else "n/a"
         print(f"  {flag} {inst:<10} R²={r2:+.3f}  {da}  noise|p|={noise_pred:.3f}  "
-              f"NLP={nlp_share:.0%}  k={calibration[inst]:.2f}")
+              f"NLP={nlp_share:.0%}  k={calibration[inst]:.2f}  "
+              f"| NLP-only R²={r2_nlp:+.3f} dir={_da_nlp}")
 
     # config.json written AFTER training so it carries the fitted calibration
     json.dump({"finbert":FINBERT,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
+               "emb_pca":EMB_PCA_DIM,   # predict/backtest must project with emb_pca.npz
                "nlp_features":use_nlp,"instruments":INSTRUMENTS,
                "calibration":calibration,"calibration_tp":calibration_tp},
               open(f"{OUT_DIR}/config.json","w"))

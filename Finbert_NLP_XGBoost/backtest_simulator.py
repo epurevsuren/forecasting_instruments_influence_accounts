@@ -329,7 +329,8 @@ def gate_multiplier(row):
     pis = min(float(row.get('policy_intensity_score') or 0.0) / 8.0, 1.0) \
         if pd.notna(row.get('policy_intensity_score')) else 0.0
     _h = float(row.get('hawkish_risk_score') or 0.0) if pd.notna(row.get('hawkish_risk_score')) else 0.0
-    _m = float(row.get('macro_risk_score') or 0.0) if pd.notna(row.get('macro_risk_score')) else 0.0
+    # macro term EVENT-WINDOW GATED at the post's date (same as build + predict)
+    _m = PR.gated_macro_score(row, row['date_ny'].date())
     dom = max(min(_h / 5.0, 1.0), min(_m / 5.0, 1.0))
     sw = float(row.get('sample_weight') or 0.0) if pd.notna(row.get('sample_weight')) else 0.0
     signal = float(0.25 * pis + 0.45 * dom + 0.30 * sw)
@@ -434,6 +435,10 @@ def load_models(model_dir, instruments):
     if not os.path.exists(cfg_path):
         sys.exit(f"❌ {cfg_path} not found — train models first (train_finbert_nlp_xgb.py).")
     cfg = json.load(open(cfg_path))
+    # attach the training-time embedding PCA (see PR.project_emb) if present
+    if cfg.get("emb_pca"):
+        _z = np.load(os.path.join(model_dir, "emb_pca.npz"))
+        cfg["_emb_pca_mats"] = (_z["mean"], _z["components"])
     models = {}
     for inst in instruments:
         p = os.path.join(model_dir, f"{inst}_Impact.json")
@@ -987,6 +992,7 @@ def main():
             df[c] = 0.0
         use_nlp = cfg['nlp_features']
     X_nlp = df[use_nlp].fillna(0.0).values.astype(np.float32)
+    X_emb = PR.project_emb(X_emb, cfg)   # PCA projection if model was trained compressed
     X = np.hstack([X_emb, X_nlp])
     print(f"\n  Feature matrix: {X.shape} "
           f"({X_emb.shape[1]} FinBERT + {X_nlp.shape[1]} NLP)")

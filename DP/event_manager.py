@@ -82,6 +82,7 @@ class EventManager:
     def __init__(self, path: str = EVENTS_FILE):
         self._path = path
         self._data = self._load()
+        self._domain_cache: dict = {}   # (domain, iso-date) -> gate
 
     # ---------------------------------------------------------------- I/O ----
 
@@ -201,6 +202,66 @@ class EventManager:
             return max(ev["_weight"] for ev in evs)
         w = max(self.get_weight_at(ev["id"], at_date) for ev in evs)
         return w if w > 0 else 1.0
+
+    # ------------------------------------------------------------------
+    # DOMAIN GATING — event-window awareness for NLP keyword scoring.
+    # Maps event id -> scorer keyword domains (flag_<domain> in
+    # scorer_config.json). Events added later by the LLM curator may carry
+    # their own "domains" list in events.json, which takes precedence.
+    # ------------------------------------------------------------------
+    DOMAIN_FALLBACK = {
+        "crypto_regulation_wave":   ["crypto_policy"],
+        "election_2024":            ["crypto_policy"],
+        "covid_crash_2020":         ["public_health", "stimulus"],
+        "covid_stimulus_recovery":  ["public_health", "stimulus",
+                                     "interest_rate", "tax_policy"],
+        "covid19_pandemic":         ["public_health"],
+        "fed_tightening_2018":      ["interest_rate"],
+        "inflation_fed_hikes_2022": ["interest_rate", "energy_policy"],
+        "svb_banking_crisis_2023":  ["financial_system"],
+        "tax_cuts_boom_2017":       ["tax_policy", "stimulus"],
+        "election_2016_trump_rally":["tax_policy", "stimulus"],
+        "russia_energy_sanctions":  ["energy_policy"],
+        "iran_strait_hormuz":       ["energy_policy"],
+        "venezuela_political":      ["energy_policy"],
+        "us_china_tech_war":        ["ai_chip_policy"],
+        "ai_disruption":            ["ai_chip_policy"],
+        "taiwan_strait_tensions":   ["ai_chip_policy"],
+    }
+
+    def domain_activity(self, domain: str, at_date) -> float:
+        """Gate 0..1: is this keyword DOMAIN 'live' at this date?
+
+        A domain is live while ANY event tagged with it is in-window; the
+        gate is the strongest matching event's priority multiplier (1.0
+        high / 0.6 medium / 0.3 low). Status is deliberately IGNORED here:
+        an open event's status reflects TODAY, not the post's day — window
+        membership is the honest point-in-time signal. 0.0 = dormant (a
+        2017 'vaccine' post must NOT score as a pandemic post; a 2016
+        'bitcoin' mention predates the regulation wave).
+        """
+        d = at_date
+        if callable(getattr(d, "date", None)):   # datetime / pd.Timestamp (tz-safe)
+            d = d.date()
+        elif not isinstance(d, date):
+            d = self._parse_date(d)
+        key = (domain, d.isoformat() if d else None)
+        cached = self._domain_cache.get(key)
+        if cached is not None:
+            return cached
+        best = 0.0
+        for ev in self.events:
+            doms = ev.get("domains") or self.DOMAIN_FALLBACK.get(ev["id"], [])
+            if domain not in doms:
+                continue
+            if d is not None:
+                start = self._parse_date(ev.get("start_date"))
+                end   = self._parse_date(ev.get("end_date"))
+                if (start is not None and d < start) or (end is not None and d > end):
+                    continue
+            best = max(best, PRIORITY_MULTIPLIERS.get(ev.get("priority", ""), 0.0))
+        self._domain_cache[key] = best
+        return best
 
     def get_all_multipliers(self) -> dict[str, float]:
         """Return {account_handle: multiplier} for every account in any event."""

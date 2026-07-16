@@ -21,6 +21,54 @@ NY = 'America/New_York'
 _HERE          = os.path.dirname(os.path.abspath(__file__))
 _ENTITIES_FILE = os.path.join(_HERE, "..", "DP", "influence_accounts.json")
 
+# ---------------------------------------------------------------------------
+# EVENT-WINDOW DOMAIN GATING (single source: DP/event_manager.py, loaded by
+# path like the signal_scorer shim). A keyword domain (crypto, COVID, Fed...)
+# only contributes to the NLP signal while a matching events.json window is
+# LIVE at the post date — a 2017 'vaccine' post is not a pandemic post.
+# Mirrors DP/build_final_training_set (training-side) exactly.
+# ---------------------------------------------------------------------------
+import importlib.util as _ilu
+_EM_PATH = os.path.normpath(os.path.join(_HERE, "..", "DP", "event_manager.py"))
+_em_spec = _ilu.spec_from_file_location("event_manager_canonical", _EM_PATH)
+_em_mod  = _ilu.module_from_spec(_em_spec)
+_em_spec.loader.exec_module(_em_mod)
+_EM = _em_mod.EventManager()
+
+_MACRO_COMPONENTS = [        # (flag column, weight, events.json domain)
+    ('flag_crypto_policy',    4.0, 'crypto_policy'),
+    ('flag_public_health',    4.0, 'public_health'),
+    ('flag_interest_rate',    2.0, 'interest_rate'),
+    ('flag_financial_system', 2.0, 'financial_system'),
+    ('flag_stimulus',         1.0, 'stimulus'),
+    ('flag_tax_policy',       1.0, 'tax_policy'),
+    ('flag_energy_policy',    1.0, 'energy_policy'),
+    ('flag_ai_chip_policy',   1.0, 'ai_chip_policy'),
+]
+
+
+def project_emb(emb, cfg):
+    """Apply the training-time PCA projection when the model set was trained
+    on compressed embeddings (config 'emb_pca'); identity for older models."""
+    mats = cfg.get("_emb_pca_mats")
+    if mats is None:
+        return emb
+    mean, comps = mats
+    return ((emb - mean) @ comps.T).astype(np.float32)
+
+
+def gated_macro_score(feats, post_date):
+    """macro_risk_score recomputed with event-window gates (0..~14, /5 norm).
+    `feats` is any dict-like with flag_* entries; `post_date` a datetime.date."""
+    s = 0.0
+    for colf, wt, domn in _MACRO_COMPONENTS:
+        v = feats.get(colf)
+        if v is not None and not pd.isna(v) and float(v) > 0:
+            g = _EM.domain_activity(domn, post_date)
+            if g > 0:
+                s += wt * float(v) * g
+    return s
+
 def _rank0_handle(when=None) -> str:
     """Return the rank-0 TruthSocial primary handle ACTIVE at `when` (default now).
 
@@ -538,6 +586,13 @@ def load(model_dir=None):
     model_dir = model_dir or OUT_DIR
     cfg = json.load(open(f"{model_dir}/config.json"))
 
+    # EMBEDDING PCA (2026-07-16): models trained with compressed embeddings
+    # (config 'emb_pca') need the SAME projection at predict time. Attach the
+    # matrices to cfg so predict()/backtest project identically.
+    if cfg.get("emb_pca"):
+        _z = np.load(os.path.join(model_dir, "emb_pca.npz"))
+        cfg["_emb_pca_mats"] = (_z["mean"], _z["components"])
+
     # CONFIG-DRIFT NOTICE: scorer_config.json evolves daily (LLM-updated), but
     # this model only uses the feature list frozen at ITS train time
     # (cfg['nlp_features']). Newer flags are scored+stored in the DB but
@@ -621,7 +676,7 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
         is_primary=is_primary,
     )
     nlp_vec = np.array([[float(feats.get(c, 0.0)) for c in cfg['nlp_features']]])
-    X = np.hstack([finbert_embed(text), nlp_vec])
+    X = np.hstack([project_emb(finbert_embed(text), cfg), nlp_vec])
 
     import math
     # DOMAIN-WEIGHTED signal (0.25 policy / 0.45 domain / 0.30 weight) — same
@@ -630,7 +685,9 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     # COVID/Fed) under the gate regardless of domain strength.
     pis = min(float(feats.get('policy_intensity_score') or 0.0) / 8.0, 1.0)
     dom = min(float(feats.get('hawkish_risk_score') or 0.0) / 5.0, 1.0)
-    dom = max(dom, min(float(feats.get('macro_risk_score') or 0.0) / 5.0, 1.0))
+    # macro term is EVENT-WINDOW GATED at the post's date (live = today)
+    _pdate = post_ts.date() if post_ts is not None else datetime.date.today()
+    dom = max(dom, min(gated_macro_score(feats, _pdate) / 5.0, 1.0))
     sw = float(feats.get('sample_weight') or 0.0)
     signal = float(0.25 * pis + 0.45 * dom + 0.30 * sw)
     gate = 1.0/(1.0+math.exp(-GATE_K*(signal-GATE_MID))) if GATE_ENABLED else 1.0

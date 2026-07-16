@@ -136,7 +136,7 @@
       "start_date": "2017-09-04",
       "end_date": "N/A",
       "status": "monitoring",
-      "priority": "medium",
+      "priority": "high",
       "description": "Rolling regulatory shocks: China bans (2017, 2021), SEC suits (Ripple 2020, Coinbase/Binance 2023), FTX collapse (2022-11), spot ETF approvals (2024-01), strategic-reserve policy (2024-25). Presidential/official posts on crypto move BTC/ETH hard.",
       "affected_accounts": ["realDonaldTrump", "POTUS", "JoeBiden"],
       "affected_assets": ["BTC", "ETH"],
