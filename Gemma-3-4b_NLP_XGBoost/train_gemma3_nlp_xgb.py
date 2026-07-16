@@ -126,6 +126,24 @@ def main():
     # all align to this order). Does NOT affect train/early-stop randomness.
     df = df.sort_values('date').reset_index(drop=True)
 
+    # ------------------------------------------------------------------
+    # TRAINING-ROW FILTER (2026-07-17): ~155k of 190k rows are non-primary
+    # geo posts whose 1-hour labels are ambient market noise. A squared-
+    # loss model trained on 82% "nothing happened" rows learns to predict
+    # ~0 for EVERYTHING (Gemma baseline backtest: mean|pred| 0.000-0.005 on
+    # most instruments, k exploding to +/-30-150). Keep only rows with a
+    # meaningful finalized sample_weight — the model learns tweet-impact
+    # from posts that plausibly HAD impact; the gates already ensure only
+    # such posts are traded at inference. Cached embeddings make retrains
+    # on any filter setting a minutes-long experiment.
+    # ------------------------------------------------------------------
+    TRAIN_MIN_WEIGHT = 0.20
+    _n0 = len(df)
+    df = df[df['sample_weight'].fillna(0.0) >= TRAIN_MIN_WEIGHT].reset_index(drop=True)
+    print(f"  🧹 Training-row filter: sample_weight >= {TRAIN_MIN_WEIGHT} "
+          f"-> {len(df)}/{_n0} rows kept "
+          f"(primary: {int(df['is_primary'].sum()) if 'is_primary' in df.columns else '?'})")
+
     # NLP feature matrix — cast to float32 (is_primary is bool; booleans → 0/1 fine)
     use_nlp = [c for c in NLP_FEATURES if c in df.columns]
     missing  = [c for c in NLP_FEATURES if c not in df.columns]
