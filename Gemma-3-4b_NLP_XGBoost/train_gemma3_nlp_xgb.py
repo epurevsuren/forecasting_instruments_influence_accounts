@@ -183,34 +183,17 @@ def main():
     # BertForSequenceClassification: softmax(Wc·tanh(Wp·cls+bp)+bc)).
     # Head saved to gemma_sent_head.npz so predict/backtest match.
     # ------------------------------------------------------------------
-    # Guard: only BERT-family sentiment classifiers have this head. When the
-    # Gemma launcher (../Gemma-3-4b_NLP_XGBoost) patches gemma/embed_texts,
-    # this block is skipped — decoder LLM embeddings carry no pooler head.
-    if "gemma" not in gemma.lower():
-        print(f"  ⏭️  Sentiment head skipped (backbone {gemma} is not gemma)")
-    else:
-        print("  🎭 gemma sentiment head over cached CLS vectors...")
-        _m = AutoModelForSequenceClassification.from_pretrained(gemma)
-        _Wp = _m.bert.pooler.dense.weight.detach().numpy().astype(np.float32)
-        _bp = _m.bert.pooler.dense.bias.detach().numpy().astype(np.float32)
-        _Wc = _m.classifier.weight.detach().numpy().astype(np.float32)
-        _bc = _m.classifier.bias.detach().numpy().astype(np.float32)
-        _id2l = {int(k): str(v).lower() for k, v in _m.config.id2label.items()}
-        _pos = next(i for i, l in _id2l.items() if l.startswith('pos'))
-        _neg = next(i for i, l in _id2l.items() if l.startswith('neg'))
-        del _m
-        _pool = np.tanh(X_emb[:, :768] @ _Wp.T + _bp)
-        _lg = _pool @ _Wc.T + _bc
-        _lg -= _lg.max(axis=1, keepdims=True)
-        _pr = np.exp(_lg); _pr /= _pr.sum(axis=1, keepdims=True)
-        sent_block = np.column_stack([_pr[:, _pos], _pr[:, _neg],
-                                      _pr[:, _pos] - _pr[:, _neg]]).astype(np.float32)
-        X_nlp = np.hstack([X_nlp, sent_block])
-        use_nlp = list(use_nlp) + ['gemma_pos', 'gemma_neg', 'gemma_sent']
-        np.savez(os.path.join(OUT_DIR, "gemma_sent_head.npz"),
-                 Wp=_Wp, bp=_bp, Wc=_Wc, bc=_bc, pos=_pos, neg=_neg)
-        print(f"     mean sentiment={sent_block[:, 2].mean():+.3f}  "
-              f"💾 gemma_sent_head.npz saved")
+    # SENTIMENT HEAD: REMOVED for Gemma (2026-07-17). That block was FinBERT
+    # anatomy (bert.pooler + a TRAINED 3-class classifier from the Financial
+    # PhraseBank). Gemma is a decoder LLM with NO trained sentiment head —
+    # AutoModelForSequenceClassification invents a RANDOM `score` layer
+    # (load report: "score.weight | MISSING") whose output is noise, and its
+    # init even crashes on 4-bit weights (normal_kernel_cuda on Byte).
+    # If a sentiment feature proves necessary, the correct Gemma-native way
+    # is next-token logit contrast (P("positive") vs P("negative") after a
+    # sentiment prompt) — one extra forward pass per post, cacheable like
+    # the embeddings. Not enabled yet: measure the embedding baseline first.
+    print("  ⏭️  Sentiment head: none for Gemma (see comment) — NLP features only")
 
     # ------------------------------------------------------------------
     # EMBEDDING COMPRESSION (2026-07-16): 1536 raw gemma dims drown the
@@ -226,9 +209,15 @@ def main():
     EMB_PCA_DIM = 128
     from sklearn.decomposition import PCA
     _i70 = int(len(df) * 0.70)          # same boundary as the split below
-    print(f"  🔻 PCA {X_emb.shape[1]} -> {EMB_PCA_DIM} dims (fit on first 70% = train slice)...")
+    # RAM guard: Gemma vectors are 5120-wide (3.3x FinBERT) — fit the PCA on
+    # a stride subsample of the train slice (<=60k rows: components are
+    # statistically identical, workspace is a third). Transform still maps
+    # ALL rows through the fitted projection.
+    _step = max(1, _i70 // 60000)
+    print(f"  🔻 PCA {X_emb.shape[1]} -> {EMB_PCA_DIM} dims "
+          f"(fit on train slice, every {_step}th row = {len(range(0, _i70, _step))} rows)...")
     _pca = PCA(n_components=EMB_PCA_DIM, svd_solver='randomized',
-               random_state=42).fit(X_emb[:_i70])
+               random_state=42).fit(X_emb[:_i70:_step])
     _evr = float(_pca.explained_variance_ratio_.sum())
     X_emb = _pca.transform(X_emb).astype(np.float32)
     np.savez(os.path.join(OUT_DIR, "emb_pca.npz"),
