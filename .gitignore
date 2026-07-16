@@ -11,6 +11,8 @@ ctrader_results/
 config_backups/
 stock-data-intraday-minute-bar/
 FX-1-Minute-Data/
+gemma3_nlp_xgb_models/
+unsloth_compiled_cache/
 
 
 # Ignore file extensions
