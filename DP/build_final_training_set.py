@@ -87,8 +87,7 @@ _EM = EventManager()   # event-window domain gating for nlp_signal
 
 # HIGH_SIGNAL selectivity bar on finalized sample_weight (= event-gated,
 # damped nlp_signal). Tuned 2026-07-16 on the full decade: with event-window
-# gating, bar 0.53 yields ~2,000 pre-damp posts (finalize damps trim toward
-# Peter's 1,000-2,000 target); 0.50 gave 3,183 (too loose — that's how the
+# gating, bar 0.53 yields ~2,000 pre-damp posts; 0.50 gave 3,183 (too loose — that's how the
 # table bloated to 3,303), 0.55 cut the canonical Jul-2019 bitcoin tweet
 # (gated signal 0.538). Checkpoints: Emir-Iran 0.876 in, bitcoin 0.538 in,
 # Israel-Fiji embassy fluff 0.242 out, 2017 'vaccine' posts gated to ~0.
