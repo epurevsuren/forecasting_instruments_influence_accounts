@@ -977,6 +977,15 @@ def main():
         for _i, _n in enumerate(('gemma_pos', 'gemma_neg', 'gemma_sent')):
             if _n in use_nlp:
                 X_nlp[:, use_nlp.index(_n)] = _sent[:, _i]
+    # GEMMA ANALYST features are not stored in posts_scored — fill them from
+    # the gemma3_analyst_v1 cache (generating any missing posts, checkpointed)
+    _acols = [c for c in use_nlp if c.startswith('analyst_')]
+    if _acols:
+        import gemma_analyst as GA
+        _pids = (df['platform'] + '_' + df['id'].astype(str)).tolist()
+        _A = GA.analyst_features(_pids, df['text'].tolist())
+        for _c in _acols:
+            X_nlp[:, use_nlp.index(_c)] = _A[:, GA.ANALYST_COLS.index(_c)]
     X_emb = PR.project_emb(X_emb, cfg)   # PCA projection if model was trained compressed
     X = np.hstack([X_emb, X_nlp])
     print(f"\n  Feature matrix: {X.shape} "

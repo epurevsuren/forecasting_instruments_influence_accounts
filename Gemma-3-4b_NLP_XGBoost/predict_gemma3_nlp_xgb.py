@@ -701,6 +701,13 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     if _sent is not None:   # inject canonical gemma sentiment features
         feats['gemma_pos'], feats['gemma_neg'], feats['gemma_sent'] = \
             (float(v) for v in _sent[0])
+    # GEMMA ANALYST features: when the model set was trained with them,
+    # Gemma READS this post live and its 23-impact view joins the features.
+    if any(c.startswith('analyst_') for c in cfg['nlp_features']):
+        import gemma_analyst as GA
+        _a = GA.analyze_texts([text])[0]
+        for _i, _c in enumerate(GA.ANALYST_COLS):
+            feats[_c] = float(_a[_i])
     nlp_vec = np.array([[float(feats.get(c, 0.0)) for c in cfg['nlp_features']]])
     X = np.hstack([project_emb(emb, cfg), nlp_vec])
 

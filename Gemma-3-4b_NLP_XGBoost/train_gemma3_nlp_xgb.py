@@ -191,6 +191,22 @@ def main():
     X_emb = np.vstack([cache[pid] for pid in platform_ids])
 
     # ------------------------------------------------------------------
+    # GEMMA ANALYST (2026-07-17, Peter: "Gemma must READ and ANALYZE the
+    # text; NLP should just suggest scoring"): Gemma generates a per-post
+    # 23-instrument impact JSON (his train_stack_xgb.py stacking idea, now
+    # on the honest chronological pipeline). The 23 analyst numbers become
+    # first-class features — XGBoost learns when to trust the analyst,
+    # when the NLP score, and how to correct the analyst's biases.
+    # Cached in gemma3_analyst_v1 (generation runs once per post, ever).
+    # ------------------------------------------------------------------
+    import gemma_analyst as GA
+    A = GA.analyst_features(platform_ids, df['text'].tolist())
+    X_nlp = np.hstack([X_nlp, A.astype(np.float32)])
+    use_nlp = list(use_nlp) + GA.ANALYST_COLS
+    print(f"  🧠 Analyst features joined: +{len(GA.ANALYST_COLS)} cols "
+          f"(nonzero on {(np.abs(A).sum(axis=1) > 0).mean():.0%} of posts)")
+
+    # ------------------------------------------------------------------
     # gemma SENTIMENT HEAD (2026-07-16): use gemma the way it was
     # DESIGNED (Araci 2019; ProsusAI/gemma = classifier fine-tuned on the
     # Financial PhraseBank): 3-class sentiment PROBABILITIES, canonical
