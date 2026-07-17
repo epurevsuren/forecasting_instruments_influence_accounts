@@ -26,7 +26,7 @@ uv run python build_final_training_set.py --full
 
 # 7+8. Train models (re-embeds all posts once — the slow step)
 cd ..\Gemma-3-4b_NLP_XGBoost
- & "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe" train_gemma3_nlp_xgb.py
+uv run python train_gemma3_nlp_xgb.py
 
 # 9. Direction backtest over the full window (until = now, NY time)
 .\run_backtest.bat 202607110000 --from 201611010000
