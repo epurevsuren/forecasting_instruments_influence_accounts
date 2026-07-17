@@ -33,19 +33,26 @@ GEN_BATCH  = int(os.environ.get("GEMMA_ANALYST_BATCH", "4"))
 THROTTLE_S = float(os.environ.get("GEMMA_ANALYST_THROTTLE", "0"))
 CHECKPOINT_EVERY = 100
 
-INSTRUMENTS = [
-    'SPY','QQQ','DIA','XLI','XLF','XLE','VIX',
-    'OIL','GOLD','COPPER','NATGAS',
-    'EUR_USD','USD_JPY','GBP_USD','USD_CNY','USD_CAD','USD_MXN','USD_CHF','AUD_USD',
-    'US10Y','US2Y','BTC','ETH',
-]
+# Instruments + caps come from THE MASTER REGISTRY (DP/instruments.json) —
+# never hardcoded. Registry order defines the ANALYST_COLS feature order,
+# identical everywhere (train loads INSTRUMENTS from the same file, so the
+# columns always line up). impact_cap is Peter's per-instrument label cap —
+# the analyst's JSON output is clipped to the same bounds as training
+# labels, so an LLM hallucination ("BTC +50%") can't poison a feature.
+# NOTE for cTrader integration: caps/impacts here are PERCENT moves; the
+# pip/lot conversion happens ONLY in Layer 3 via the registry's "ctrader"
+# blocks (pip_position, lot_size, leverage) + ctrader_bridge — FX percent
+# moves are small but at 30:1 class leverage a 0.2% move is a 6% margin
+# return, which is why FX must never be filtered or capped by raw percent
+# thresholds borrowed from equities.
+_INSTRUMENTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "DP", "instruments.json")
+with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
+    _REG = json.load(_f)["instruments"]
+INSTRUMENTS  = list(_REG.keys())
 ANALYST_COLS = [f"analyst_{i}" for i in INSTRUMENTS]
 _KEYS = [f"{i}_Impact" for i in INSTRUMENTS]
-# sanity caps per instrument class (same spirit as the training IMPACT_CAP)
-_CAPS = {**{i: 3.0 for i in ('SPY','QQQ','DIA','XLI','XLF','XLE')},
-         'VIX': 20.0, 'OIL': 8.0, 'GOLD': 5.0, 'COPPER': 5.0, 'NATGAS': 10.0,
-         **{i: 2.5 for i in INSTRUMENTS if '_' in i},
-         'US10Y': 8.0, 'US2Y': 8.0, 'BTC': 10.0, 'ETH': 12.0}
+_CAPS = {i: float(v.get("impact_cap", 5.0)) for i, v in _REG.items()}
 
 SYSTEM_PROMPT = """You are an expert financial analyst who predicts how political/geopolitical social-media posts move markets within one hour of posting.
 
@@ -70,9 +77,15 @@ Cause-and-effect patterns:
 Read the post's MEANING, not just keywords. A post about CANCELLING an attack is de-escalation (calming), even though it mentions "attack" and "military". Distinguish genuine policy actions from political noise. Most routine posts should be near 0 for every instrument.
 
 Respond with ONLY a JSON object (no other text) giving the predicted percentage move for each instrument, using these exact keys:
-{"SPY_Impact":0.0,"QQQ_Impact":0.0,"DIA_Impact":0.0,"XLI_Impact":0.0,"XLF_Impact":0.0,"XLE_Impact":0.0,"VIX_Impact":0.0,"OIL_Impact":0.0,"GOLD_Impact":0.0,"COPPER_Impact":0.0,"NATGAS_Impact":0.0,"EUR_USD_Impact":0.0,"USD_JPY_Impact":0.0,"GBP_USD_Impact":0.0,"USD_CNY_Impact":0.0,"USD_CAD_Impact":0.0,"USD_MXN_Impact":0.0,"USD_CHF_Impact":0.0,"AUD_USD_Impact":0.0,"US10Y_Impact":0.0,"US2Y_Impact":0.0,"BTC_Impact":0.0,"ETH_Impact":0.0}
+__JSON_TEMPLATE__
 
 Positive = price up, negative = price down. Typical ranges: stocks ±2%, VIX ±15%, oil ±5%, gold ±3%, FX ±1.5%, yields ±6%, crypto ±8%. Routine posts ≈ 0."""
+
+# exact-keys template generated FROM THE REGISTRY so adding an instrument to
+# instruments.json flows into the analyst prompt with no code edit
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "__JSON_TEMPLATE__",
+    "{" + ",".join(f'"{k}":0.0' for k in _KEYS) + "}")
 
 
 def _get_model():
