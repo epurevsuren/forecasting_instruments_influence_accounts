@@ -73,11 +73,14 @@ USAGE
   uv run python backtest_simulator.py 202606140900 --from 202605010000
   uv run python backtest_simulator.py 202606140900 --from 202606130900 --fine-tune
 """
+import os
+# FA2 install is broken in this venv — tell unsloth to go straight to
+# Xformers instead of probing FA2 and warning (same speed either way).
+os.environ.setdefault("UNSLOTH_FORCE_XFORMERS", "1")
 try:
     import unsloth  # noqa: F401 — must import BEFORE transformers for its patches
 except ImportError:
     pass
-import os
 import sys
 import json
 import shutil

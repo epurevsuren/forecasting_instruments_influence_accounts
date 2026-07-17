@@ -10,11 +10,15 @@ commentary, event-window domain gating) and magnitude calibration included.
 Requires signal_scorer.py (shim) + gemma_embedder.py in this folder.
 Run:  uv run python predict_gemma3_nlp_xgb.py
 """
+import os
+# FA2 install is broken in this venv — tell unsloth to go straight to
+# Xformers instead of probing FA2 and warning (same speed either way).
+os.environ.setdefault("UNSLOTH_FORCE_XFORMERS", "1")
 try:
     import unsloth  # noqa: F401 — must import BEFORE transformers for its patches
 except ImportError:
     pass
-import os, re, json, argparse, datetime
+import re, json, argparse, datetime
 import numpy as np
 import pandas as pd
 import torch

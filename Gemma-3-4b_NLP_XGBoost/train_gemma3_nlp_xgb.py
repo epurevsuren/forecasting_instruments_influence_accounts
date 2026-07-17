@@ -15,11 +15,15 @@ Outputs: gemma3_nlp_xgb_models/ (XGBoost model jsons + config.json + emb_pca.npz
 Run:     uv run python train_gemma3_nlp_xgb.py
          (first run embeds ~190k posts with Gemma — hours, one-time cache)
 """
+import os
+# FA2 install is broken in this venv — tell unsloth to go straight to
+# Xformers instead of probing FA2 and warning (same speed either way).
+os.environ.setdefault("UNSLOTH_FORCE_XFORMERS", "1")
 try:
     import unsloth  # noqa: F401 — must import BEFORE transformers for its patches
 except ImportError:
     pass
-import os, json
+import json
 import numpy as np
 import pandas as pd
 import torch
