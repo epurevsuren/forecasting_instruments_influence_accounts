@@ -986,7 +986,9 @@ def main():
     if _acols:
         import gemma_analyst as GA
         _pids = (df['platform'] + '_' + df['id'].astype(str)).tolist()
-        _A = GA.analyst_features(_pids, df['text'].tolist())
+        _A = GA.analyst_features(
+            _pids, df['text'].tolist(),
+            accounts=df['account'].tolist() if 'account' in df.columns else None)
         for _c in _acols:
             X_nlp[:, use_nlp.index(_c)] = _A[:, GA.ANALYST_COLS.index(_c)]
     X_emb = PR.project_emb(X_emb, cfg)   # PCA projection if model was trained compressed

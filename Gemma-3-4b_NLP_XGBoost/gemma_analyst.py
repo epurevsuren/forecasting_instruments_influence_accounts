@@ -53,6 +53,11 @@ INSTRUMENTS  = list(_REG.keys())
 ANALYST_COLS = [f"analyst_{i}" for i in INSTRUMENTS]
 _KEYS = [f"{i}_Impact" for i in INSTRUMENTS]
 _CAPS = {i: float(v.get("impact_cap", 5.0)) for i, v in _REG.items()}
+# cTrader class leverage per instrument (registry) — the live display ranks
+# calls by MARGIN-RELATIVE return (|pred%| x leverage): a 0.2% EUR_USD move
+# at 30:1 (=6% margin) outranks a 3% VIX move at low class leverage. Same
+# ranking Layer 3 uses for burst allocation.
+_LEV = {i: float(v.get("ctrader", {}).get("leverage", 10)) for i, v in _REG.items()}
 
 SYSTEM_PROMPT = """You are an expert financial analyst who predicts how political/geopolitical social-media posts move markets within one hour of posting.
 
@@ -164,8 +169,9 @@ def _gen_batch(texts, tok, model, dev):
     return vecs
 
 
-def analyze_texts(texts):
-    """Gemma READS each post and returns (n, 23) predicted impacts.
+def analyze_texts(texts, meta=None):
+    """Gemma READS each post and returns (n, len(INSTRUMENTS)) impacts.
+    `meta` (optional): account names aligned with `texts`, for the live log.
     Falls back to one-post-at-a-time if a batch fails — a single bad post
     can't kill an hours-long cached run."""
     import time
@@ -178,13 +184,20 @@ def analyze_texts(texts):
         batch = [str(t)[:2000] for t in texts[i:i + GEN_BATCH]]
         try:
             vecs = _gen_batch(batch, tok, model, dev)
-            # LIVE: what the analyst just read + its headline call
-            for _t, _v in zip(batch, vecs):
-                _top = np.argsort(-np.abs(_v))[:2]
-                _call = ", ".join(f"{INSTRUMENTS[o]} {_v[o]:+.1f}%"
-                                  for o in _top if abs(_v[o]) >= 0.05) or "flat"
-                _snip = re.sub(r"\s+", " ", str(_t))[:72]
-                print(f"    🧠 {_snip!r} -> {_call}")
+            # LIVE: account + FULL post text, calls ranked by MARGIN-RELATIVE
+            # return (|pred%| x class leverage from the registry) — what is
+            # most TRADEABLE, not what has the biggest raw percent.
+            for _k, (_t, _v) in enumerate(zip(batch, vecs)):
+                _mret = np.array([abs(_v[o]) * _LEV.get(INSTRUMENTS[o], 10.0)
+                                  for o in range(len(_v))])
+                _top = np.argsort(-_mret)[:3]
+                _call = ", ".join(
+                    f"{INSTRUMENTS[o]} {_v[o]:+.2f}% (≈{_v[o] * _LEV.get(INSTRUMENTS[o], 10.0):+.0f}% margin)"
+                    for o in _top if _mret[o] >= 1.0) or "flat"
+                _who = f"@{meta[i + _k]}  " if meta is not None and meta[i + _k] else ""
+                _txt = re.sub(r"\s+", " ", str(_t)).strip()
+                print(f"    🧠 {_who}{_txt}")
+                print(f"       → {_call}")
             results.extend(vecs)
         except Exception as e:                            # noqa: BLE001
             print(f"  ⚠️  batch generate failed ({type(e).__name__}: {str(e)[:80]}) "
@@ -198,9 +211,10 @@ def analyze_texts(texts):
     return np.vstack(results)
 
 
-def analyst_features(platform_ids, texts):
-    """(n, 23) analyst impact features, cache-first with incremental
-    checkpoints (a crash never loses generated work)."""
+def analyst_features(platform_ids, texts, accounts=None):
+    """(n, len(INSTRUMENTS)) analyst impact features, cache-first with
+    incremental checkpoints (a crash never loses generated work).
+    `accounts` (optional): account names for the live log."""
     cached = db.read_table(ANALYST_TABLE)
     cache = {}
     if cached is not None and 'platform_id' in cached.columns:
@@ -216,7 +230,9 @@ def analyst_features(platform_ids, texts):
             part = missing[c0:c0 + CHECKPOINT_EVERY]
             print(f"  🗂️  analyzing posts {c0 + 1}-{min(c0 + len(part), len(missing))} "
                   f"of {len(missing)}...")
-            preds = analyze_texts([texts[i] for i in part])
+            preds = analyze_texts(
+                [texts[i] for i in part],
+                meta=[accounts[i] for i in part] if accounts is not None else None)
             rows = []
             for j, i in enumerate(part):
                 cache[platform_ids[i]] = preds[j]
