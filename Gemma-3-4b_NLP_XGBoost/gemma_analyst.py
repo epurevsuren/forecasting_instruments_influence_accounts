@@ -169,9 +169,43 @@ def _gen_batch(texts, tok, model, dev):
     return vecs
 
 
-def analyze_texts(texts, meta=None):
+_NY_TZ = "America/New_York"
+
+
+def _fmt_dt(d):
+    """Post datetime -> 'YYYY-MM-DD HH:MM' shown in the ORIGINAL New York
+    timezone — NEVER UTC. Posts are NY-time by origin; the pipeline may carry a
+    UTC-typed copy for sorting, so a tz-aware value is put back to NY for the
+    log (a tz-naive value is already NY and shown as-is). '' if unknown."""
+    if d is None:
+        return ""
+    try:
+        ts = pd.Timestamp(d)
+        if ts.tz is not None:
+            ts = ts.tz_convert(_NY_TZ)      # recover the original NY wall time (never UTC)
+        return ts.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(d)
+
+
+def _platform_emoji(platform):
+    """Per-post log marker representing the SOURCE PLATFORM: 🐦 X/Twitter,
+    𝐓 Truth Social (falls back to • if unknown)."""
+    p = str(platform).strip().lower()
+    if p == "truthsocial":
+        return "𝐓"
+    if p in ("x_twitter", "twitter", "x"):
+        return "🐦"
+    return "•"
+
+
+def analyze_texts(texts, meta=None, dates=None, platforms=None):
     """Gemma READS each post and returns (n, len(INSTRUMENTS)) impacts.
     `meta` (optional): account names aligned with `texts`, for the live log.
+    `dates` (optional): post datetimes aligned with `texts`, shown right after
+    the account name in the live log.
+    `platforms` (optional): source platform aligned with `texts` — sets the
+    per-post log emoji (🐦 X/Twitter, 𝐓 Truth Social).
     Falls back to one-post-at-a-time if a batch fails — a single bad post
     can't kill an hours-long cached run."""
     import time
@@ -194,9 +228,13 @@ def analyze_texts(texts, meta=None):
                 _call = ", ".join(
                     f"{INSTRUMENTS[o]} {_v[o]:+.2f}% (≈{_v[o] * _LEV.get(INSTRUMENTS[o], 10.0):+.0f}% margin)"
                     for o in _top if _mret[o] >= 1.0) or "flat"
-                _who = f"@{meta[i + _k]}  " if meta is not None and meta[i + _k] else ""
-                _txt = re.sub(r"\s+", " ", str(_t)).strip()
-                print(f"    🧠 {_who}{_txt}")
+                _emoji = _platform_emoji(platforms[i + _k]) if platforms is not None else "•"
+                _who  = f"@{meta[i + _k]}  " if meta is not None and meta[i + _k] else ""
+                _when = f"{_fmt_dt(dates[i + _k])}  " if dates is not None else ""
+                # FULL post text (context) from the ORIGINAL, untruncated text —
+                # NOT the [:2000] generation slice; the whole post, no "..." cut.
+                _txt  = re.sub(r"\s+", " ", str(texts[i + _k])).strip()
+                print(f"    {_emoji} {_who}{_when}{_txt}")
                 print(f"       → {_call}")
             results.extend(vecs)
         except Exception as e:                            # noqa: BLE001
@@ -211,10 +249,11 @@ def analyze_texts(texts, meta=None):
     return np.vstack(results)
 
 
-def analyst_features(platform_ids, texts, accounts=None):
+def analyst_features(platform_ids, texts, accounts=None, dates=None):
     """(n, len(INSTRUMENTS)) analyst impact features, cache-first with
     incremental checkpoints (a crash never loses generated work).
-    `accounts` (optional): account names for the live log."""
+    `accounts` / `dates` (optional): account names + post datetimes for the
+    live log (datetime is printed right after the account name)."""
     cached = db.read_table(ANALYST_TABLE)
     cache = {}
     if cached is not None and 'platform_id' in cached.columns:
@@ -232,7 +271,11 @@ def analyst_features(platform_ids, texts, accounts=None):
                   f"of {len(missing)}...")
             preds = analyze_texts(
                 [texts[i] for i in part],
-                meta=[accounts[i] for i in part] if accounts is not None else None)
+                meta=[accounts[i] for i in part] if accounts is not None else None,
+                dates=[dates[i] for i in part] if dates is not None else None,
+                # platform for the log emoji, from the 'platform_id' prefix
+                # ('x_twitter_123' -> 'x_twitter', 'truthsocial_456' -> 'truthsocial')
+                platforms=[str(platform_ids[i]).rsplit("_", 1)[0] for i in part])
             rows = []
             for j, i in enumerate(part):
                 cache[platform_ids[i]] = preds[j]

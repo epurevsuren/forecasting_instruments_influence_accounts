@@ -206,7 +206,8 @@ def main():
     import gemma_analyst as GA
     A = GA.analyst_features(
         platform_ids, df['text'].tolist(),
-        accounts=df['account'].tolist() if 'account' in df.columns else None)
+        accounts=df['account'].tolist() if 'account' in df.columns else None,
+        dates=df['date'].tolist() if 'date' in df.columns else None)
     X_nlp = np.hstack([X_nlp, A.astype(np.float32)])
     use_nlp = list(use_nlp) + GA.ANALYST_COLS
     print(f"  🧠 Analyst features joined: +{len(GA.ANALYST_COLS)} cols "
