@@ -21,6 +21,18 @@ import json
 import numpy as np
 import pandas as pd
 
+# Optional rich coloring for the live analyst log (account = blue, date = purple,
+# instrument moves = green/red by direction). Degrades to plain print if rich is
+# not installed — the pipeline never depends on it.
+try:
+    from rich.console import Console as _RichConsole
+    from rich.markup import escape as _rescape
+    _console = _RichConsole(highlight=False)
+except Exception:                                       # rich not installed
+    _console = None
+    def _rescape(s):
+        return s
+
 import db                      # folder-local shim -> ../database.db
 import gemma_embedder as GE    # shares the loaded 4-bit model
 
@@ -222,20 +234,41 @@ def analyze_texts(texts, meta=None, dates=None, platforms=None):
             # return (|pred%| x class leverage from the registry) — what is
             # most TRADEABLE, not what has the biggest raw percent.
             for _k, (_t, _v) in enumerate(zip(batch, vecs)):
-                _mret = np.array([abs(_v[o]) * _LEV.get(INSTRUMENTS[o], 10.0)
-                                  for o in range(len(_v))])
-                _top = np.argsort(-_mret)[:3]
-                _call = ", ".join(
-                    f"{INSTRUMENTS[o]} {_v[o]:+.2f}% (≈{_v[o] * _LEV.get(INSTRUMENTS[o], 10.0):+.0f}% margin)"
-                    for o in _top if _mret[o] >= 1.0) or "flat"
+                # calls ranked by MARGIN-RELATIVE return (|pred%| x class leverage)
+                _mret  = np.array([abs(_v[o]) * _LEV.get(INSTRUMENTS[o], 10.0)
+                                   for o in range(len(_v))])
+                _top   = [o for o in np.argsort(-_mret)[:3] if _mret[o] >= 1.0]
                 _emoji = _platform_emoji(platforms[i + _k]) if platforms is not None else "•"
-                _who  = f"@{meta[i + _k]}  " if meta is not None and meta[i + _k] else ""
-                _when = f"{_fmt_dt(dates[i + _k])}  " if dates is not None else ""
+                _acct  = meta[i + _k]  if meta  is not None else None
+                _when  = _fmt_dt(dates[i + _k]) if dates is not None else ""
                 # FULL post text (context) from the ORIGINAL, untruncated text —
                 # NOT the [:2000] generation slice; the whole post, no "..." cut.
-                _txt  = re.sub(r"\s+", " ", str(texts[i + _k])).strip()
-                print(f"    {_emoji} {_who}{_when}{_txt}")
-                print(f"       → {_call}")
+                _txt   = re.sub(r"\s+", " ", str(texts[i + _k])).strip()
+
+                if _console is not None:
+                    # account = blue, date = purple; escape user text so its
+                    # brackets aren't parsed as rich markup.
+                    _who = f"[bold blue]@{_rescape(str(_acct))}[/]  " if _acct else ""
+                    _dt  = f"[magenta]{_rescape(_when)}[/]  " if _when else ""
+                    _console.print(f"    {_emoji} {_who}{_dt}{_rescape(_txt)}", soft_wrap=True)
+                    if _top:                        # each move green (up) / red (down)
+                        _parts = []
+                        for o in _top:
+                            _clr = "green" if _v[o] > 0 else ("red" if _v[o] < 0 else "white")
+                            _lev = _LEV.get(INSTRUMENTS[o], 10.0)
+                            _parts.append(f"[{_clr}]{INSTRUMENTS[o]} {_v[o]:+.2f}% "
+                                          f"(≈{_v[o] * _lev:+.0f}% margin)[/]")
+                        _console.print("       → " + ", ".join(_parts), soft_wrap=True)
+                    else:
+                        _console.print("       → [dim]flat[/]", soft_wrap=True)
+                else:                               # plain fallback (rich not installed)
+                    _who  = f"@{_acct}  " if _acct else ""
+                    _dt   = f"{_when}  " if _when else ""
+                    _call = ", ".join(
+                        f"{INSTRUMENTS[o]} {_v[o]:+.2f}% (≈{_v[o] * _LEV.get(INSTRUMENTS[o], 10.0):+.0f}% margin)"
+                        for o in _top) or "flat"
+                    print(f"    {_emoji} {_who}{_dt}{_txt}")
+                    print(f"       → {_call}")
             results.extend(vecs)
         except Exception as e:                            # noqa: BLE001
             print(f"  ⚠️  batch generate failed ({type(e).__name__}: {str(e)[:80]}) "
