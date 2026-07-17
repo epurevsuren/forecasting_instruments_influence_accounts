@@ -1,7 +1,7 @@
 {
   "_comment": "Dynamic config for signal_scorer. Edit keywords here — no code changes needed. Used IDENTICALLY by training and prediction so features always match.",
-  "version": "2.0",
-  "_version_note": "2.0 = era extension for 2016-2026 back-simulation (45th/46th/47th presidencies): crypto policy, COVID/public health, QE/zero-rate, NK crisis, 2018 trade war vocabulary.",
+  "version": "2.1",
+  "_version_note": "2.1 = exogenous-shock extension: natural disasters (tsunami/earthquake), terror attacks, and armed invasions/conflict, each with its COUNTERACTION captured (disaster -> initial risk-off, then repatriation/emergency-relief reversal e.g. USD_JPY yen back up; invasion -> escalation, then ceasefire de-escalation). Keywords are DB-grounded on unified_feed and use specific multi-word phrases to avoid the metaphorical noise found there ('cultural invasion', 'gravytsunami' handle, economic 'recovery/relief', bare 'ied'). 2.0 = era extension for 2016-2026 back-simulation (45th/46th/47th presidencies): crypto policy, COVID/public health, QE/zero-rate, NK crisis, 2018 trade war vocabulary.",
   "policy_verbs": [
     "raise", "cut", "delay", "increase", "reduce", "ban", "lift", "sign", "pause",
     "cancel", "approve", "block", "tax", "tariff", "subsidize", "sanction", "negotiate",
@@ -17,7 +17,8 @@
   "_geo_terms_note": "DIRECTION AUDIT: geopolitical_terms feeds hawkish_risk_score, so it may contain ONLY escalatory/war-direction words. Peace-direction words (ceasefire, summit, denuclearization) live in flag_peace_deescalation; macro-domain words (pandemic, stimulus, inflation, bailout...) live in their domain flags feeding macro_risk_score — putting them here inflated hawkish for COVID/Fed posts (wrong direction).",
   "geopolitical_terms": [
     "war", "attack", "missile", "military", "sanction", "tariff", "conflict",
-    "blockade", "nuclear", "invasion", "airstrike", "escalation", "brexit"
+    "blockade", "nuclear", "invasion", "airstrike", "escalation", "brexit",
+    "incursion", "insurgency", "coup"
   ],
   "policy_flags": {
     "flag_peace_deescalation": [
@@ -44,7 +45,10 @@
     ],
     "flag_stimulus": [
       "stimulus", "relief", "spending", "package", "bailout", "infrastructure",
-      "funding", "budget deal", "treasury support"
+      "funding", "budget deal", "treasury support",
+      "disaster relief", "emergency relief", "relief efforts", "reconstruction",
+      "rebuilding effort", "repatriation", "humanitarian aid", "aid package",
+      "recovery fund", "reconstruction fund"
     ],
     "flag_tariff_trade": [
       "tariff", "reciprocal tariff", "trade war", "china", "beijing", "import tax",
@@ -87,6 +91,25 @@
       "crown prince", "nuclear", "secretary of war", "joint chiefs", "assault", "hegseth",
       "north korea", "kim jong un", "rocket man", "fire and fury", "syria",
       "isis", "soleimani", "afghanistan", "kabul", "withdrawal of troops"
+    ],
+    "_event_flags_note": "EXOGENOUS SHOCKS (v2.1). Multi-word/specific keywords ONLY — unified_feed showed bare words are noisy: 'invasion' -> 'cultural invasion', 'tsunami' -> '@gravytsunami'/'National Preparedness Month', 'kidnap' -> local news, 'ied' -> 4577 false hits, 'relief/recovery' -> economic. Disaster+terror route to macro_risk_score (risk-off/safe-haven, non-trade-war); armed_conflict routes to hawkish_risk_score (war escalation). The COUNTERACTION is captured by flag_stimulus (emergency relief/repatriation/reconstruction = the reversal, e.g. yen back up) and flag_peace_deescalation (ceasefire = conflict reversal).",
+    "flag_natural_disaster": [
+      "earthquake", "quake", "magnitude", "richter", "tsunami", "typhoon",
+      "hurricane", "cyclone", "volcanic eruption", "wildfire", "flooding",
+      "flash flood", "landslide", "natural disaster", "disaster area",
+      "evacuation order", "aftershock", "storm surge"
+    ],
+    "flag_terror_attack": [
+      "suicide bomb", "suicide bombing", "car bomb", "terrorist attack",
+      "terror attack", "bombing", "mass shooting", "massacre", "hostages",
+      "taken hostage", "kidnapped", "abducted", "assassination", "assassinated",
+      "beheading", "hijacking", "gunman", "explosion", "detonated"
+    ],
+    "flag_armed_conflict": [
+      "full-scale invasion", "military invasion", "invaded", "ground offensive",
+      "ground assault", "incursion", "annexation", "annexed", "military occupation",
+      "seized the capital", "cross-border attack", "declared war", "storming",
+      "shelling", "airstrikes on"
     ],
     "flag_energy_policy": [
       "oil", "gas", "drilling", "pipeline", "strategic petroleum reserve", "spr",
@@ -138,7 +161,11 @@
     "quantitative easing zero interest rates money printing federal reserve",
     "north korea nuclear missile test summit denuclearization",
     "bank failure deposit guarantee bailout financial crisis",
-    "inflation surge consumer prices gas prices strategic petroleum reserve"
+    "inflation surge consumer prices gas prices strategic petroleum reserve",
+    "major earthquake and tsunami strike Japan disrupting factories and supply chains, yen falls then rallies as insurers repatriate capital and emergency relief flows home",
+    "suicide bombing terrorist attack in a major city triggers risk-off, VIX spikes, flight to safety into gold and government bonds while equities and risk currencies fall",
+    "full-scale military invasion as troops cross the border escalates into war, oil and gold spike, safe-haven demand rises then eases if a ceasefire and de-escalation follow",
+    "government announces disaster relief reconstruction and humanitarian aid package, domestic recovery and rebuilding effort strengthen the currency after the initial shock"
   ],
   "noise_refs": [
     "I endorse congressman running for re-election great patriot",
@@ -146,7 +173,13 @@
     "happy birthday wonderful person god bless America",
     "rally in state tremendous crowd amazing supporters",
     "thank you for the kind words great patriot America first",
-    "incredible representative of the great people of the state"
+    "incredible representative of the great people of the state",
+    "counter-terror hostage rescue drill and joint military exercise, bomb disposal training simulation practicing home front defense",
+    "National Preparedness Month reminder about disaster preparedness and earthquake safety, disasters do not plan ahead so have a plan",
+    "the cultural invasion is more dangerous than military threats, a tsunami of misinformation and a wave of change sweeping the nation",
+    "on the anniversary we remember the victims of the embassy bombing and commemorate those lost in the terror attack, we will never forget",
+    "local hero fought off kidnappers and a brave officer was honored for the rescue, greetings to the disaster response team on their raising day",
+    "upskirting is an invasion of privacy that leaves victims feeling degraded and distressed, the online harassment bill"
   ],
   "fallback_financial_keywords": [
     "tariff", "iran", "nuclear", "military", "attack", "deal", "sanction",

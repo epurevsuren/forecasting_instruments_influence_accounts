@@ -237,6 +237,7 @@ def compute_composite_scores(df):
     df["hawkish_risk_score"] = (
         df.get("flag_tariff_trade", 0) + df.get("flag_sanctions", 0)
         + df.get("flag_war_geopolitics", 0) + df.get("flag_supply_chain", 0)
+        + df.get("flag_armed_conflict", 0)  # v2.1: invasion/incursion = war escalation
         + df["num_geopolitical_terms"]
     )
     df["growth_policy_score"] = (
@@ -256,6 +257,11 @@ def compute_composite_scores(df):
     # clear the gate alone.
     df["macro_risk_score"] = (
         4 * df.get("flag_crypto_policy", 0) + 4 * df.get("flag_public_health", 0)
+        # v2.1: exogenous shocks are single-flag risk-off domains (safe-haven /
+        # supply disruption / repatriation) — x4 like crypto/health so a pure
+        # disaster or terror post clears the gate ALONE instead of dying at
+        # hawkish=0 (same fix the crypto/COVID note above documents).
+        + 4 * df.get("flag_natural_disaster", 0) + 4 * df.get("flag_terror_attack", 0)
         + 2 * df.get("flag_interest_rate", 0) + 2 * df.get("flag_financial_system", 0)
         + df.get("flag_stimulus", 0) + df.get("flag_tax_policy", 0)
         + df.get("flag_energy_policy", 0) + df.get("flag_ai_chip_policy", 0)
