@@ -26,7 +26,11 @@ import gemma_embedder as GE    # shares the loaded 4-bit model
 
 ANALYST_TABLE = "gemma3_analyst_v1"
 MAX_NEW_TOKENS = 320
-GEN_BATCH = 4
+# Full speed by default (the Razer handles its own thermals; the earlier
+# freeze was Razer Synapse, not heat). Env knobs remain for emergencies:
+# GEMMA_ANALYST_THROTTLE=0.5 adds a cooldown between batches.
+GEN_BATCH  = int(os.environ.get("GEMMA_ANALYST_BATCH", "4"))
+THROTTLE_S = float(os.environ.get("GEMMA_ANALYST_THROTTLE", "0"))
 CHECKPOINT_EVERY = 100
 
 INSTRUMENTS = [
@@ -73,6 +77,15 @@ Positive = price up, negative = price down. Typical ranges: stocks ±2%, VIX ±1
 
 def _get_model():
     tok, model = GE._load_gemma()
+    # unsloth fast-inference kernels for generation (~2x) — no-op elsewhere
+    if not getattr(model, "_fast_inference_on", False):
+        try:
+            from unsloth import FastModel
+            FastModel.for_inference(model)
+            model._fast_inference_on = True
+            print("  ⚡ unsloth fast-inference enabled for generation")
+        except Exception:
+            pass
     lora = os.environ.get("GEMMA_ANALYST_LORA")
     if lora and not getattr(model, "_analyst_lora_loaded", False):
         try:
@@ -105,32 +118,70 @@ def _parse_json(text):
     return out
 
 
-def analyze_texts(texts):
-    """Gemma READS each post and returns (n, 23) predicted impacts."""
+def _gen_batch(texts, tok, model, dev):
+    """One padded generation batch -> list of parsed (23,) vectors."""
     import torch
-    tok, model = _get_model()
-    dev = next(model.parameters()).device
-    _pad_side = tok.padding_side
-    tok.padding_side = "left"   # decoder batch generation REQUIRES left padding
-    results = []
-    for i in range(0, len(texts), GEN_BATCH):
-        batch = [str(t)[:2000] for t in texts[i:i + GEN_BATCH]]
-        prompts = [tok.apply_chat_template(
-            [{"role": "system", "content": SYSTEM_PROMPT},
-             {"role": "user", "content": t}],
-            tokenize=False, add_generation_prompt=True) for t in batch]
-        enc = tok(prompts, return_tensors="pt", padding=True,
-                  truncation=True, max_length=1024).to(dev)
+    # BYPASS the (unsloth-patched, multimodal) processor: its __call__ drops
+    # the padding request with left padding -> ragged tensors ("expected
+    # sequence of length 762 ... got 761"). The underlying TEXT tokenizer
+    # pads reliably and model.generate takes input_ids/attention_mask.
+    _t = getattr(tok, "tokenizer", tok)
+    prompts = [_t.apply_chat_template(
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": t}],
+        tokenize=False, add_generation_prompt=True) for t in texts]
+    _side = _t.padding_side
+    _t.padding_side = "left"    # decoder batch generation REQUIRES left padding
+    try:
+        enc = _t(prompts, return_tensors="pt", padding=True,
+                 truncation=True, max_length=1024,
+                 add_special_tokens=False)   # chat template already added <bos>
+        enc = {k: v.to(dev) for k, v in enc.items()}
         with torch.inference_mode():
             out = model.generate(**enc, max_new_tokens=MAX_NEW_TOKENS,
                                  do_sample=False, temperature=None, top_p=None,
-                                 pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        for b in range(len(batch)):
-            gen = tok.decode(out[b][enc['input_ids'].shape[1]:],
-                             skip_special_tokens=True)
-            vec = _parse_json(gen)
-            results.append(vec if vec is not None else np.zeros(len(_KEYS), dtype=np.float32))
-    tok.padding_side = _pad_side
+                                 pad_token_id=_t.pad_token_id or _t.eos_token_id)
+    finally:
+        _t.padding_side = _side
+    vecs = []
+    for b in range(len(texts)):
+        gen = _t.decode(out[b][enc['input_ids'].shape[1]:], skip_special_tokens=True)
+        v = _parse_json(gen)
+        vecs.append(v if v is not None else np.zeros(len(_KEYS), dtype=np.float32))
+    return vecs
+
+
+def analyze_texts(texts):
+    """Gemma READS each post and returns (n, 23) predicted impacts.
+    Falls back to one-post-at-a-time if a batch fails — a single bad post
+    can't kill an hours-long cached run."""
+    import time
+    tok, model = _get_model()
+    dev = next(model.parameters()).device
+    results = []
+    for i in range(0, len(texts), GEN_BATCH):
+        if THROTTLE_S > 0 and i > 0:
+            time.sleep(THROTTLE_S)   # thermal cooldown between batches
+        batch = [str(t)[:2000] for t in texts[i:i + GEN_BATCH]]
+        try:
+            vecs = _gen_batch(batch, tok, model, dev)
+            # LIVE: what the analyst just read + its headline call
+            for _t, _v in zip(batch, vecs):
+                _top = np.argsort(-np.abs(_v))[:2]
+                _call = ", ".join(f"{INSTRUMENTS[o]} {_v[o]:+.1f}%"
+                                  for o in _top if abs(_v[o]) >= 0.05) or "flat"
+                _snip = re.sub(r"\s+", " ", str(_t))[:72]
+                print(f"    🧠 {_snip!r} -> {_call}")
+            results.extend(vecs)
+        except Exception as e:                            # noqa: BLE001
+            print(f"  ⚠️  batch generate failed ({type(e).__name__}: {str(e)[:80]}) "
+                  f"— retrying one-by-one")
+            for t in batch:
+                try:
+                    results.extend(_gen_batch([t], tok, model, dev))
+                except Exception as e2:                   # noqa: BLE001
+                    print(f"  ⚠️  single-post generate failed ({str(e2)[:60]}) — zeros")
+                    results.append(np.zeros(len(_KEYS), dtype=np.float32))
     return np.vstack(results)
 
 
@@ -150,6 +201,8 @@ def analyst_features(platform_ids, texts):
               f"analyze (generation ~1-2s/post, cached forever)...")
         for c0 in range(0, len(missing), CHECKPOINT_EVERY):
             part = missing[c0:c0 + CHECKPOINT_EVERY]
+            print(f"  🗂️  analyzing posts {c0 + 1}-{min(c0 + len(part), len(missing))} "
+                  f"of {len(missing)}...")
             preds = analyze_texts([texts[i] for i in part])
             rows = []
             for j, i in enumerate(part):
