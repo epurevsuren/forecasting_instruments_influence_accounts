@@ -52,11 +52,15 @@ for _p in (_HERE, os.path.normpath(os.path.join(_HERE, "..", "DP"))):
         sys.path.insert(0, _p)
 
 import db
-from gemma_analyst import SYSTEM_PROMPT, INSTRUMENTS, _KEYS, _CAPS
+from gemma_analyst import FT_SYSTEM_PROMPT, FT_POST_CHARS, INSTRUMENTS, _KEYS, _CAPS
 from gemma_embedder import GEMMA_ID_4BIT
 
 SAVE_PATH        = os.path.join(_HERE, "gemma3_analyst_lora")
-MAX_SEQ_LENGTH   = 1024
+# 512, not 1024: with torch.compile disabled the loss materializes the FULL
+# 262,144-vocab logits in fp32 (seq x vocab x 4B = 1.07GB at 1024 -> OOM on
+# 8GB). Short FT prompt (~30 tok) + 1000-char post + 23-key JSON answer fit
+# in 512 with the loss tensor down to ~540MB transient.
+MAX_SEQ_LENGTH   = 512
 TRAIN_MIN_WEIGHT = 0.20   # same noise filter as the XGB trainer
 TRAIN_FRAC       = 0.85   # chronological cut — last 15% NEVER seen (honest OOS)
 OVERSAMPLE_W     = 0.50   # rows above this weight are repeated...
@@ -97,8 +101,8 @@ def build_dataset(tok):
 
     texts = []
     for _, row in df.iterrows():
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": str(row['text'])[:2000]},
+        msgs = [{"role": "system", "content": FT_SYSTEM_PROMPT},
+                {"role": "user", "content": str(row['text'])[:FT_POST_CHARS]},
                 {"role": "assistant", "content": to_target(row)}]
         texts.append(tok.apply_chat_template(msgs, tokenize=False))
     from datasets import Dataset

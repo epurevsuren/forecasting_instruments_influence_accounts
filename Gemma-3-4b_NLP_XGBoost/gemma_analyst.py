@@ -107,6 +107,17 @@ SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
     "__JSON_TEMPLATE__",
     "{" + ",".join(f'"{k}":0.0' for k in _KEYS) + "}")
 
+# SHORT prompt for the FINE-TUNED analyst (training + inference must match).
+# The long instructional prompt exists to teach a zero-shot model the task;
+# after SFT the task lives in the LoRA weights, and on an 8GB card the long
+# prompt's tokens are what blow up the full-vocab loss (262k vocab x seq len
+# fp32 logits). Post budget in FT mode: 1000 chars.
+FT_SYSTEM_PROMPT = ("You are a market analyst. Output ONLY a JSON object with "
+                    "the predicted 1-hour percentage move of each instrument "
+                    "for this post.")
+FT_POST_CHARS = 1000
+_FT_MODE = bool(os.environ.get("GEMMA_ANALYST_LORA"))
+
 
 def _get_model():
     tok, model = GE._load_gemma()
@@ -163,9 +174,12 @@ def _gen_batch(texts, tok, model, dev):
     # sequence of length 762 ... got 761"). The underlying TEXT tokenizer
     # pads reliably and model.generate takes input_ids/attention_mask.
     _t = getattr(tok, "tokenizer", tok)
+    # FT mode: short prompt + tighter post budget — must match SFT format
+    _sys = FT_SYSTEM_PROMPT if _FT_MODE else SYSTEM_PROMPT
+    _cut = FT_POST_CHARS if _FT_MODE else 2000
     prompts = [_t.apply_chat_template(
-        [{"role": "system", "content": SYSTEM_PROMPT},
-         {"role": "user", "content": t}],
+        [{"role": "system", "content": _sys},
+         {"role": "user", "content": str(t)[:_cut]}],
         tokenize=False, add_generation_prompt=True) for t in texts]
     _side = _t.padding_side
     _t.padding_side = "left"    # decoder batch generation REQUIRES left padding
