@@ -26,7 +26,5 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss
 if not exist logs mkdir logs
 
 REM %* passes through all args (e.g. "202606140900 --from 202411010000 --fine-tune")
-REM %USERPROFILE% is expanded by cmd BEFORE PowerShell runs — $env: inside
-REM single quotes would stay literal and "command not found".
 powershell -NoProfile -Command "uv run python backtest_simulator.py %* 2>>'logs\backtest_%TS%.err' | ForEach-Object { $_; Add-Content -Path 'logs\backtest_%TS%.log' -Value $_ -Encoding utf8 }"
 REM If you don't use uv, replace "uv run python" with "python" above.

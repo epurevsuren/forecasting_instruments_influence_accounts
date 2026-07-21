@@ -71,9 +71,10 @@
     ],
     "flag_public_health": [
       "coronavirus", "covid", "pandemic", "wuhan", "china virus", "outbreak",
-      "quarantine", "social distancing", "15 days to slow the spread",
+      "virus", "quarantine", "social distancing", "days to slow the spread",
       "travel ban", "vaccine", "operation warp speed", "reopen", "reopening",
-      "ventilators", "hydroxychloroquine", "mask mandate", "herd immunity"
+      "ventilators", "hydroxychloroquine", "mask mandate", "herd immunity",
+      "mutation", "omicron", "delta variant"
     ],
     "flag_tax_policy": [
       "tax cut", "corporate tax", "income tax", "capital gains", "irs",
@@ -188,7 +189,7 @@
   ],
   "fallback_noise_keywords": [
     "endorse", "congressman", "senator", "great honor", "running for",
-    "fantastic job", "tremendous champion"
+    "fantastic job", "tremendous champion", "panda", "birthday", "music", "acrobatics"
   ],
   "norm_divisors": {
     "policy_intensity_score": 25.0,

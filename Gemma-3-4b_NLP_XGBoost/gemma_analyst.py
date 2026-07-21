@@ -36,7 +36,10 @@ except Exception:                                       # rich not installed
 import db                      # folder-local shim -> ../database.db
 import gemma_embedder as GE    # shares the loaded 4-bit model
 
-ANALYST_TABLE = "gemma3_analyst_v1"
+# Cache table is VERSIONED BY MODEL: fine-tuned analyst outputs must never
+# mix with zero-shot ones (set GEMMA_ANALYST_LORA -> separate table).
+ANALYST_TABLE = ("gemma3_analyst_ft1" if os.environ.get("GEMMA_ANALYST_LORA")
+                 else "gemma3_analyst_v1")
 MAX_NEW_TOKENS = 320
 # Full speed by default (the Razer handles its own thermals; the earlier
 # freeze was Razer Synapse, not heat). Env knobs remain for emergencies:
@@ -122,7 +125,11 @@ def _get_model():
             from peft import PeftModel
             model = PeftModel.from_pretrained(model, lora)
             model._analyst_lora_loaded = True
-            print(f"  🎓 Analyst LoRA loaded from {lora}")
+            # share the WRAPPED model back with the embedder so its forward
+            # can disable the adapter (embeddings must stay BASE-model to
+            # match the gemma3_embeddings_v1 cache)
+            GE._tok_model[1] = model
+            print(f"  🎓 Analyst LoRA loaded from {lora} (analyst cache: {ANALYST_TABLE})")
         except Exception as e:                            # noqa: BLE001
             print(f"  ⚠️  LoRA load failed ({e}) — using base model")
     return tok, model

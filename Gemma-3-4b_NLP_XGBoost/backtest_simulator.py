@@ -28,7 +28,7 @@ asked for — a handful of lightweight yfinance calls instead of a full rebuild.
 WHAT IT DOES
 ------------
 For every HIGH_SIGNAL post with post_time in [--from, --until]:
-  1. Build the model input: cached gemma embedding (gemma_embeddings_v2)
+  1. Build the model input: cached gemma embedding (gemma3_embeddings_v1)
      + NLP scorer features (posts_scored), exactly as in training.
   2. Predict per-instrument 1h impact with the trained XGBoost models
      (gemma_nlp_xgb_models/ by default, or --model-dir), applying the SAME

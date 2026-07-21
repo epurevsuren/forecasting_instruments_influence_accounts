@@ -34,7 +34,7 @@ GEMMA_ID_4BIT = os.environ.get("GEMMA_MODEL_ID", "unsloth/gemma-3-4b-it-unsloth-
 GEMMA_ID_FULL = "unsloth/gemma-3-4b-it"   # ungated mirror (google/gemma-3-4b-it needs HF auth)
 HIDDEN        = 2560                    # Gemma-3-4B hidden size
 N_EMB         = HIDDEN * 2              # mean(2560) + last-token(2560)
-EMB_TABLE     = "gemma3_embeddings_v1"  # DuckDB cache (separate from gemma_embeddings_v2)
+EMB_TABLE     = "gemma3_embeddings_v1"  # DuckDB cache
 MAX_LEN       = 256
 BATCH         = 8                       # 4B model — smaller batches than gemma's 32
 
@@ -141,7 +141,13 @@ def embed_texts(texts):
         enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
                   max_length=MAX_LEN)
         enc = {k: v.to(dev) for k, v in enc.items()}
-        with torch.inference_mode():
+        # embeddings must ALWAYS come from the BASE model (they must match
+        # the gemma3_embeddings_v1 cache) — if an analyst LoRA is attached
+        # to the shared model, disable it for this forward pass.
+        import contextlib
+        _ctx = (model.disable_adapter() if hasattr(model, "disable_adapter")
+                else contextlib.nullcontext())
+        with _ctx, torch.inference_mode():
             out = model(**enc, output_hidden_states=True)
         last = out.hidden_states[-1].float()               # (B, T, 2560)
         mask = enc['attention_mask'].unsqueeze(-1).float()
