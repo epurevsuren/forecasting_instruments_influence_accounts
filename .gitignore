@@ -13,6 +13,7 @@ stock-data-intraday-minute-bar/
 FX-1-Minute-Data/
 gemma3_nlp_xgb_models/
 unsloth_compiled_cache/
+gemma3_analyst_lora_ckpt/
 
 
 # Ignore file extensions

@@ -32,7 +32,11 @@ os.environ.setdefault("UNSLOTH_FORCE_XFORMERS", "1")
 os.environ.setdefault("UNSLOTH_DISABLE_FLEX_ATTENTION", "1")
 os.environ.setdefault("UNSLOTH_ENABLE_FLEX_ATTENTION", "0")
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "max_split_size_mb:512")
+# expandable_segments reduces fragmentation — on 8GB the training run sat
+# right at the VRAM edge; fragmentation after the step-200 checkpoint
+# pushed it into Windows sysmem paging (23 s/step -> 450 s/step).
+os.environ.setdefault("PYTORCH_ALLOC_CONF",
+                      "expandable_segments:True,max_split_size_mb:512")
 
 from unsloth import FastModel                       # BEFORE transformers
 from unsloth.chat_templates import train_on_responses_only
@@ -129,8 +133,16 @@ def main():
         tokenizer     = tok,
         train_dataset = ds,
         args = SFTConfig(
-            per_device_train_batch_size = 2,
-            gradient_accumulation_steps = 4,
+            # batch 1 + accum 8 = SAME effective batch (8) with roughly half
+            # the activation VRAM — keeps the run off the Windows sysmem-
+            # paging cliff that collapsed 23 s/step to 450 s/step at 8GB.
+            per_device_train_batch_size = 1,
+            gradient_accumulation_steps = 8,
+            # First adapter doesn't need the full epoch (~28h healthy): loss
+            # plateaus early; ~1500 steps (~12k examples incl. oversampled
+            # high-signal) tests the hypothesis in ~10-12h. Override:
+            # $env:SFT_MAX_STEPS = "-1"  (full epoch)
+            max_steps                   = int(os.environ.get("SFT_MAX_STEPS", "1500")),
             num_train_epochs            = 1,
             learning_rate               = 2e-4,
             lr_scheduler_type           = "cosine",
