@@ -324,6 +324,26 @@ def main():
                 adj = np.clip(med / v_vals, 0.33, 2.0)
                 w_tr = w_tr * adj
 
+        # ---------------------------------------------------------
+        # PER-INSTRUMENT LABEL-QUALITY TRUST (2026-07-28)
+        # ---------------------------------------------------------
+        # Session status is per instrument: a 03:00 post is shut for SPY but
+        # live for BTC/FX. Down-weight ONLY this instrument's weak-label rows
+        # here — never globally in build (that damped 75,271 posts off SPY's
+        # calendar, cut HIGH_SIGNAL 2,733->1,765 and starved every instrument).
+        #   next_open = market was shut; label is the next session's first hour
+        #               (real + tradeable, but hours of other news intervene)
+        #   daily     = daily-bar fallback, weakest evidence
+        QUALITY_TRUST = {'intraday': 1.0, 'next_open': 0.5, 'daily': 0.3}
+        qcol = f'{inst}_quality'
+        if qcol in df.columns:
+            q_tr = df.iloc[:i_tr][qcol].astype(str).map(QUALITY_TRUST).fillna(1.0)
+            w_tr = w_tr * q_tr.values
+            _n_no = int((df.iloc[:i_tr][qcol].astype(str) == 'next_open').sum())
+            if _n_no:
+                print(f"     {inst}: {_n_no} next_open rows at "
+                      f"x{QUALITY_TRUST['next_open']} trust")
+
         # (feature_weights REMOVED 2026-07-16: measured dead end — 20x weight
         # lifted NLP importance only 4.4%->6.4%; it only biases colsample
         # sampling. Replaced by the PCA compression above.)

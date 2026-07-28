@@ -841,15 +841,11 @@ CHAIN_LABEL_WINDOW_MIN = 60
 DAILY_LABEL_DAMP       = 0.7   # trust multiplier when the core label is
                                # daily-fallback (post while market closed —
                                # "actual" = next session's whole move)
-NEXT_OPEN_LABEL_DAMP   = 0.5   # trust multiplier for 'next_open' labels
-                               # (2026-07-22): posted while the market was
-                               # SHUT, so the reaction is the first hour of
-                               # the next session. That IS tradeable (and is
-                               # what our execution would get), but hours of
-                               # unrelated news land between post and open —
-                               # weaker evidence of tweet impact than an
-                               # in-session reaction, so it trains at half
-                               # trust rather than being thrown away.
+NEXT_OPEN_LABEL_DAMP   = 0.5   # DEPRECATED as a GLOBAL damp (2026-07-28).
+                               # 'next_open' trust is now applied PER
+                               # INSTRUMENT in the trainer (QUALITY_TRUST),
+                               # because session status differs per market.
+                               # Kept only as the documented trust value.
 
 
 def finalize(scored, impact_cols):
@@ -908,14 +904,19 @@ def finalize(scored, impact_cols):
             scored.loc[daily_mask, 'sample_weight'] = (
                 scored.loc[daily_mask, 'sample_weight'] * DAILY_LABEL_DAMP).round(4)
         # SESSION-AWARE labels (2026-07-22): posts made while the market was
-        # shut now carry a next-session-open label instead of a gap-spanning
-        # one. Real, tradeable, but noisier than an in-session reaction.
-        nopen_mask = scored['SPY_quality'].astype(str) == 'next_open'
-        if nopen_mask.any():
-            print(f"  🌅 {int(nopen_mask.sum())} post(s) with next-open labels "
-                  f"(posted while shut): sample_weight ×{NEXT_OPEN_LABEL_DAMP}")
-            scored.loc[nopen_mask, 'sample_weight'] = (
-                scored.loc[nopen_mask, 'sample_weight'] * NEXT_OPEN_LABEL_DAMP).round(4)
+        # shut carry a next-session-open label instead of a gap-spanning one.
+        # NO GLOBAL DAMP HERE — that was a bug (2026-07-28): session status is
+        # PER INSTRUMENT (a 3am post is shut for SPY but live for BTC/FX), and
+        # sample_weight is both the global training trust AND the HIGH_SIGNAL
+        # selection key, so damping 75,271 posts off SPY's calendar alone cut
+        # HIGH_SIGNAL 2,733 -> 1,765 and starved every instrument of trades.
+        # The next_open down-weighting now happens PER INSTRUMENT in
+        # train_*_nlp_xgb.py, where each model already builds its own weight
+        # vector (same place as the vol30 regime adjustment).
+        nopen_n = int((scored['SPY_quality'].astype(str) == 'next_open').sum())
+        if nopen_n:
+            print(f"  🌅 {nopen_n} post(s) carry next-open labels for SPY "
+                  f"(per-instrument trust handled at train time, not here)")
 
     # MACRO CO-MOVEMENT damp: when the WHOLE equity complex moved hard in the
     # post's window but the post itself is low-signal, the label is a macro
@@ -944,7 +945,11 @@ def train_columns(impact_cols):
             'account', 'account_rank', 'entity_weight', 'event_weight',
             'sample_weight', 'nlp_signal']
     vol_cols = [f'{n}_vol30' for n in TICKERS]   # vol regime at post time
-    return base + impact_cols + vol_cols
+    # PER-INSTRUMENT LABEL QUALITY ('intraday' | 'next_open' | 'daily') — the
+    # trainer down-weights each instrument's own weak-label rows instead of a
+    # global damp off SPY's calendar (see finalize note, 2026-07-28).
+    qual_cols = [f'{n}_quality' for n in TICKERS]
+    return base + impact_cols + vol_cols + qual_cols
 
 
 # ==========================================
