@@ -630,6 +630,29 @@ def _intraday_moves_duckdb(con, name, after, before):
       reaction  = close of first bar >= post_bar+60min IF within 45min of target,
                   else close of the bar 2 positions after the post bar (capped);
                   a post on/after the LAST bar has no forward data -> None (daily).
+
+    SESSION-AWARE (2026-07-22 — the 55%-accuracy root cause). Placebo test:
+    |move| after HIGH_SIGNAL posts vs random bar times was 0.38x (SPY) and
+    0.00x (VIX) — post windows looked QUIETER than random, which is
+    impossible if tweets move markets. Cause: only 36.2% of posts land
+    inside a live session; for the other 63.8% the "1-hour move" was
+    measured ACROSS the closure (post bar = previous close, reaction bar =
+    next session), so the label captured the whole overnight/weekend gap —
+    everything that happened while the market was shut — and taught it to
+    the model as tweet impact. Controlling for session, the real effect is
+    1.4-2.0x normal volatility, so the signal was there but buried.
+
+    Now every post is classified against THAT INSTRUMENT'S OWN bar
+    structure (so US equities, 24h FX and crypto each get their own
+    session rules for free, incl. FX weekends):
+      * post inside a live session (reaction stays in the same session)
+          -> 'intraday' label, unchanged verified maths.
+      * post while the market is CLOSED, or too near the close for the
+        1-hour window to complete -> 'next_open' label: the first tradeable
+        hour of the NEXT session, measured from that session's OPEN (NOT
+        from the previous close), which excludes the untradeable gap. This
+        matches what the strategy could actually execute.
+    Returns {post_id: (move|None, quality)}.
     """
     ibkr = os.path.join(CACHE_DIR, f"{name}_30min.csv")
     yf_  = os.path.join(CACHE_DIR, f"{name}_30min_yf.csv")
@@ -639,32 +662,61 @@ def _intraday_moves_duckdb(con, name, after, before):
     if os.path.exists(yf_):
         union += (f" UNION ALL SELECT date::TIMESTAMPTZ t, open, close, 1 pri "
                   f"FROM read_csv_auto('{yf_}', null_padding=true) {flt}")
+    # SESSION_GAP_MIN: a jump larger than this between consecutive bars marks a
+    # market closure (30-min bars run 30 min apart inside a session; overnight /
+    # weekend / holiday breaks are hours). 90 min tolerates a missing bar.
     q = f"""
     WITH raw AS ({union}),
-    bars AS (SELECT t, open, close, row_number() OVER (ORDER BY t) AS ord
-             FROM (SELECT *, row_number() OVER (PARTITION BY t ORDER BY pri) rn FROM raw) WHERE rn = 1),
+    dedup AS (SELECT t, open, close FROM
+              (SELECT *, row_number() OVER (PARTITION BY t ORDER BY pri) rn FROM raw) WHERE rn = 1),
+    flagged AS (SELECT t, open, close,
+                COALESCE(t - LAG(t) OVER (ORDER BY t) > INTERVAL '90 minutes', TRUE) AS newsess
+                FROM dedup),
+    bars AS (SELECT t, open, close, newsess, row_number() OVER (ORDER BY t) AS ord,
+                    SUM(CASE WHEN newsess THEN 1 ELSE 0 END) OVER (ORDER BY t) AS sess
+             FROM flagged),
     mx AS (SELECT max(ord) AS m FROM bars),
-    pb AS (SELECT p.post_id, p.pdt, b.ord pi, b.t pbt, b.open p_open, b.close p_close
+    pb AS (SELECT p.post_id, p.pdt, b.ord pi, b.t pbt, b.sess psess,
+                  b.open p_open, b.close p_close
            FROM _posts p ASOF JOIN bars b ON p.pdt >= b.t),
-    r1 AS (SELECT pb.post_id, r.t rt, r.close rc
+    r1 AS (SELECT pb.post_id, r.t rt, r.close rc, r.sess rsess
            FROM pb ASOF JOIN bars r ON (pb.pbt + INTERVAL '60 minutes') <= r.t),
     r2 AS (SELECT pb.post_id, b2.close rc2
            FROM pb JOIN bars b2 ON b2.ord = LEAST(pb.pi + 2, (SELECT m FROM mx))),
+    -- NEXT-SESSION OPEN for posts made while the market is closed (or too
+    -- close to the bell for the hour to finish inside the session):
+    -- first bar strictly after the post that starts a NEW session.
+    no AS (SELECT pb.post_id, o.ord oord, o.open o_open
+           FROM pb ASOF JOIN (SELECT * FROM bars WHERE newsess) o
+             ON pb.pdt < o.t),
+    nor AS (SELECT no.post_id, b3.close nrc
+            FROM no JOIN bars b3 ON b3.ord = LEAST(no.oord + 1, (SELECT m FROM mx))),
     x AS (SELECT pb.post_id, pb.pi, (SELECT m FROM mx) mxm,
              COALESCE(NULLIF(pb.p_open, 0), NULLIF(pb.p_close, 0)) AS init,
              CASE WHEN r1.rt IS NOT NULL
                    AND (r1.rt - (pb.pbt + INTERVAL '60 minutes')) <= INTERVAL '45 minutes'
-                  THEN r1.rc ELSE r2.rc2 END AS react
-          FROM pb LEFT JOIN r1 USING(post_id) LEFT JOIN r2 USING(post_id))
+                  THEN r1.rc ELSE r2.rc2 END AS react,
+             -- crossed a market closure? (reaction lands in a later session,
+             -- or no in-session reaction bar exists at all)
+             CASE WHEN r1.rsess IS NULL OR r1.rsess <> pb.psess THEN TRUE
+                  ELSE FALSE END AS crossed,
+             nor.nrc AS n_react, nn.o_open AS n_init
+          FROM pb LEFT JOIN r1 USING(post_id) LEFT JOIN r2 USING(post_id)
+                  LEFT JOIN nor USING(post_id) LEFT JOIN no nn USING(post_id))
     SELECT post_id,
            CASE WHEN pi >= mxm THEN NULL
-                WHEN init IS NULL OR init = 0 THEN NULL
-                WHEN react IS NULL OR react = 0 THEN NULL
-                ELSE round((react - init) / init * 100, 4) END AS mv
+                WHEN NOT crossed AND init IS NOT NULL AND init <> 0
+                     AND react IS NOT NULL AND react <> 0
+                     THEN round((react - init) / init * 100, 4)
+                WHEN crossed AND n_init IS NOT NULL AND n_init <> 0
+                     AND n_react IS NOT NULL AND n_react <> 0
+                     THEN round((n_react - n_init) / n_init * 100, 4)
+                ELSE NULL END AS mv,
+           CASE WHEN crossed THEN 'next_open' ELSE 'intraday' END AS qual
     FROM x
     """
-    return {int(pid): (None if mv is None else float(mv))
-            for pid, mv in con.execute(q).fetchall()}
+    return {int(pid): (None if mv is None else float(mv), str(qual))
+            for pid, mv, qual in con.execute(q).fetchall()}
 
 
 def compute_impacts(scored):
@@ -706,9 +758,12 @@ def compute_impacts(scored):
         if mtype in ('24h', 'us') and csv_ok:
             moves = _intraday_moves_duckdb(con, name, _after, _before)   # DuckDB ASOF (bulk)
             for i in range(n):
-                mv = moves.get(i)
+                mv, qual = moves.get(i, (None, 'daily'))
                 if mv is not None:
-                    ar_list[i] = round(mv, 4); q_list[i] = 'intraday'
+                    # qual: 'intraday' (post inside a live session) or
+                    # 'next_open' (market was shut -> first tradeable hour of
+                    # the next session, measured from ITS open, gap excluded)
+                    ar_list[i] = round(mv, 4); q_list[i] = qual
                 else:                                                    # pandas daily fallback
                     ar, _ = abnormal_return_daily(dates_list[i], name, sessions[i])
                     ar_list[i] = ar;  q_list[i] = 'daily'
@@ -786,6 +841,15 @@ CHAIN_LABEL_WINDOW_MIN = 60
 DAILY_LABEL_DAMP       = 0.7   # trust multiplier when the core label is
                                # daily-fallback (post while market closed —
                                # "actual" = next session's whole move)
+NEXT_OPEN_LABEL_DAMP   = 0.5   # trust multiplier for 'next_open' labels
+                               # (2026-07-22): posted while the market was
+                               # SHUT, so the reaction is the first hour of
+                               # the next session. That IS tradeable (and is
+                               # what our execution would get), but hours of
+                               # unrelated news land between post and open —
+                               # weaker evidence of tweet impact than an
+                               # in-session reaction, so it trains at half
+                               # trust rather than being thrown away.
 
 
 def finalize(scored, impact_cols):
@@ -843,6 +907,15 @@ def finalize(scored, impact_cols):
                   f"(closed market): sample_weight ×{DAILY_LABEL_DAMP}")
             scored.loc[daily_mask, 'sample_weight'] = (
                 scored.loc[daily_mask, 'sample_weight'] * DAILY_LABEL_DAMP).round(4)
+        # SESSION-AWARE labels (2026-07-22): posts made while the market was
+        # shut now carry a next-session-open label instead of a gap-spanning
+        # one. Real, tradeable, but noisier than an in-session reaction.
+        nopen_mask = scored['SPY_quality'].astype(str) == 'next_open'
+        if nopen_mask.any():
+            print(f"  🌅 {int(nopen_mask.sum())} post(s) with next-open labels "
+                  f"(posted while shut): sample_weight ×{NEXT_OPEN_LABEL_DAMP}")
+            scored.loc[nopen_mask, 'sample_weight'] = (
+                scored.loc[nopen_mask, 'sample_weight'] * NEXT_OPEN_LABEL_DAMP).round(4)
 
     # MACRO CO-MOVEMENT damp: when the WHOLE equity complex moved hard in the
     # post's window but the post itself is low-signal, the label is a macro
