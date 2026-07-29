@@ -277,6 +277,8 @@ def main():
     report = {}
     calibration = {}      # per-instrument magnitude scale, fitted OUT-OF-SAMPLE
     calibration_tp = {}   # conservative TP quantile (40th pct of actual/pred)
+    calibration_raw = {}  # UNCLIPPED fit — diagnostic, shows how far off it was
+    calibration_unreliable = []   # instruments whose raw fit left the sane band
     for inst in INSTRUMENTS:
         col = f"{inst}_Impact"
         if col not in df.columns: continue
@@ -401,14 +403,30 @@ def main():
         if cal_mask.sum() >= 5 and (pred_cal[cal_mask] ** 2).sum() > 1e-9:
             k_cal = float((pred_cal[cal_mask] * ycal[cal_mask]).sum()
                           / (pred_cal[cal_mask] ** 2).sum())
-            # floor 0.25 -> 0.02 (2026-07-16): US10Y/US2Y/NATGAS models
-            # over-predict 25-100x on the quiet 2025-26 calib window (R²
-            # -600 class); a 0.25 floor still left them 5-25x hot. An
-            # honest tiny k mutes a broken model instead of trading it.
-            k_cal = float(np.clip(k_cal, 0.02, 20.0))
+            # FLOOR BACK TO 0.25 (2026-07-29). The 0.02 floor (added
+            # 2026-07-16 to mute over-predicting rate models) silently
+            # destroyed the whole pipeline: any instrument whose trade-region
+            # fit came out low had EVERY prediction multiplied by 0.02, so
+            # nothing could clear the 0.1% TRADE bar — backtest 003903 showed
+            # VIX x0.02, BTC x0.02 and just 6 TRADE flags across 618 posts
+            # (was 478). Muting a suspect model by scaling it to zero also
+            # hides the problem instead of reporting it, so:
+            #   * k stays inside a sane band [0.25, 8]
+            #   * the RAW fit is recorded separately, and an instrument whose
+            #     raw fit falls outside the band is flagged UNRELIABLE so the
+            #     backtest/Layer-2 can skip it deliberately rather than
+            #     trading a silently-zeroed signal.
+            k_raw = k_cal
+            k_cal = float(np.clip(k_cal, 0.25, 8.0))
+            calibration_raw[inst] = round(k_raw, 4)
+            if not (0.25 <= k_raw <= 8.0):
+                calibration_unreliable.append(inst)
+                print(f"     ⚠️  {inst}: raw calibration {k_raw:.3f} outside "
+                      f"[0.25, 8] -> clipped to {k_cal:.2f} and flagged UNRELIABLE")
         else:
             k_cal = 1.0
-            
+            calibration_raw[inst] = None
+
         calibration[inst] = round(k_cal, 3)
 
         # ---------------------------------------------------------
@@ -455,8 +473,15 @@ def main():
     json.dump({"gemma":gemma,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
                "emb_pca":EMB_PCA_DIM,   # predict/backtest must project with emb_pca.npz
                "nlp_features":use_nlp,"instruments":INSTRUMENTS,
-               "calibration":calibration,"calibration_tp":calibration_tp},
+               "calibration":calibration,"calibration_tp":calibration_tp,
+               "calibration_raw":calibration_raw,
+               "calibration_unreliable":calibration_unreliable},
               open(f"{OUT_DIR}/config.json","w"))
+    if calibration_unreliable:
+        print(f"\n⚠️  UNRELIABLE calibration on {len(calibration_unreliable)}/"
+              f"{len(calibration)} instruments: {', '.join(calibration_unreliable)}")
+        print("   Their raw fit was outside [0.25, 8] — predictions are clipped,")
+        print("   not zeroed. Treat their TRADE flags with suspicion.")
     print("\n🎯 TP quantiles (Layer-2 --tp-mult per instrument, 40th pct of "
           "actual/calibrated-pred):")
     print("   " + "  ".join(f"{i}:{v:.2f}" for i, v in calibration_tp.items()))

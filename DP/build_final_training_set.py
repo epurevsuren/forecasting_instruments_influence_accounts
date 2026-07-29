@@ -841,11 +841,99 @@ CHAIN_LABEL_WINDOW_MIN = 60
 DAILY_LABEL_DAMP       = 0.7   # trust multiplier when the core label is
                                # daily-fallback (post while market closed —
                                # "actual" = next session's whole move)
+GEMINI_CONFOUNDER_DAMP = 0.3   # OPTIONAL (--use-gemini): trust multiplier when
+                               # Gemini+Search found a DIFFERENT major event
+                               # (FOMC/CPI/NFP/earnings) inside the post's
+                               # 60-min reaction window. A GLOBAL damp is
+                               # correct here — unlike session status, a
+                               # competing macro event contaminates EVERY
+                               # instrument's window at once.
 NEXT_OPEN_LABEL_DAMP   = 0.5   # DEPRECATED as a GLOBAL damp (2026-07-28).
                                # 'next_open' trust is now applied PER
                                # INSTRUMENT in the trainer (QUALITY_TRUST),
                                # because session status differs per market.
                                # Kept only as the documented trust value.
+
+
+# Gemini annotations live in a CSV (NOT database.db): the DB is single-writer
+# and long annotation runs must not fight the trainer for the lock. Read here
+# with DuckDB, exactly like the market_data_cache bars.
+GEMINI_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "gemini_annotations.csv")
+USE_GEMINI = False   # flipped ON only by --use-gemini (see __main__)
+
+
+def apply_gemini(scored):
+    """OPTIONAL second-opinion layer (--use-gemini). No flag or no table =>
+    returns `scored` untouched, so the daily pipeline is unaffected.
+
+    LEAKAGE FIREWALL (see gemini_impact_annotator.py):
+      gl_*  grounded/search -> LABEL SIDE ONLY (weights, curation). Because
+            a grounded answer knows what happened after the post, these must
+            NEVER become model features.
+      gf_*  text-only       -> feature-safe, joined as training columns.
+    """
+    if not os.path.exists(GEMINI_CSV):
+        print(f"  ℹ️  --use-gemini given but {os.path.basename(GEMINI_CSV)} not found "
+              f"— skipping (run gemini_impact_annotator.py first)")
+        return scored
+    try:
+        import duckdb as _dd
+        ann = _dd.query(
+            f"SELECT * FROM read_csv_auto('{GEMINI_CSV.replace(chr(92), '/')}', "
+            f"null_padding=true)").df()
+    except Exception:
+        ann = pd.read_csv(GEMINI_CSV)
+    if not len(ann):
+        print(f"  ℹ️  {os.path.basename(GEMINI_CSV)} is empty — skipping")
+        return scored
+    print(f"  🛰️  {len(ann)} Gemini annotation(s) loaded from "
+          f"{os.path.basename(GEMINI_CSV)}")
+
+    ann = ann.copy()
+    ann['id'] = pd.to_numeric(ann['id'], errors='coerce').astype('Int64')
+    key = ['platform', 'id']
+
+    # ---- LABEL SIDE: confounded reaction windows -------------------------
+    gl = ann[ann['mode'] == 'grounded']
+    if len(gl) and 'gl_confounder_present' in gl.columns:
+        gl = gl.drop_duplicates(subset=key, keep='last')
+        scored = scored.merge(
+            gl[key + ['gl_confounder_present', 'gl_market_moving']],
+            on=key, how='left')
+        conf = scored['gl_confounder_present'].fillna(False).astype(bool)
+        if conf.any():
+            print(f"  🛰️  {int(conf.sum())} post(s) whose 60-min window Gemini+Search "
+                  f"found CONFOUNDED by another major event: "
+                  f"sample_weight ×{GEMINI_CONFOUNDER_DAMP}")
+            scored.loc[conf, 'sample_weight'] = (
+                scored.loc[conf, 'sample_weight'] * GEMINI_CONFOUNDER_DAMP).round(4)
+        _mm = scored['gl_market_moving'].notna()
+        if _mm.any():
+            print(f"  🛰️  Gemini verdict available on {int(_mm.sum())} post(s); "
+                  f"{int(scored.loc[_mm, 'gl_market_moving'].fillna(False).astype(bool).sum())}"
+                  f" judged genuinely market-moving")
+        # gl_* stay OUT of train_columns — label side only, never features.
+
+    # ---- FEATURE SIDE: text-only structure -------------------------------
+    gf = ann[ann['mode'] == 'text']
+    gf_cols = [c for c in ann.columns if c.startswith('gf_') and c != 'gf_error']
+    if len(gf) and gf_cols:
+        gf = gf.drop_duplicates(subset=key, keep='last')
+        scored = scored.merge(gf[key + gf_cols], on=key, how='left')
+        # one-hot the categorical, keep the ordinals numeric
+        if 'gf_event_type' in scored.columns:
+            et = scored['gf_event_type'].fillna('none').astype(str)
+            for v in sorted(x for x in et.unique() if x != 'none'):
+                scored[f'gf_et_{v}'] = (et == v).astype(float)
+            scored = scored.drop(columns=['gf_event_type'])
+        for c in [c for c in scored.columns if c.startswith('gf_')]:
+            scored[c] = pd.to_numeric(scored[c], errors='coerce').fillna(0.0)
+        global _GEMINI_FEATURE_COLS
+        _GEMINI_FEATURE_COLS = [c for c in scored.columns if c.startswith('gf_')]
+        print(f"  🛰️  {len(gf)} post(s) carry feature-safe gf_* columns "
+              f"({len(_GEMINI_FEATURE_COLS)} features -> train_columns)")
+    return scored
 
 
 def finalize(scored, impact_cols):
@@ -949,7 +1037,13 @@ def train_columns(impact_cols):
     # trainer down-weights each instrument's own weak-label rows instead of a
     # global damp off SPY's calendar (see finalize note, 2026-07-28).
     qual_cols = [f'{n}_quality' for n in TICKERS]
-    return base + impact_cols + vol_cols + qual_cols
+    # OPTIONAL feature-safe Gemini columns (--use-gemini). gl_* are NEVER
+    # included: grounded output knows the future (leakage firewall).
+    gf_cols = [c for c in _GEMINI_FEATURE_COLS if c not in base]
+    return base + impact_cols + vol_cols + qual_cols + gf_cols
+
+
+_GEMINI_FEATURE_COLS: list = []   # filled by apply_gemini() when --use-gemini
 
 
 # ==========================================
@@ -989,6 +1083,11 @@ def main_full():
         print(f"\n  ENDORSEMENT (low NLP → damped to ~5%):")
         print(f"    NLP signal: {r['nlp_signal']:.3f}")
         print(f"    VIX impact: {r['VIX_Impact']:+.4f}%")
+
+    # OPTIONAL Gemini layer — only when --use-gemini was passed (USE_GEMINI is
+    # set in __main__). Untouched pipeline otherwise.
+    if USE_GEMINI:
+        scored = apply_gemini(scored)
 
     scored = finalize(scored, impact_cols)
 
@@ -1157,7 +1256,16 @@ if __name__ == '__main__':
                     help="One-time repair: drop output rows dated >= this (NY time) "
                          "and re-label them in the same run. NOTE: yfinance intraday "
                          "only reaches back ~60 days — older posts fall back to daily data.")
+    ap.add_argument("--use-gemini", action="store_true",
+                    help="OPTIONAL: join the gemini_annotations table "
+                         "(gemini_impact_annotator.py). Grounded gl_* verdicts damp "
+                         "confounded reaction windows; text-only gf_* become training "
+                         "features. Without this flag the pipeline is unchanged.")
     args = ap.parse_args()
+    USE_GEMINI = args.use_gemini
+    if USE_GEMINI:
+        print("🛰️  --use-gemini: gemini_annotations will be joined "
+              "(gl_* label-side only, gf_* as features)")
     if args.full:
         main_full()
     else:
