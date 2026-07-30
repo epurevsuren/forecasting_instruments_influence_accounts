@@ -428,6 +428,28 @@ def load_models(model_dir, instruments):
             m.load_model(p)
             models[inst] = m
     print(f"  ✅ Loaded {len(models)}/{len(instruments)} models from {model_dir}")
+
+    # TWO-HEAD CLASSIFIERS (2026-07-31). Optional: an older model dir without
+    # them still runs, falling back to the |pred| >= threshold gate.
+    clf_move, clf_dir, reg_size = {}, {}, {}
+    for inst in instruments:
+        pm = os.path.join(model_dir, f"{inst}_Impact__move.json")
+        pd_ = os.path.join(model_dir, f"{inst}_Impact__dir.json")
+        ps = os.path.join(model_dir, f"{inst}_Impact__size.json")
+        if os.path.exists(pm):
+            _c = xgb.XGBClassifier(); _c.load_model(pm); clf_move[inst] = _c
+        if os.path.exists(pd_):
+            _c = xgb.XGBClassifier(); _c.load_model(pd_); clf_dir[inst] = _c
+        if os.path.exists(ps):
+            _r = xgb.XGBRegressor(); _r.load_model(ps); reg_size[inst] = _r
+    cfg["_clf_move"], cfg["_clf_dir"], cfg["_reg_size"] = clf_move, clf_dir, reg_size
+    if clf_move:
+        print(f"  🎯 Heads loaded: {len(clf_move)} move + {len(clf_dir)} direction"
+              f" + {len(reg_size)} size — gate = P(move) x P(direction), "
+              f"TP sized from the SIZE head")
+    else:
+        print("  ⚠️  No classifier heads in this model dir — falling back to the "
+              "|pred| magnitude gate (retrain to enable the two-head gate)")
     return cfg, models
 
 
@@ -488,7 +510,8 @@ def recompute_near_cutoff_actuals(df, until, impact_cols, near_window_min):
 # ============================================================================
 # main simulation loop
 # ============================================================================
-def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold):
+def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold,
+                 edge_min=0.05, require_tradeable=True):
     instruments = cfg['instruments']
     label_meta = {inst: (emoji, name) for inst, emoji, name in PR.LABELS}
 
@@ -527,6 +550,46 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
         print(f"  🎚️  Magnitude calibration applied "
               f"(k per instrument, e.g. " +
               ", ".join(f"{i}×{_cal[i]:.2f}" for i in list(_cal)[:5]) + " ...)")
+
+    # ---- TWO-HEAD CLASSIFIER PROBABILITIES ------------------------------
+    # p_move = P(this post produces an abnormal 1h move for this instrument)
+    # p_up   = P(that move is upward)
+    # The trade decision is (p_move >= gate) AND (|p_up - 0.5| >= edge), and
+    # the DIRECTION comes from p_up — not from sign(pred). That is the whole
+    # point: the regressor's sign carries almost no information (backtest
+    # 20260731 micro-accuracy 48.2%), while direction conditioned on a real
+    # move is where the signal actually lives.
+    _clf_mv, _clf_dr = cfg.get("_clf_move", {}), cfg.get("_clf_dir", {})
+    _gate = cfg.get("move_gate", {})
+    p_move = {inst: _clf_mv[inst].predict_proba(_X_for(inst))[:, 1]
+              for inst in _clf_mv}
+    p_up = {inst: _clf_dr[inst].predict_proba(_X_for(inst))[:, 1]
+            for inst in _clf_dr}
+    # SIZE head: per-post |move| in %, replacing the single per-instrument
+    # median. This is what Layer 2 needs for a reachable TP — the simulate log
+    # showed TIMEOUT on 148/158 QQQ and 112/115 XLE trades because every trade
+    # carried the same median-sized target regardless of the actual setup.
+    _reg_sz = cfg.get("_reg_size", {})
+    # size_k = the out-of-sample scale correction fitted at train time. Skipping
+    # it would systematically under-size every TP by ~20%.
+    p_size = {inst: np.clip(_reg_sz[inst].predict(_X_for(inst)), 0.0, None)
+                     * float(_gate.get(inst, {}).get("size_k", 1.0))
+              for inst in _reg_sz}
+    if p_size:
+        _sk = {i: _gate.get(i, {}).get("size_k", 1.0) for i in list(p_size)[:5]}
+        print("  📏 Size head scale-corrected: " +
+              ", ".join(f"{i}x{v:.2f}" for i, v in _sk.items()) + " ...")
+    if p_move:
+        _ex = list(p_move)[:4]
+        print("  🎯 Classifier gate per instrument: " +
+              ", ".join(f"{i} p>={_gate.get(i, {}).get('p_move_thr', 0.5):.2f}"
+                        for i in _ex) + " ...")
+        _tradeable = [i for i in p_move if _gate.get(i, {}).get("tradeable")]
+        if require_tradeable:
+            print(f"  ✅ TRADEABLE instruments ({len(_tradeable)}/{len(p_move)}): "
+                  + (", ".join(_tradeable) if _tradeable else "NONE")
+                  + "\n     (direction head beat chance out-of-sample; the rest are "
+                    "skipped — use --trade-all to override)")
 
     # Chain handling lives in the PRODUCTION module (PR.chain_factor, called
     # by gate_multiplier) — the backtest only resets its in-process state so
@@ -607,13 +670,26 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
             actual = float(row[col]) if pd.notna(row[col]) else 0.0
             abs_err = abs(raw_pred - actual)
 
+            # ---- direction source: classifier head B when available -------
+            # sign(raw_pred) scored 48.2% micro in backtest 20260731 — i.e.
+            # worse than a coin. p_up is trained only on rows that really
+            # moved, so it is the honest directional call.
+            _pm = float(p_move[inst][row_i]) if inst in p_move else None
+            _pu = float(p_up[inst][row_i]) if inst in p_up else None
+            if _pu is not None:
+                trade_dir = 1.0 if _pu > 0.5 else -1.0
+                dir_edge = abs(_pu - 0.5)
+            else:
+                trade_dir = np.sign(raw_pred)
+                dir_edge = None
+
             # Damped posts (chain-follower / endorsement / reiteration / stale)
             # were DELIBERATELY not traded — grading their zeroed prediction
             # against the market's move would pollute accuracy with fake
             # misses. They are excluded from direction stats entirely.
             meaningful = abs(actual) >= dir_threshold and not damped
             if meaningful:
-                match = np.sign(raw_pred) == np.sign(actual)
+                match = trade_dir == np.sign(actual)
                 stats[inst]['n'] += 1
                 stats[inst]['match'] += int(match)
                 stats[inst]['abs_err'] += abs_err
@@ -623,10 +699,26 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
 
             # TRADE/SKIP: would we have acted on this prediction at all?
             # A damped post (gate/temporal mult != 1.0) is by definition
-            # low-confidence/stale -- never trade it, even if the scaled
-            # |raw_pred| still happens to clear trade_threshold.
-            is_trade = (abs(raw_pred) >= trade_threshold) and not damped
-            sign_match = (np.sign(raw_pred) == np.sign(actual)) if actual != 0 else False
+            # low-confidence/stale -- never trade it, even if the signal
+            # still happens to clear the gate.
+            #
+            # PRIMARY GATE = two-head classifier: the instrument must be
+            # likely to MOVE abnormally *and* the direction head must have a
+            # real edge. Falls back to the old magnitude bar only when the
+            # model dir predates the classifier heads.
+            if _pm is not None and dir_edge is not None:
+                _g = _gate.get(inst, {})
+                _thr = float(_g.get("p_move_thr", 0.5))
+                # An instrument whose direction head failed to beat chance on
+                # the held-out calibration slice is not traded at all. Trading
+                # a coin flip with a spread is a guaranteed loss; better to run
+                # 4 instruments that work than 23 that don't.
+                _ok = _g.get("tradeable", True) or not require_tradeable
+                is_trade = (_ok and _pm >= _thr and dir_edge >= edge_min
+                            and not damped)
+            else:
+                is_trade = (abs(raw_pred) >= trade_threshold) and not damped
+            sign_match = (trade_dir == np.sign(actual)) if actual != 0 else False
             if is_trade:
                 td_stats[inst]['trade_n'] += 1
                 td_stats[inst]['trade_match'] += int(sign_match)
@@ -640,17 +732,79 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
 
             emoji, name = label_meta.get(inst, ("", inst))
             orig_str = f"  (orig {orig_pred:+.4f}%)" if damped else ""
+            _prob_str = (f"  p_mv={_pm:.2f} p_up={_pu:.2f}"
+                         if (_pm is not None and _pu is not None) else "")
             print(f"  {emoji} {inst:<8} {raw_pred:>+8.4f}% {actual:>+8.4f}%  "
-                  f"{match_str:<6}  {abs_err:>6.4f}  {decision:<5}{orig_str}")
+                  f"{match_str:<6}  {abs_err:>6.4f}  {decision:<5}{_prob_str}{orig_str}")
 
             csv_row[f'{inst}_pred'] = raw_pred
             csv_row[f'{inst}_actual'] = actual
             csv_row[f'{inst}_match'] = (bool(match) if meaningful else None)
             csv_row[f'{inst}_decision'] = decision
+            # Layer 2 reads these: direction to trade, and the expected move
+            # size (empirical median |move| given an event) for TP distance —
+            # the regressor's collapsed |pred| must NOT size trades any more.
+            csv_row[f'{inst}_p_move'] = _pm
+            csv_row[f'{inst}_p_up'] = _pu
+            csv_row[f'{inst}_dir'] = int(trade_dir) if trade_dir else 0
+            # PER-POST predicted size when the size head exists; the flat
+            # per-instrument median only as a fallback.
+            csv_row[f'{inst}_exp_move'] = (
+                float(p_size[inst][row_i]) if inst in p_size
+                else _gate.get(inst, {}).get("median_abs_move"))
+            csv_row[f'{inst}_size_flat'] = _gate.get(inst, {}).get("median_abs_move")
 
         csv_rows.append(csv_row)
 
     return stats, td_stats, csv_rows
+
+
+def print_size_summary(csv_rows, instruments, dir_threshold):
+    """SIZE ACCURACY — the honest answer to "the predicted number is nowhere
+    near the actual". The old MAGNITUDE table scored the SIGNED regressor,
+    which reads MdAPE 100% on every instrument because it predicts ~0. This
+    table scores the SIZE head against |actual|: how big will the move be,
+    with the sign supplied separately by the direction head.
+    """
+    import numpy as _np
+    rows = []
+    for inst in instruments:
+        p, a = [], []
+        for r in csv_rows:
+            if r.get('total_mult', 1.0) != 1.0:
+                continue
+            pv, av = r.get(f'{inst}_exp_move'), r.get(f'{inst}_actual')
+            if pv is None or av is None or abs(av) < dir_threshold:
+                continue
+            p.append(float(pv)); a.append(abs(float(av)))
+        if len(p) < 8:
+            continue
+        p, a = _np.array(p), _np.array(a)
+        corr = float(_np.corrcoef(p, a)[0, 1]) if p.std() > 1e-12 else float('nan')
+        rows.append((inst, len(p), corr, p.mean() / max(a.mean(), 1e-9),
+                     float(_np.median(_np.abs(p - a) / _np.maximum(a, 1e-9))),
+                     p.mean(), a.mean()))
+    if not rows:
+        return
+    print("\n" + "=" * 78)
+    print("  SIZE ACCURACY  (|predicted move| vs |actual move|) — the number "
+          "that matters")
+    print("  Direction is supplied separately; this scores magnitude ALONE.")
+    print("=" * 78)
+    print(f"  {'instrument':<10} {'n':>5} {'corr':>7} {'scale':>7} {'MdAPE':>7} "
+          f"{'mean|p|':>9} {'mean|a|':>9}")
+    for inst, n, corr, sc, md, mp, ma in sorted(rows, key=lambda r: -r[2]):
+        mk = "✅" if corr >= 0.15 else ("🟡" if corr >= 0.08 else "🔴")
+        print(f"  {mk}{inst:<9} {n:>5} {corr:>7.3f} {sc:>7.2f} {md:>7.0%} "
+              f"{mp:>9.3f} {ma:>9.3f}")
+    _c = [r[2] for r in rows if r[2] == r[2]]
+    _s = [r[3] for r in rows]
+    print("-" * 78)
+    print(f"  OVERALL  mean corr={_np.mean(_c):+.3f}  mean scale="
+          f"{_np.mean(_s):.2f}x (want ~1.0)")
+    print("  Reference: the SIGNED regressor scores corr 0.031 at scale 0.003x "
+          "(MdAPE 100%)")
+    print("=" * 78)
 
 
 def print_magnitude_summary(csv_rows, instruments, dir_threshold):
@@ -732,10 +886,14 @@ def print_summary(stats, dir_threshold):
     print("=" * 78)
 
 
-def print_trade_skip_summary(td_stats, trade_threshold, dir_threshold):
+def print_trade_skip_summary(td_stats, trade_threshold, dir_threshold, gate_on=False):
     print("\n" + "=" * 78)
-    print(f"  TRADE vs SKIP  (TRADE = |predicted move| >= {trade_threshold}%, "
-          f"based on the model's own prediction)")
+    if gate_on:
+        print("  TRADE vs SKIP  (TRADE = P(move) >= per-instrument gate AND the")
+        print("                  direction head has an edge; direction from P(up))")
+    else:
+        print(f"  TRADE vs SKIP  (TRADE = |predicted move| >= {trade_threshold}%, "
+              f"based on the model's own prediction)")
     print("=" * 78)
 
     tot = {'trade_n': 0, 'trade_match': 0,
@@ -859,7 +1017,11 @@ def write_csv(csv_rows, csv_path, instruments):
                   'date', 'text',
                   'nlp_signal', 'gate', 'temporal_label', 'total_mult']
     for inst in instruments:
-        fieldnames += [f'{inst}_pred', f'{inst}_actual', f'{inst}_match', f'{inst}_decision']
+        fieldnames += [f'{inst}_pred', f'{inst}_actual', f'{inst}_match',
+                       f'{inst}_decision',
+                       # two-head classifier outputs (Layer 2 sizes from these)
+                       f'{inst}_p_move', f'{inst}_p_up', f'{inst}_dir',
+                       f'{inst}_exp_move', f'{inst}_size_flat']
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
@@ -948,6 +1110,14 @@ def main():
                     help=f"Minimum |predicted %% move| to count as a TRADE decision "
                          f"(vs SKIP) in the TRADE/SKIP summary. Default: same as "
                          f"--dir-threshold ({DIR_THRESHOLD_DEFAULT}).")
+    ap.add_argument("--edge-min", type=float, default=0.05,
+                    help="Two-head gate: minimum |P(up) - 0.5| from the direction "
+                         "head for a TRADE. 0.05 = model must be at least 55/45. "
+                         "Raise it to trade less but more confidently (default 0.05).")
+    ap.add_argument("--trade-all", action="store_true",
+                    help="Trade every instrument, including those whose direction "
+                         "head failed to beat chance out-of-sample. Default is to "
+                         "trade only instruments flagged tradeable in config.json.")
     ap.add_argument("--model-dir", default=OUT_DIR,
                     help=f"Directory with <INST>_Impact.json + config.json (default {OUT_DIR}).")
     ap.add_argument("--fine-tune", action="store_true",
@@ -1024,12 +1194,18 @@ def main():
 
     trade_threshold = args.trade_threshold if args.trade_threshold is not None else args.dir_threshold
 
-    stats, td_stats, csv_rows = run_backtest(df, X, cfg, models, impact_cols, args.dir_threshold, trade_threshold)
+    stats, td_stats, csv_rows = run_backtest(df, X, cfg, models, impact_cols,
+                                             args.dir_threshold, trade_threshold,
+                                             edge_min=args.edge_min,
+                                             require_tradeable=not args.trade_all)
 
     print_summary(stats, args.dir_threshold)
     print_magnitude_summary(csv_rows, [i for i in instruments if i in models],
                             args.dir_threshold)
-    print_trade_skip_summary(td_stats, trade_threshold, args.dir_threshold)
+    print_size_summary(csv_rows, [i for i in instruments if i in models],
+                       args.dir_threshold)
+    print_trade_skip_summary(td_stats, trade_threshold, args.dir_threshold,
+                             gate_on=bool(cfg.get("_clf_move")))
     print_filtered_accuracy(td_stats, args.dir_threshold)
     write_trade_accuracy(td_stats, args.model_dir, trade_threshold, since, until)
 

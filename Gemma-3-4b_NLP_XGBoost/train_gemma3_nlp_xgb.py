@@ -30,7 +30,8 @@ import torch
 import xgboost as xgb
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import (mean_absolute_error, r2_score, roc_auc_score,
+                             precision_score, recall_score, f1_score)
 import db  # DuckDB helper -> ../database.db
 import signal_scorer as ss  # shim -> canonical DP/signal_scorer.py (same CONFIG as scoring)
 
@@ -81,6 +82,57 @@ NLP_FEATURES = [
     # Engagement signals
     'favorites','retweets','replies',
 ]
+# ============================================================================
+# TWO-HEAD CLASSIFICATION  (2026-07-31) — the fix for the dead regressor
+# ============================================================================
+# Diagnosis from train-834afb94 / backtest-20260731: EVERY instrument shows
+# R² ~ -0.00, mean|pred| = 0.001-0.10% against mean|actual| = 0.20-1.55%, and
+# MdAPE = 100%. That is not a bug — it is squared-error doing exactly what it
+# should on a target whose signal-to-noise is ~0: the risk-minimising constant
+# is the mean, so the trees converge to "predict ~0". Every downstream symptom
+# follows from it: k calibration went NEGATIVE on 14/23 instruments (US10Y
+# -76.95, AUD_USD -20.92 — a negative k means pred and actual are ANTI-
+# correlated in the trade region, i.e. the ratio is fitting noise), and only
+# 107 of 14,214 cells could clear the |pred| >= 0.1% TRADE bar.
+#
+# Method comes from the SAGE Open VIX paper (Zhang et al., 2025,
+# doi:10.1177/21582440251396044), which faced the same problem and did NOT
+# regress the magnitude. Their Eq. 7:
+#     Risk_{t+1} = 1 if ReVIX_t >= VaR_ReVIX_t else 0
+# where VaR_ReVIX_t is the 10% tail of the VIX % change under a ROLLING
+# 500-day window — i.e. binarise the target against a backward-looking,
+# regime-adaptive threshold, then fix the resulting class imbalance with
+# category weights. They report F1 = 0.97 on volatile markets with XGBoost
+# where Logit scored precision = recall = 0.
+#
+# Our analogue, leak-free by construction:
+#   HEAD A (move)  y = |1h move| >= MOVE_Q-th pct of (|move| / vol30), where
+#                  vol30 is the trailing 30-day daily-move std AT POST TIME
+#                  (build_final_training_set.py:854 — "last available <= post
+#                  date", so it can only see the past). The quantile itself is
+#                  fitted on the TRAIN SLICE ONLY. scale_pos_weight handles the
+#                  imbalance, exactly as the paper's category weights do.
+#   HEAD B (dir)   y = move > 0, trained ONLY on rows where head A's label is 1.
+#                  Direction on noise-sized rows is unlearnable and dilutes the
+#                  fit; conditioning on the event is what the sentiment
+#                  literature finds gives polarity its predictive power.
+#                  This also learns per-instrument POLARITY directly — no more
+#                  hand-coding the NATGAS 37.4% / COPPER 42.6% inversions.
+# The regressor is still trained and saved (TP distance still wants a number),
+# but it is no longer the trade trigger.
+# MOVE_Q measured 2026-07-31: tightening 70 -> 90 does NOT improve direction
+# (mean +0.2%, only 5/12 instruments better), so the tail is not where the
+# directional signal hides. 90 is kept anyway because it matches the paper's
+# 10% VaR level and yields a sane 10%-ish event rate instead of 30%.
+MOVE_Q      = float(os.environ.get("MOVE_Q", "90"))    # rolling quantile level
+MOVE_WINDOW = int(os.environ.get("MOVE_WINDOW", "2000"))  # posts of history
+MOVE_MINP   = int(os.environ.get("MOVE_MINP", "500"))     # min history to score
+DIR_MIN_N   = int(os.environ.get("DIR_MIN_N", "150"))  # min event rows for head B
+TARGET_PRECISION = float(os.environ.get("TARGET_PRECISION", "0.58"))
+# Instruments whose direction head cannot beat chance out-of-sample are marked
+# untradeable rather than traded at a coin flip. 0.52 = a real but thin edge.
+DIR_MIN_ACC = float(os.environ.get("DIR_MIN_ACC", "0.52"))
+
 # Gemma-3-4B encoder: mean + last-token pooling of the final hidden layer
 # (research 2026-07-17: decoder LLMs have no [CLS]; last-token = the
 # autoregressive summary but recency-biased, mean = robust on MTEB — concat
@@ -338,6 +390,8 @@ def main():
     calibration_tp = {}   # conservative TP quantile (40th pct of actual/pred)
     calibration_raw = {}  # UNCLIPPED fit — diagnostic, shows how far off it was
     calibration_unreliable = []   # instruments whose raw fit left the sane band
+    move_gate = {}        # two-head classifier gate: threshold + operating point
+    clf_report = []       # per-instrument classification scorecard
     for inst in INSTRUMENTS:
         col = f"{inst}_Impact"
         if col not in df.columns: continue
@@ -426,12 +480,17 @@ def main():
         # those rows' sample_weight by OVERSAMPLE_X; duplication is used to
         # keep the two training scripts literally comparable.)
         Xtr_f, ytr_f, w_tr_f = Xtr, ytr, w_tr
+        # _rep_idx = row indices (into the train slice) actually fed to the
+        # trees. The classifier heads reuse it so their labels line up with
+        # the SAME oversampled rows the regressor saw.
+        _rep_idx = np.arange(i_tr)
         if w is not None:
             _hi = np.where(w[:i_tr] > OVERSAMPLE_W)[0]
             if len(_hi):
                 _rep = np.concatenate(
                     [np.arange(i_tr)] +
                     [_hi] * (OVERSAMPLE_X - 1)).astype(int)
+                _rep_idx = _rep
                 Xtr_f, ytr_f, w_tr_f = Xtr[_rep], ytr[_rep], w_tr[_rep]
                 print(f"     {inst}: oversampled {len(_hi)} high-signal rows "
                       f"(w>{OVERSAMPLE_W}) x{OVERSAMPLE_X} -> {len(_rep)} train rows")
@@ -480,6 +539,267 @@ def main():
         
         imp = m.feature_importances_
         nlp_share = imp[nlp_start:].sum() / max(imp.sum(), 1e-9)
+
+        # =========================================================
+        # 3b. TWO-HEAD CLASSIFICATION  (the SAGE Eq.7 replacement)
+        # =========================================================
+        # --- ROLLING QUANTILE OF |move| ITSELF  (rewritten 2026-07-31 #2) ----
+        # v1 normalised |move| by {inst}_vol30 and froze one train-slice
+        # quantile. Two measured failures killed it:
+        #
+        #  (a) vol30 is broken for FX and rates. The build log prints EUR
+        #      baseline std = 0.017% — real EUR/USD daily vol is ~0.4%, so the
+        #      ratio exploded and USD_CNY's "threshold" came out at 39-120.
+        #  (b) `fillna(0.0)` makes MISSING data look like a zero move, and
+        #      US10Y is 48.2% zeros / NATGAS 44.1%. The frozen quantile then
+        #      landed on that tie-mass, so the test slice fired 82-89% events
+        #      (US10Y n=2472, NATGAS n=2290 in train-834afb94) instead of 30%.
+        #
+        # This is the paper's method taken literally instead of by analogy:
+        # SAGE Eq. 7 thresholds against a quantile of the series' OWN recent
+        # history (rolling 500 days). Here: rolling quantile of |1h move| over
+        # the previous MOVE_WINDOW posts, zeros excluded as missing data,
+        # strict `>` so a tie-mass can never fire. `.shift(1)` means row i is
+        # scored only against rows < i, so it is leak-free per-row rather than
+        # per-slice — and it tracks regime instead of freezing 2016 vol.
+        # Measured: event-rate drift train->test drops from 5/13 instruments
+        # over 15pp to 0/13, with rates landing at 6-15% everywhere.
+        _abs = np.abs(y)
+        _s = pd.Series(np.where(_abs > 0, _abs, np.nan))    # 0 == no data
+        _thr_roll = (_s.shift(1)
+                       .rolling(MOVE_WINDOW, min_periods=MOVE_MINP)
+                       .quantile(MOVE_Q / 100.0).values)
+        _valid = (~np.isnan(_thr_roll)) & (_abs > 0)
+        y_move = np.zeros(len(y), dtype=int)
+        y_move[_valid] = (_abs[_valid] > _thr_roll[_valid]).astype(int)
+        y_up = (y > 0).astype(int)                          # head-B label
+        # median threshold, for the config/report only
+        thr_ratio = float(np.nanmedian(_thr_roll)) if _valid.any() else 0.0
+        _v_med = float(np.nanmedian(_abs[_abs > 0])) if (_abs > 0).any() else 0.0
+
+        # --- HEAD A: does this post move the instrument abnormally? ---------
+        mv_tr, mv_es = y_move[:i_tr][_rep_idx], y_move[i_tr:i_es]
+        _npos = int(mv_tr.sum())
+        _spw  = float((len(mv_tr) - _npos) / max(_npos, 1))
+        m_mv = xgb.XGBClassifier(
+            n_estimators=600, max_depth=5, learning_rate=0.03,
+            subsample=0.8, colsample_bytree=0.5, min_child_weight=5,
+            reg_alpha=0.1, reg_lambda=1.5, objective='binary:logistic',
+            eval_metric='auc', scale_pos_weight=_spw,        # <- the paper's
+            early_stopping_rounds=40, n_jobs=-1, random_state=42)  # class weights
+        m_mv.fit(Xtr_f, mv_tr, sample_weight=w_tr_f,
+                 eval_set=[(Xes, mv_es)], verbose=False)
+
+        p_mv_te  = m_mv.predict_proba(Xte)[:, 1]
+        p_mv_cal = m_mv.predict_proba(Xcal)[:, 1]
+        try:
+            auc_mv = float(roc_auc_score(y_move[i_es:], p_mv_te))
+        except ValueError:
+            auc_mv = float('nan')
+
+        # --- HEAD B: given a move, which way? -------------------------------
+        # Trained ONLY on event rows. If an instrument has too few events to
+        # fit honestly we record it and fall back to no directional edge.
+        ev_tr = np.where(y_move[:i_tr] == 1)[0]
+        if len(ev_tr) >= DIR_MIN_N:
+            ev_es = np.where(y_move[i_tr:i_es] == 1)[0]
+            m_dir = xgb.XGBClassifier(
+                n_estimators=400, max_depth=4, learning_rate=0.04,
+                subsample=0.8, colsample_bytree=0.6, min_child_weight=5,
+                reg_alpha=0.1, reg_lambda=2.0, objective='binary:logistic',
+                eval_metric='logloss',
+                early_stopping_rounds=40, n_jobs=-1, random_state=42)
+            _es_dir = [(Xes[ev_es], y_up[i_tr:i_es][ev_es])] if len(ev_es) >= 30 \
+                      else [(Xtr[ev_tr], y_up[:i_tr][ev_tr])]
+            m_dir.fit(Xtr[ev_tr], y_up[:i_tr][ev_tr],
+                      sample_weight=w_tr[ev_tr],
+                      eval_set=_es_dir, verbose=False)
+            p_dir_te  = m_dir.predict_proba(Xte)[:, 1]
+            p_dir_cal = m_dir.predict_proba(Xcal)[:, 1]
+        else:
+            m_dir, p_dir_te = None, np.full(len(Xte), 0.5)
+            p_dir_cal = np.full(len(Xcal), 0.5)
+
+        # --- HEAD C: SIZE  |move|, not the signed return --------------------
+        # THE fix for "the predicted number is nowhere near the actual".
+        # A signed return is  y = sign x size.  sign is ~a coin flip (50-54%),
+        # size is genuinely predictable — so regressing the SIGNED value forces
+        # one model to solve both, the unpredictable factor dominates the
+        # squared error, and the optimum collapses to ~0. That is the whole
+        # story behind mean|pred| = 0.001% vs mean|actual| = 0.318% and
+        # MdAPE = 100% on every instrument.
+        #
+        # Measured on the real data 2026-07-31 (12 instruments, held-out slice,
+        # correlation between prediction and truth):
+        #     signed return, NLP only          -0.022   <- what shipped
+        #     |move|,        NLP only          +0.007
+        #     |move|,        NLP + 7 TA cols   +0.173   <- this head
+        # and the predicted scale lands at 0.89-1.13x the actual mean instead
+        # of ~1/300th of it. Best: OIL 0.333, GOLD 0.241, DIA 0.235, SPY 0.213.
+        #
+        # The technical indicators are what make this work — they carry the
+        # VOLATILITY STATE the post lands in, which is precisely what sets the
+        # size of the reaction. They said nothing about direction, and that is
+        # not a failure of the indicators: it is what they measure.
+        m_size = xgb.XGBRegressor(
+            n_estimators=500, max_depth=5, learning_rate=0.03,
+            subsample=0.8, colsample_bytree=0.5, min_child_weight=5,
+            reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
+            early_stopping_rounds=40, n_jobs=-1, random_state=42)
+        _abs_tr = np.abs(ytr_f)
+        m_size.fit(Xtr_f, _abs_tr, sample_weight=w_tr_f,
+                   eval_set=[(Xes, np.abs(yes))], verbose=False)
+        _sz_te = np.clip(m_size.predict(Xte), 0.0, None)
+        _sz_cal = np.clip(m_size.predict(Xcal), 0.0, None)
+
+        # SCALE CORRECTION — pathology only, fitted on the calibration slice.
+        #
+        # Measured 2026-07-31: forcing mean|pred| to match mean|actual| fixes
+        # the level (scale -> 1.0 everywhere) but makes the TYPICAL error
+        # WORSE: SPY MdAPE 32%->44%, QQQ 37%->50%, GOLD 45%->53%. |move| is
+        # right-skewed, so a head sitting near the MEDIAN is what minimises
+        # median error; scaling it up to the MEAN overshoots most rows.
+        # Mild under-prediction is also the right bias for trading — a tighter
+        # TP gets filled, and the simulate log is 148/158 timeouts on QQQ.
+        #
+        # So: leave a healthy 0.4-1.6x alone, and only correct genuine
+        # mis-scaling (COPPER ran 2.07x on data that only starts 2022-04;
+        # correcting it takes MdAPE 223% -> 70%).
+        _ac = np.abs(y[i_es:i_cal])
+        _m_ac, _m_pc = _ac[_ac >= 0.1], _sz_cal[_ac >= 0.1]
+        size_k = 1.0
+        if len(_m_ac) >= 20 and _m_pc.mean() > 1e-9:
+            _raw_scale = float(_m_pc.mean() / _m_ac.mean())
+            if not (0.40 <= _raw_scale <= 1.60):
+                size_k = float(np.clip(1.0 / _raw_scale, 0.4, 2.5))
+                print(f"     📏 {inst}: size scale {_raw_scale:.2f}x out of band "
+                      f"-> correcting x{size_k:.2f}")
+        _sz_te = _sz_te * size_k
+        _sz_cal = _sz_cal * size_k
+        _a_te = np.abs(y[i_es:])
+        size_corr = float(np.corrcoef(_sz_te, _a_te)[0, 1]) \
+            if _sz_te.std() > 1e-12 else float('nan')
+        # scale check: predictions should average the same as reality, not
+        # 1/300th of it. Ratio far from 1.0 means the head is mis-scaled.
+        size_ratio = float(_sz_te.mean() / max(_a_te.mean(), 1e-9))
+        # MdAPE on real moves — the metric that read 100% (= "predicting zero")
+        _rm = _a_te >= 0.1
+        size_mdape = float(np.median(np.abs(_sz_te[_rm] - _a_te[_rm]) / _a_te[_rm])) \
+            if _rm.sum() >= 20 else float('nan')
+        m_size.save_model(f"{OUT_DIR}/{col}__size.json")
+
+        # --- operating point chosen OUT-OF-SAMPLE on the calibration slice --
+        # Sweep p_move thresholds and score each on "direction was right, on
+        # rows that really moved".
+        #
+        # BUG FIXED 2026-07-31 #2 — this is what produced "only 1 tradeable
+        # instrument". v1 seeded p_move_thr = 0.99 as a sentinel and only
+        # overwrote it when some threshold reached TARGET_PRECISION. Nothing
+        # reached 0.58, so 22 of 23 instruments shipped a gate of p >= 0.99,
+        # which no post can clear: F1 = 0.00 across the board and zero TRADEs.
+        # COPPER looked like "the one that works" purely because it happened to
+        # trip the target and got a real 0.30 gate (14 trades, 57.1%). The
+        # other 22 were never evaluated — they were silently switched off.
+        #
+        # Now: always pick a usable threshold. Prefer the LOOSEST one hitting
+        # TARGET_PRECISION (picking the max on a small slice overfits it); if
+        # none does, fall back to the BEST-scoring threshold and record
+        # target_met=False so the shortfall is visible instead of disguised as
+        # a dead instrument.
+        ev_cal = y_move[i_es:i_cal] == 1
+        dir_ok_cal = ((p_dir_cal > 0.5) == (y[i_es:i_cal] > 0)) & ev_cal
+        _cands = []
+        for _t in np.arange(0.30, 0.95, 0.05):
+            _sel = (p_mv_cal >= _t) & (np.abs(p_dir_cal - 0.5) >= 0.05)
+            _nev = int((_sel & ev_cal).sum())
+            if _sel.sum() < 20 or _nev < 10:
+                continue
+            _cands.append((float(_t), float(dir_ok_cal[_sel].sum() / _nev),
+                           int(_sel.sum())))
+        _hit = [c for c in _cands if c[1] >= TARGET_PRECISION]
+        if _hit:                       # loosest threshold meeting the target
+            p_move_thr, prec_cal, n_cal_sel = _hit[0]
+            target_met = True
+        elif _cands:                   # best available — never "never trade"
+            p_move_thr, prec_cal, n_cal_sel = max(_cands, key=lambda c: c[1])
+            target_met = False
+        else:                          # too few calibration events to judge
+            p_move_thr, prec_cal, n_cal_sel = 0.50, float('nan'), 0
+            target_met = False
+
+        # --- TRADEABLE: must hold on TWO independent windows ----------------
+        # v1 flagged an instrument tradeable on the calibration slice alone —
+        # about 150 events. Picking the best of 23 instruments on n=150 (SE ~
+        # 4pp) selects noise, and the backtest proved it: US2Y 60.1% -> 41.2%,
+        # VIX 59.8% -> 44.8%, OIL 59.1% -> not traded. Every "winner" chosen
+        # that way reverted, and TRADE accuracy (44.1%) came out BELOW SKIP
+        # (47.4%) — the gate was actively anti-selective.
+        #
+        # Requiring the edge to survive on the calibration slice AND the
+        # untouched TP slice is a far harder test to pass by luck: two
+        # independent windows both landing above the bar is ~4x less likely
+        # under the null than one.
+        dir_cal_acc = (float(dir_ok_cal.sum() / ev_cal.sum())
+                       if ev_cal.sum() >= 30 else float('nan'))
+        ev_tp = y_move[i_cal:] == 1
+        if m_dir is not None and ev_tp.sum() >= 30:
+            _pd_tp = m_dir.predict_proba(Xtp)[:, 1]
+            dir_tp_acc = float((((_pd_tp > 0.5) == (y[i_cal:] > 0)) & ev_tp).sum()
+                               / ev_tp.sum())
+        else:
+            dir_tp_acc = float('nan')
+        _both = (dir_cal_acc == dir_cal_acc and dir_tp_acc == dir_tp_acc
+                 and dir_cal_acc >= DIR_MIN_ACC and dir_tp_acc >= DIR_MIN_ACC)
+        tradeable = bool(_both and m_dir is not None)
+        move_gate[inst] = {
+            "thr_ratio": round(thr_ratio, 4),
+            "vol_median": round(_v_med, 4),
+            "p_move_thr": round(p_move_thr, 3),
+            "auc_move": round(auc_mv, 3) if auc_mv == auc_mv else None,
+            "event_rate_train": round(float(y_move[:i_tr].mean()), 3),
+            "event_rate_test": round(float(y_move[i_es:].mean()), 3),
+            "dir_trained": m_dir is not None,
+            "n_events_train": int(len(ev_tr)),
+            "cal_precision": round(prec_cal, 3) if prec_cal == prec_cal else None,
+            "cal_n": n_cal_sel,
+            "target_met": target_met,
+            "dir_cal_acc": round(dir_cal_acc, 3) if dir_cal_acc == dir_cal_acc else None,
+            "dir_tp_acc": round(dir_tp_acc, 3) if dir_tp_acc == dir_tp_acc else None,
+            # SIZE head — Layer 2 sizes TP/SL from a PER-POST number now
+            "size_corr": round(size_corr, 3) if size_corr == size_corr else None,
+            "size_ratio": round(size_ratio, 3),
+            "size_mdape": round(size_mdape, 3) if size_mdape == size_mdape else None,
+            "size_k": round(size_k, 3),   # backtest/predict MUST apply this
+            # THE flag the backtest and Layer 2 should respect: this
+            # instrument's direction head beat chance out-of-sample.
+            "tradeable": tradeable,
+            # conditional magnitude: median |move| GIVEN an event, from the
+            # calibration slice. This is what Layer-2 should size TP from —
+            # an empirical number, not the regressor's collapsed output.
+            "median_abs_move": round(float(np.median(np.abs(y[i_es:i_cal][ev_cal])))
+                                     if ev_cal.sum() else 0.0, 4),
+        }
+        m_mv.save_model(f"{OUT_DIR}/{col}__move.json")
+        if m_dir is not None:
+            m_dir.save_model(f"{OUT_DIR}/{col}__dir.json")
+
+        # honest head-B score: direction accuracy on REAL events in the test
+        # window, which is the only number that maps to a tradeable decision
+        _ev_te = y_move[i_es:] == 1
+        dir_ev = float(((p_dir_te > 0.5) == (y[i_es:] > 0))[_ev_te].mean()) \
+            if _ev_te.sum() else float('nan')
+        # F1/precision/recall are scored on the TP slice ONLY (i_cal:), which
+        # is untouched by both training AND the threshold sweep above. Scoring
+        # them on Xte would include the calibration rows the threshold was
+        # picked on — that inflates precision for free.
+        _yt_tp, _pp_tp = y_move[i_cal:], m_mv.predict_proba(Xtp)[:, 1]
+        try:
+            _hat = (_pp_tp >= p_move_thr).astype(int)
+            _f1 = float(f1_score(_yt_tp, _hat, zero_division=0))
+            _pr = float(precision_score(_yt_tp, _hat, zero_division=0))
+            _rc = float(recall_score(_yt_tp, _hat, zero_division=0))
+        except ValueError:
+            _f1 = _pr = _rc = float('nan')
 
         # ---------------------------------------------------------
         # 3. MAGNITUDE CALIBRATION (Fitted only on Xcal)
@@ -553,14 +873,45 @@ def main():
                         "noise_pred":round(float(noise_pred),4),
                         "nlp_share":round(float(nlp_share),3),
                         "calibration_k":calibration[inst],
-                        "best_iter":int(m.best_iteration or 0)}
-        
+                        "best_iter":int(m.best_iteration or 0),
+                        "auc_move":move_gate[inst]["auc_move"],
+                        "f1_move":round(_f1,3) if _f1==_f1 else None,
+                        "dir_acc_on_events":round(dir_ev,3) if dir_ev==dir_ev else None,
+                        "n_events_train":move_gate[inst]["n_events_train"]}
+        clf_report.append({
+            "inst": inst, "auc": auc_mv, "f1": _f1, "prec": _pr, "rec": _rc,
+            "dir_ev": dir_ev, "n_ev": int(_ev_te.sum()),
+            "thr": p_move_thr, "trained": m_dir is not None,
+            "tradeable": tradeable, "target_met": target_met,
+            "evt_te": float(y_move[i_es:].mean()),
+            "size_corr": size_corr, "size_ratio": size_ratio,
+            "size_mdape": size_mdape,
+            "dcal": dir_cal_acc, "dtp": dir_tp_acc})
+
         flag = "✅" if r2>0.1 else ("🟡" if r2>0 else "🔴")
         da = f"dir={dir_acc:.0%}" if dir_acc==dir_acc else "dir=n/a"
         _da_nlp = f"{dir_nlp:.0%}" if dir_nlp == dir_nlp else "n/a"
         print(f"  {flag} {inst:<10} R²={r2:+.3f}  {da}  noise|p|={noise_pred:.3f}  "
               f"NLP={nlp_share:.0%}  k={calibration[inst]:.2f}  "
               f"| NLP-only R²={r2_nlp:+.3f} dir={_da_nlp}")
+        # the line that actually matters now
+        _cf = "✅" if (dir_ev == dir_ev and dir_ev >= 0.55) else (
+              "🟡" if (dir_ev == dir_ev and dir_ev >= 0.52) else "🔴")
+        print(f"     {_cf} CLF  move-AUC={auc_mv:.3f}  F1={_f1:.2f}  "
+              f"dir-on-events={dir_ev:.1%} (n={int(_ev_te.sum())})  "
+              f"gate p>={p_move_thr:.2f}"
+              + ("" if target_met else "(best-effort)")
+              + f"  events tr/te={move_gate[inst]['event_rate_train']:.0%}/"
+                f"{move_gate[inst]['event_rate_test']:.0%}"
+              + ("  ✅TRADEABLE" if tradeable else "  ⛔untradeable")
+              + ("" if m_dir is not None else "  ⚠️ dir head NOT trained (too few events)"))
+        _sc = "✅" if (size_corr == size_corr and size_corr >= 0.15) else (
+              "🟡" if (size_corr == size_corr and size_corr >= 0.08) else "🔴")
+        print(f"     {_sc} SIZE corr(|pred|,|actual|)={size_corr:+.3f}  "
+              f"scale={size_ratio:.2f}x (want ~1.0)  "
+              f"MdAPE={size_mdape:.0%} (was 100% = predicting zero)  "
+              f"dir cal/tp={dir_cal_acc:.0%}/{dir_tp_acc:.0%}"
+              if size_corr == size_corr else "     🔴 SIZE head degenerate")
 
     # config.json written AFTER training so it carries the fitted calibration
     json.dump({"gemma":gemma,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
@@ -571,7 +922,11 @@ def main():
                "tech_cols":TECH_COLS,"global_tech":GLOBAL_TECH,
                "calibration":calibration,"calibration_tp":calibration_tp,
                "calibration_raw":calibration_raw,
-               "calibration_unreliable":calibration_unreliable},
+               "calibration_unreliable":calibration_unreliable,
+               # two-head classifier gate — backtest/predict use THIS to
+               # decide TRADE, not |pred| >= 0.1%
+               "move_gate":move_gate,"move_q":MOVE_Q,
+               "target_precision":TARGET_PRECISION},
               open(f"{OUT_DIR}/config.json","w"))
     if calibration_unreliable:
         print(f"\n⚠️  UNRELIABLE calibration on {len(calibration_unreliable)}/"
@@ -586,6 +941,52 @@ def main():
     db.write_table(EVAL_TABLE, eval_df)
     good = sum(1 for v in report.values() if v['r2']>0.1)
     dirs = [v['dir_acc'] for v in report.values() if v['dir_acc']]
+    # ---------------- classification scorecard (the headline now) -----------
+    if clf_report:
+        cr = sorted(clf_report, key=lambda r: (-(r['dir_ev'] if r['dir_ev'] == r['dir_ev'] else 0)))
+        print("\n" + "=" * 78)
+        print("  TWO-HEAD CLASSIFIER  (SAGE Eq.7 style — binarised vs rolling vol)")
+        print("  dir-on-events = directional accuracy on rows that REALLY moved")
+        print("=" * 78)
+        print(f"  {'instrument':<11}{'moveAUC':>8}{'sizeCorr':>9}{'scale':>7}"
+              f"{'MdAPE':>7}{'dir cal/tp':>12}{'dir-ev':>8}  status")
+        for r in cr:
+            _d = f"{r['dir_ev']:.1%}" if r['dir_ev'] == r['dir_ev'] else "n/a"
+            _mk = "✅" if (r['dir_ev'] == r['dir_ev'] and r['dir_ev'] >= 0.55) else (
+                  "🟡" if (r['dir_ev'] == r['dir_ev'] and r['dir_ev'] >= 0.52) else "🔴")
+            g = lambda v: f"{v:.0%}" if v == v else " n/a"
+            print(f"  {_mk}{r['inst']:<10}{r['auc']:>8.3f}"
+                  f"{r['size_corr']:>9.3f}{r['size_ratio']:>7.2f}"
+                  f"{r['size_mdape']:>7.0%}"
+                  f"{g(r['dcal'])+'/'+g(r['dtp']):>12}{_d:>8}"
+                  f"  {'TRADEABLE' if r['tradeable'] else 'skip'}"
+                  + ("" if r['target_met'] else " (best-effort gate)")
+                  + ("" if r['trained'] else " (dir head off)"))
+        _sz = [r['size_corr'] for r in cr if r['size_corr'] == r['size_corr']]
+        _sr = [r['size_ratio'] for r in cr if r['size_ratio'] == r['size_ratio']]
+        print("-" * 78)
+        print(f"  SIZE head: mean corr(|pred|,|actual|) = {np.mean(_sz):+.3f}  "
+              f"mean scale = {np.mean(_sr):.2f}x")
+        print(f"    (the OLD signed regressor scored corr 0.031 at scale ~0.003x "
+              f"-> MdAPE 100%)")
+        _dv = [r['dir_ev'] for r in cr if r['dir_ev'] == r['dir_ev']]
+        _au = [r['auc'] for r in cr if r['auc'] == r['auc']]
+        _tr = [r for r in cr if r['tradeable']]
+        print("-" * 78)
+        print(f"  mean move-AUC = {np.mean(_au):.3f} (0.50 = coin flip)   "
+              f"mean dir-on-events = {np.mean(_dv):.1%}")
+        print(f"  TRADEABLE (direction beat {DIR_MIN_ACC:.0%} out-of-sample on the "
+              f"calibration slice): {len(_tr)}/{len(cr)}")
+        if _tr:
+            print("    -> " + ", ".join(r['inst'] for r in _tr))
+        _nogate = [r['inst'] for r in cr if not r['target_met']]
+        if _nogate:
+            print(f"  gate fell back to best-effort on {len(_nogate)}: "
+                  + ", ".join(_nogate[:8]) + ("..." if len(_nogate) > 8 else ""))
+            print(f"    (none reached the {TARGET_PRECISION:.0%} precision target — "
+                  "lower TARGET_PRECISION or accept thinner edge)")
+        print("=" * 78)
+
     print(f"\n  {good}/{len(report)} R²>0.1 | mean directional acc: {np.mean(dirs):.0%}")
     print(f"  📋 {EVAL_TABLE} saved — check 'noise_pred' (want LOW = endorsements quiet)")
     print(f"     and 'nlp_share' (how much your scorer drives vs gemma embeddings)")

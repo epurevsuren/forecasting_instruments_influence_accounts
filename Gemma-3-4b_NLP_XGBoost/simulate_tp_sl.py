@@ -308,13 +308,23 @@ def main():
 
     for n_i, inst in enumerate(instruments, 1):
         dcol, pcol = f"{inst}_decision", f"{inst}_pred"
+        # TWO-HEAD COLUMNS (2026-07-31). The backtest now emits <INST>_dir
+        # (direction from the classifier) and <INST>_exp_move (empirical median
+        # |1h move| on real events). We MUST use them when present: the
+        # regressor's |pred| collapsed to ~0.001-0.1%, so sizing TP/SL from it
+        # puts every trade under --min-pred and this layer would report "no
+        # trades" while the model was actually calling them fine.
+        dircol, excol = f"{inst}_dir", f"{inst}_exp_move"
+        has_heads = dircol in posts.columns and excol in posts.columns
         todo = posts[posts[dcol] == "TRADE"]
         if todo.empty:
             print(f"\n[{n_i}/{len(instruments)}] ⏭️  {inst}: no TRADE-flagged posts")
             continue
 
         print(f"\n[{n_i}/{len(instruments)}] 📥 {inst}: loading 1-min bars "
-              f"({len(todo)} trade candidates)...", flush=True)
+              f"({len(todo)} trade candidates)"
+              + ("  [two-head: dir + exp_move]" if has_heads else "  [legacy |pred|]")
+              + "...", flush=True)
         bars = load_1min(inst, t_min, t_max)
         if bars is None:
             print(f"  ❌ {inst}: no 1-min cache file / no bars in span — skipped")
@@ -339,7 +349,20 @@ def main():
         # open would ride the SAME move twice. Skip until the position exits.
         open_until = None
         for _, p in todo.sort_values("post_ts").iterrows():
-            pred = float(p[pcol]) * args.pred_scale
+            # SIGNAL SOURCE: classifier heads when the backtest provided them,
+            # else the legacy regressor output.
+            #   magnitude -> exp_move (median |move| on real events, measured
+            #                on a held-out slice) instead of the dead |pred|
+            #   direction -> the direction head's call instead of sign(pred),
+            #                which scored 48.2% micro (worse than a coin) in
+            #                backtest 20260731
+            if has_heads and np.isfinite(p.get(excol, np.nan)) \
+                    and float(p.get(excol) or 0) > 0:
+                mag = float(p[excol]) * args.pred_scale
+                sgn = 1.0 if float(p.get(dircol) or 0) >= 0 else -1.0
+                pred = mag * sgn
+            else:
+                pred = float(p[pcol]) * args.pred_scale
             if pred == 0 or not np.isfinite(pred):
                 skips["zero_pred"] = skips.get("zero_pred", 0) + 1
                 continue
