@@ -496,7 +496,33 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     # actual = k x raw_pred — fixes squared-error shrinkage so predicted
     # PERCENTAGES track actual moves, not just direction)
     _cal = cfg.get("calibration", {})
-    preds = {inst: models[inst].predict(X) * _cal.get(inst, 1.0) for inst in models}
+    # PER-INSTRUMENT FEATURE MATRIX (2026-07-29): models are now trained on
+    # [gemma-PCA | NLP | own technical indicators | global VIX/SPY block],
+    # so inference must rebuild the SAME layout per instrument. The recipe
+    # lives in config.json ("tech_cols" / "global_tech"); when it is absent
+    # (older model sets) we fall back to the shared X unchanged.
+    _tcols_r = cfg.get("tech_cols") or []
+    _gtech_r = cfg.get("global_tech") or []
+
+    def _X_for(inst):
+        if not _tcols_r:
+            return X
+        cols = [f'{inst}_{c}' for c in _tcols_r] + list(_gtech_r)
+        cols = [c for c in cols if c in df.columns]
+        if not cols:
+            return X
+        blk = df[cols].apply(pd.to_numeric, errors='coerce')
+        blk = blk.fillna(blk.median()).fillna(0.0).values.astype(np.float32)
+        return np.hstack([X, blk])
+
+    if _tcols_r:
+        _miss = [c for c in ([f'{list(models)[0]}_{t}' for t in _tcols_r] + list(_gtech_r))
+                 if c not in df.columns]
+        print(f"  📈 TA block per instrument: {len(_tcols_r)} own + {len(_gtech_r)} global"
+              + (f"  ⚠️ {len(_miss)} column(s) missing -> 0-filled" if _miss else ""))
+
+    preds = {inst: models[inst].predict(_X_for(inst)) * _cal.get(inst, 1.0)
+             for inst in models}
     if _cal:
         print(f"  🎚️  Magnitude calibration applied "
               f"(k per instrument, e.g. " +

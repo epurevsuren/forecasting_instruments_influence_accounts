@@ -141,12 +141,29 @@ def main():
     # such posts are traded at inference. Cached embeddings make retrains
     # on any filter setting a minutes-long experiment.
     # ------------------------------------------------------------------
-    TRAIN_MIN_WEIGHT = 0.20
+    # TRAIN_MIN_WEIGHT raised 0.20 -> 0.30 (2026-07-29). At 0.20 the trees
+    # still saw ~30k rows dominated by low-impact posts whose 1-hour labels
+    # are ambient noise, which is what pushes squared-error toward
+    # "predict ~0". Override with env SFT-style if you want to sweep it:
+    #   $env:TRAIN_MIN_WEIGHT = "0.25"
+    TRAIN_MIN_WEIGHT = float(os.environ.get("TRAIN_MIN_WEIGHT", "0.30"))
     _n0 = len(df)
-    df = df[df['sample_weight'].fillna(0.0) >= TRAIN_MIN_WEIGHT].reset_index(drop=True)
+    _sw = df['sample_weight'].fillna(0.0)
+    print("  📊 Rows surviving each candidate threshold (pick empirically):")
+    for _t in (0.20, 0.25, 0.30, 0.35, 0.40, 0.50):
+        _k = int((_sw >= _t).sum())
+        _mark = "  <- ACTIVE" if abs(_t - TRAIN_MIN_WEIGHT) < 1e-9 else ""
+        print(f"       w >= {_t:.2f}: {_k:>6} rows ({_k/_n0:5.1%}){_mark}")
+    df = df[_sw >= TRAIN_MIN_WEIGHT].reset_index(drop=True)
     print(f"  🧹 Training-row filter: sample_weight >= {TRAIN_MIN_WEIGHT} "
           f"-> {len(df)}/{_n0} rows kept "
           f"(primary: {int(df['is_primary'].sum()) if 'is_primary' in df.columns else '?'})")
+
+    # HIGH-SIGNAL OVERSAMPLING (same constants as train_gemma3_analyst_lora.py)
+    OVERSAMPLE_W = 0.50   # rows above this weight are repeated...
+    OVERSAMPLE_X = 4      # ...this many times, in the TRAIN slice only
+    print(f"  🔁 Oversampling: sample_weight > {OVERSAMPLE_W} repeated x{OVERSAMPLE_X} "
+          f"({int((df['sample_weight'].fillna(0.0) > OVERSAMPLE_W).sum())} rows qualify)")
 
     # NLP feature matrix — cast to float32 (is_primary is bool; booleans → 0/1 fine)
     use_nlp = [c for c in NLP_FEATURES if c in df.columns]
@@ -266,6 +283,48 @@ def main():
              components=_pca.components_.astype(np.float32))
     print(f"     explained variance: {_evr:.1%}  💾 emb_pca.npz saved")
 
+    # ------------------------------------------------------------------
+    # TECHNICAL INDICATORS (added 2026-07-29, jiewwantan-style: daily bars
+    # + derived indicators as predictors). build_final_training_set emits
+    # {inst}_{mom5,mom20,sma_rat,rsi14,macd_h,bb_pos,atr_pct,vol_rat},
+    # every one .shift(1)-guarded so a post can only see the PREVIOUS
+    # close. The placebo test proved market context matters enormously
+    # (post-window vol is 2x in-session, ~0 out-of-session) and the model
+    # currently cannot see any of it.
+    #
+    # DESIGN: attaching all 23x8=184 columns to every model would drop the
+    # NLP share from ~33% to ~20% — the exact dilution the PCA step was
+    # added to fix. So each instrument's model gets ONLY:
+    #   * its OWN 8 indicators (what its own market is doing), plus
+    #   * a small GLOBAL risk block (VIX + SPY) that matters to everything.
+    # ------------------------------------------------------------------
+    # must match DP/build_final_training_set.TECH_COLS (no vol_rat — the
+    # daily source has no Volume series)
+    TECH_COLS = ['mom5', 'mom20', 'sma_rat', 'rsi14', 'macd_h',
+                 'bb_pos', 'atr_pct']
+    GLOBAL_TECH = [f'VIX_{c}' for c in ('atr_pct', 'sma_rat', 'mom5')] + \
+                  [f'SPY_{c}' for c in ('atr_pct', 'mom5')]
+    _have_tech = [c for c in df.columns
+                  if any(c.endswith('_' + t) for t in TECH_COLS)]
+    if _have_tech:
+        print(f"  📈 Technical indicators available: {len(_have_tech)} columns "
+              f"({len(TECH_COLS)}/instrument, own+global attached per model)")
+    else:
+        print("  ⚠️  No technical indicator columns found — rerun "
+              "build_final_training_set.py --full to generate them")
+
+    def _tech_block(inst):
+        """(n, k) own-instrument + global indicators for one model."""
+        cols = [f'{inst}_{c}' for c in TECH_COLS] + GLOBAL_TECH
+        cols = [c for c in cols if c in df.columns]
+        if not cols:
+            return np.zeros((len(df), 0), dtype=np.float32), []
+        blk = df[cols].apply(pd.to_numeric, errors='coerce')
+        # median-fill from the TRAIN slice only (no lookahead in the filler)
+        _i70 = int(len(df) * 0.70)
+        blk = blk.fillna(blk.iloc[:_i70].median()).fillna(0.0)
+        return blk.values.astype(np.float32), cols
+
     X = np.hstack([X_emb, X_nlp])
     nlp_start = X_emb.shape[1]   # index where NLP features begin
     print(f"  Combined: {X.shape[1]} dims ({X_emb.shape[1]} gemma-PCA + {len(use_nlp)} NLP)")
@@ -284,6 +343,10 @@ def main():
         if col not in df.columns: continue
         y = df[col].fillna(0.0).values
         idx = np.arange(len(df))
+
+        # per-instrument feature matrix: [gemma-PCA | NLP | own+global TA]
+        _tb, _tcols = _tech_block(inst)
+        X_i = np.hstack([X, _tb]) if _tb.shape[1] else X
         
         # ---------------------------------------------------------
         # 1. STRICT 4-WAY CHRONOLOGICAL SPLIT (The Lookahead Fix)
@@ -294,13 +357,15 @@ def main():
         i_cal = int(N * 0.93)  #  8% Magnitude Calibration
                                #  7% Take Profit Calibration (Remainder)
 
-        Xtr,  ytr,  itr  = X[:i_tr], y[:i_tr], idx[:i_tr]
-        Xes,  yes,  ies  = X[i_tr:i_es], y[i_tr:i_es], idx[i_tr:i_es]
-        Xcal, ycal, ical = X[i_es:i_cal], y[i_es:i_cal], idx[i_es:i_cal]
-        Xtp,  ytp,  itp  = X[i_cal:], y[i_cal:], idx[i_cal:]
-        
+        # NOTE: slices come from X_i (per-instrument matrix incl. its own
+        # technical indicators), NOT the shared X.
+        Xtr,  ytr,  itr  = X_i[:i_tr], y[:i_tr], idx[:i_tr]
+        Xes,  yes,  ies  = X_i[i_tr:i_es], y[i_tr:i_es], idx[i_tr:i_es]
+        Xcal, ycal, ical = X_i[i_es:i_cal], y[i_es:i_cal], idx[i_es:i_cal]
+        Xtp,  ytp,  itp  = X_i[i_cal:], y[i_cal:], idx[i_cal:]
+
         # We still want an aggregate "Test" set for reporting R2 / MAE / etc.
-        Xte, yte, ite = X[i_es:], y[i_es:], idx[i_es:]
+        Xte, yte, ite = X_i[i_es:], y[i_es:], idx[i_es:]
 
         # ---------------------------------------------------------
         # 2. VOLATILITY ADJUSTMENT (The Median Leak Fix)
@@ -346,6 +411,31 @@ def main():
                 print(f"     {inst}: {_n_no} next_open rows at "
                       f"x{QUALITY_TRUST['next_open']} trust")
 
+        # ---------------------------------------------------------
+        # 3. HIGH-SIGNAL OVERSAMPLING  (mirrors train_gemma3_analyst_lora.py)
+        # ---------------------------------------------------------
+        # The trees see ~30k rows of which only a minority are genuinely
+        # market-moving, so squared-error drives them toward "predict ~0".
+        # The LoRA script solves this by repeating sample_weight > 0.50 rows
+        # OVERSAMPLE_X times; we apply the SAME logic here.
+        #
+        # SAFETY: duplication happens ONLY on the training slice, AFTER the
+        # chronological split — a duplicated row can never land in the
+        # early-stop, calibration or TP windows, so this cannot leak.
+        # (For XGBoost this is mathematically equivalent to multiplying
+        # those rows' sample_weight by OVERSAMPLE_X; duplication is used to
+        # keep the two training scripts literally comparable.)
+        Xtr_f, ytr_f, w_tr_f = Xtr, ytr, w_tr
+        if w is not None:
+            _hi = np.where(w[:i_tr] > OVERSAMPLE_W)[0]
+            if len(_hi):
+                _rep = np.concatenate(
+                    [np.arange(i_tr)] +
+                    [_hi] * (OVERSAMPLE_X - 1)).astype(int)
+                Xtr_f, ytr_f, w_tr_f = Xtr[_rep], ytr[_rep], w_tr[_rep]
+                print(f"     {inst}: oversampled {len(_hi)} high-signal rows "
+                      f"(w>{OVERSAMPLE_W}) x{OVERSAMPLE_X} -> {len(_rep)} train rows")
+
         # (feature_weights REMOVED 2026-07-16: measured dead end — 20x weight
         # lifted NLP importance only 4.4%->6.4%; it only biases colsample
         # sampling. Replaced by the PCA compression above.)
@@ -355,7 +445,8 @@ def main():
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
             early_stopping_rounds=40, n_jobs=-1, random_state=42)
 
-        m.fit(Xtr, ytr, sample_weight=w_tr, eval_set=[(Xes, yes)], verbose=False)
+        m.fit(Xtr_f, ytr_f, sample_weight=w_tr_f,
+              eval_set=[(Xes, yes)], verbose=False)
 
         # NLP-ONLY CHALLENGER — same split, NLP features only. Answers "is
         # gemma earning its 128 columns?" per instrument, in every train
@@ -367,7 +458,9 @@ def main():
             subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
             early_stopping_rounds=40, n_jobs=-1, random_state=42)
-        m_nlp.fit(Xtr[:, nlp_start:], ytr, sample_weight=w_tr,
+        # challenger trains on the SAME oversampled slice, so the comparison
+        # stays apples-to-apples
+        m_nlp.fit(Xtr_f[:, nlp_start:], ytr_f, sample_weight=w_tr_f,
                   eval_set=[(Xes[:, nlp_start:], yes)], verbose=False)
         
         # Overall Test Predictions for Reporting
@@ -473,6 +566,9 @@ def main():
     json.dump({"gemma":gemma,"emb_dim":int(X_emb.shape[1]),"pooling":"cls+mean",
                "emb_pca":EMB_PCA_DIM,   # predict/backtest must project with emb_pca.npz
                "nlp_features":use_nlp,"instruments":INSTRUMENTS,
+               # per-instrument TA block recipe — predict/backtest MUST
+               # rebuild [emb | nlp | own TECH | GLOBAL_TECH] in this order
+               "tech_cols":TECH_COLS,"global_tech":GLOBAL_TECH,
                "calibration":calibration,"calibration_tp":calibration_tp,
                "calibration_raw":calibration_raw,
                "calibration_unreliable":calibration_unreliable},

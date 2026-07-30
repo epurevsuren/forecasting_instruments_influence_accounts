@@ -719,6 +719,72 @@ def _intraday_moves_duckdb(con, name, after, before):
             for pid, mv, qual in con.execute(q).fetchall()}
 
 
+def _tech_indicators(d):
+    """Classic TA indicators from DAILY bars, in the spirit of
+    jiewwantan/XGBoost_stock_prediction (daily data + derived indicators as
+    predictors). Gives the trees the market CONTEXT they currently lack —
+    the placebo test showed post-window volatility depends heavily on the
+    regime and session, and the model has no way to see either.
+
+    LEAK RULE: every series is .shift(1) before it is returned, so a post on
+    day D can only ever see data through day D-1's close. Nothing from the
+    post's own day (which would contain the reaction we are predicting)
+    can reach a feature.
+    """
+    # `daily[name]` is a DICT of Series ({'Open','High','Low','Close'}) built
+    # by fetch_daily()/_merge_bars() — NOT a DataFrame, and it carries NO
+    # Volume. (An earlier version called d.columns here and every instrument
+    # logged "indicators failed ('dict' object has no attribute 'columns')",
+    # silently filling all indicator columns with None.) Accept both shapes.
+    _get = (lambda k: d[k] if k in d else None) if isinstance(d, dict) \
+        else (lambda k: d[k] if k in d.columns else None)
+    o, h, l, c = _get('Open'), _get('High'), _get('Low'), _get('Close')
+    if c is None or o is None or h is None or l is None:
+        return pd.DataFrame()
+    v = _get('Volume')          # absent for daily dicts -> vol_rat skipped
+    out = pd.DataFrame(index=c.index)
+
+    # momentum / trend
+    out['mom5']   = c.pct_change(5) * 100
+    out['mom20']  = c.pct_change(20) * 100
+    sma20         = c.rolling(20, min_periods=5).mean()
+    out['sma_rat'] = (c / sma20 - 1.0) * 100
+
+    # RSI(14) — Wilder
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14, min_periods=5).mean()
+    loss = (-delta.clip(upper=0)).rolling(14, min_periods=5).mean()
+    out['rsi14'] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+
+    # MACD histogram, normalised by price so it is comparable across assets
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    out['macd_h'] = (macd - macd.ewm(span=9, adjust=False).mean()) / c * 100
+
+    # Bollinger %B (position inside the 20-day band)
+    sd20 = c.rolling(20, min_periods=5).std()
+    out['bb_pos'] = (c - sma20) / (2 * sd20.replace(0, np.nan))
+
+    # ATR(14) as % of price — the natural unit for TP/SL sizing
+    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()],
+                   axis=1).max(axis=1)
+    out['atr_pct'] = tr.rolling(14, min_periods=5).mean() / c * 100
+
+    if v is not None:
+        out['vol_rat'] = v / v.rolling(20, min_periods=5).mean().replace(0, np.nan)
+
+    # *** THE LEAK GUARD *** — only information through the previous close
+    return out.shift(1).replace([np.inf, -np.inf], np.nan)
+
+
+# vol_rat is intentionally NOT here: the daily source carries no Volume, so
+# requesting it would create 23 all-None columns. _tech_indicators still
+# computes it when a volume series is present.
+TECH_COLS = ['mom5', 'mom20', 'sma_rat', 'rsi14', 'macd_h',
+             'bb_pos', 'atr_pct']
+
+
 def compute_impacts(scored):
     """Add {NAME}_Impact / _zscore / _quality columns for every ticker. Returns (scored, impact_cols).
 
@@ -810,6 +876,42 @@ def compute_impacts(scored):
                 new_columns[vcol] = [None] * n
         else:
             new_columns[vcol] = [None] * n
+
+        # ---- TECHNICAL INDICATORS at post time (leak-guarded, see above) ----
+        if name in daily:
+            try:
+                ind = _tech_indicators(daily[name])
+                imaps = {cc: ind[cc].to_dict() for cc in ind.columns}
+                iidx = None
+                def _ind_at(dt, cc):
+                    d0 = dt.date()
+                    for back in range(0, 8):     # last session on/before post date
+                        key = d0 - timedelta(days=back)
+                        val = imaps[cc].get(key)
+                        if val is not None and pd.notna(val):
+                            return round(float(val), 5)
+                    return None
+                for cc in TECH_COLS:
+                    if cc in imaps:
+                        new_columns[f'{name}_{cc}'] = [_ind_at(dates_list[i], cc)
+                                                       for i in range(n)]
+                    else:
+                        new_columns[f'{name}_{cc}'] = [None] * n
+                _ok = sum(1 for cc in TECH_COLS
+                          if any(x is not None for x in new_columns[f'{name}_{cc}']))
+                if _ok < len(TECH_COLS):
+                    print(f"  ⚠️  {name}: only {_ok}/{len(TECH_COLS)} indicators "
+                          f"produced values — check the daily bars")
+            except Exception as e:                                  # noqa: BLE001
+                # LOUD: a silent all-None fill previously let a broken
+                # indicator block sail through a full rebuild unnoticed.
+                print(f"  ❌ {name}: INDICATORS FAILED ({type(e).__name__}: "
+                      f"{str(e)[:80]}) — columns will be EMPTY, features useless")
+                for cc in TECH_COLS:
+                    new_columns[f'{name}_{cc}'] = [None] * n
+        else:
+            for cc in TECH_COLS:
+                new_columns[f'{name}_{cc}'] = [None] * n
 
         valid = sum(1 for x in ar_list if x is not None)
         print(f"  ✅ {col:<22} {valid:>4} valid [{mtype}]")
@@ -1037,10 +1139,12 @@ def train_columns(impact_cols):
     # trainer down-weights each instrument's own weak-label rows instead of a
     # global damp off SPY's calendar (see finalize note, 2026-07-28).
     qual_cols = [f'{n}_quality' for n in TICKERS]
+    # technical indicators at post time (leak-guarded by shift(1))
+    tech_cols = [f'{n}_{c}' for n in TICKERS for c in TECH_COLS]
     # OPTIONAL feature-safe Gemini columns (--use-gemini). gl_* are NEVER
     # included: grounded output knows the future (leakage firewall).
     gf_cols = [c for c in _GEMINI_FEATURE_COLS if c not in base]
-    return base + impact_cols + vol_cols + qual_cols + gf_cols
+    return base + impact_cols + vol_cols + qual_cols + tech_cols + gf_cols
 
 
 _GEMINI_FEATURE_COLS: list = []   # filled by apply_gemini() when --use-gemini
