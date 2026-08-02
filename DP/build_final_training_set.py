@@ -1144,10 +1144,91 @@ def train_columns(impact_cols):
     # OPTIONAL feature-safe Gemini columns (--use-gemini). gl_* are NEVER
     # included: grounded output knows the future (leakage firewall).
     gf_cols = [c for c in _GEMINI_FEATURE_COLS if c not in base]
-    return base + impact_cols + vol_cols + qual_cols + tech_cols + gf_cols
+    cols = base + impact_cols + vol_cols + qual_cols + tech_cols + gf_cols
+    # ---- LEAKAGE FIREWALL (G2) ----------------------------------------
+    # rag_* columns are built from news published in the hour AFTER the post.
+    # They are legitimate for sample_weight and curation, and catastrophic as
+    # features — at prediction time that hour has not happened. Enforced here
+    # in code so it cannot be lost to a future edit or a copy-paste.
+    try:
+        from rag_confounder_annotator import assert_label_side_only
+        assert_label_side_only(cols, where="train_columns()")
+    except ImportError:
+        # annotator not present — nothing to guard against
+        if any(str(c).startswith("rag_") for c in cols):
+            raise RuntimeError(
+                "rag_* column in train_columns() but rag_confounder_annotator "
+                "is missing — refusing to build a possibly-leaking feature set.")
+    return cols
 
 
 _GEMINI_FEATURE_COLS: list = []   # filled by apply_gemini() when --use-gemini
+
+# ============================================================================
+# OPTIONAL RAG CONFOUNDER LAYER  (--use-rag)
+# ============================================================================
+RAG_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "rag_annotations.csv")
+RAG_CONFOUNDER_DAMP = 0.3   # same trust multiplier as the Gemini layer
+USE_RAG = False             # flipped ON only by --use-rag
+
+
+def apply_rag(scored):
+    """OPTIONAL (--use-rag). Down-weights posts whose 1-hour reaction window
+    was demonstrably dominated by OTHER news — a CPI print, an airstrike, a
+    different official acting. Those rows carry a big label the post did not
+    earn, and training on them teaches attribution that is simply false.
+
+    STRICTLY LABEL-SIDE. Every rag_ column here touches sample_weight and
+    nothing else; train_columns() raises if one ever reaches the feature list.
+
+    No flag, or no CSV => byte-identical behaviour to today.
+    """
+    if not USE_RAG:
+        return scored
+    if not os.path.exists(RAG_CSV):
+        print(f"  ℹ️  --use-rag given but {os.path.basename(RAG_CSV)} not found "
+              f"— skipping (run rag_confounder_annotator.py first)")
+        return scored
+    try:
+        import duckdb as _d
+        ann = _d.query(
+            f"SELECT * FROM read_csv_auto('{RAG_CSV}', header=True)").df()
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  ⚠️  could not read {os.path.basename(RAG_CSV)} ({e}) — skipping")
+        return scored
+    if not len(ann) or 'platform_id' not in ann.columns:
+        print("  ℹ️  rag_annotations.csv empty — skipping")
+        return scored
+
+    ann = ann.drop_duplicates(subset=['platform_id'], keep='last')
+    key = scored['platform'].astype(str) + '_' + scored['id'].astype(str)
+    m = ann.set_index('platform_id')
+
+    conf = key.map(m['rag_confounder_present']).fillna(False)
+    conf = conf.astype(str).str.lower().isin(('true', '1', 'yes'))
+    # NEVER down-weight a post merely because it fell outside DOC coverage —
+    # absence of evidence is not evidence of a confounder.
+    if 'rag_status' in m.columns:
+        cov = key.map(m['rag_status']).fillna('missing')
+        conf = conf & (cov == 'ok')
+
+    n_ann = int(key.isin(m.index).sum())
+    if conf.any():
+        print(f"  🔎 RAG: {int(conf.sum())} post(s) whose 60-min window was "
+              f"dominated by OTHER news: sample_weight ×{RAG_CONFOUNDER_DAMP}")
+        scored.loc[conf, 'sample_weight'] = (
+            scored.loc[conf, 'sample_weight'] * RAG_CONFOUNDER_DAMP).round(4)
+        if 'rag_confounder_type' in m.columns:
+            _t = key[conf].map(m['rag_confounder_type']).value_counts()
+            print("     by type: " + ", ".join(f"{k}={v}" for k, v in _t.items()))
+    else:
+        print("  🔎 RAG: no confounded windows flagged")
+    _oc = int((key.map(m.get('rag_status', pd.Series(dtype=str)))
+               == 'out_of_coverage').sum()) if 'rag_status' in m.columns else 0
+    print(f"  🔎 RAG annotations matched on {n_ann}/{len(scored)} post(s)"
+          + (f"; {_oc} outside DOC coverage (untouched)" if _oc else ""))
+    return scored
 
 
 # ==========================================
@@ -1192,6 +1273,10 @@ def main_full():
     # set in __main__). Untouched pipeline otherwise.
     if USE_GEMINI:
         scored = apply_gemini(scored)
+
+    # OPTIONAL RAG confounder layer — only when --use-rag was passed.
+    if USE_RAG:
+        scored = apply_rag(scored)
 
     scored = finalize(scored, impact_cols)
 
@@ -1365,11 +1450,22 @@ if __name__ == '__main__':
                          "(gemini_impact_annotator.py). Grounded gl_* verdicts damp "
                          "confounded reaction windows; text-only gf_* become training "
                          "features. Without this flag the pipeline is unchanged.")
+    ap.add_argument("--use-rag", action="store_true",
+                    help="OPTIONAL: join rag_annotations.csv "
+                         "(rag_confounder_annotator.py — free GDELT + local "
+                         "Gemma). Down-weights posts whose 1-hour window was "
+                         "dominated by OTHER news. STRICTLY label-side: rag_* "
+                         "columns can never become features. Without this flag "
+                         "the pipeline is unchanged.")
     args = ap.parse_args()
     USE_GEMINI = args.use_gemini
+    USE_RAG = args.use_rag
     if USE_GEMINI:
         print("🛰️  --use-gemini: gemini_annotations will be joined "
               "(gl_* label-side only, gf_* as features)")
+    if USE_RAG:
+        print(f"🔎 --use-rag: rag_annotations.csv will be joined "
+              f"(confounded windows ×{RAG_CONFOUNDER_DAMP}, label-side only)")
     if args.full:
         main_full()
     else:

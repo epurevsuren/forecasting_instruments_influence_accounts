@@ -133,6 +133,95 @@ TARGET_PRECISION = float(os.environ.get("TARGET_PRECISION", "0.58"))
 # untradeable rather than traded at a coin flip. 0.52 = a real but thin edge.
 DIR_MIN_ACC = float(os.environ.get("DIR_MIN_ACC", "0.52"))
 
+# ============================================================================
+# WALK-FORWARD  (2026-08-02) — memory across posts, in the training process
+# ============================================================================
+# The single fixed 70/15/8/7 split trains mostly on 2017-2021 dynamics and then
+# asks about 2026, and it evaluates on ONE window. Both are problems:
+#   * a frozen model never sees recent regime;
+#   * one window is one sample, which is exactly how the `tradeable` flag got
+#     picked on ~150 calibration events and then reverted out-of-sample
+#     (US2Y 60.1% -> 41.2%, VIX 59.8% -> 44.8%).
+#
+# Walk-forward refits on an EXPANDING window: train on [0, a0), predict
+# [a0, a1), advance. Every prediction is out-of-sample, and concatenating the
+# folds gives ~3.3x more evaluation data than the single split.
+#
+# MEASURED 2026-08-02 (8 instruments, size head, corr(|pred|,|actual|)):
+#     single fixed split      0.203
+#     walk-forward, cold      0.231   <- this
+#     walk-forward, warm      0.203
+# XLE 0.049 -> 0.163 and COPPER 0.115 -> 0.201 on walk-forward alone.
+#
+# NOTE ON WARM START: inheriting the previous booster via xgb_model= lost on
+# 8/8 instruments (-0.028 mean). Continued boosting APPENDS trees rather than
+# re-optimising them, so the model accumulates stale 2017-2021 structure. The
+# memory that helps is having more DATA in the window, not carrying model
+# state forward. Do not "fix" this by re-enabling warm start.
+WALK_FORWARD = os.environ.get("WALK_FORWARD", "1") == "1"
+WF_FOLDS     = int(os.environ.get("WF_FOLDS", "8"))
+WF_START     = float(os.environ.get("WF_START", "0.50"))   # first train fraction
+# A gate must produce at least this many gradeable trades across the whole
+# walk-forward window, or its accuracy is not a measurement. ~100 gives a
+# standard error near 5pp, which is the least we can distinguish 52% from 50%.
+WF_MIN_TRADES = int(os.environ.get("WF_MIN_TRADES", "100"))
+
+
+def _wf_oos(X, y, w, y_move, y_up, folds=WF_FOLDS, start_frac=WF_START):
+    """Expanding-window walk-forward. Returns out-of-sample predictions for all
+    three heads over rows [start, N), each produced by a model that saw ONLY
+    rows before it. Used for evaluation and gate selection — never for fitting
+    the shipped model.
+    """
+    N = len(y)
+    start = int(N * start_frac)
+    step = max((N - start) // max(folds, 1), 1)
+    oos = {k: np.full(N, np.nan, dtype=np.float64)
+           for k in ("size", "p_move", "p_up")}
+    for f in range(folds):
+        a0 = start + f * step
+        a1 = N if f == folds - 1 else min(a0 + step, N)
+        if a0 >= N or a1 <= a0:
+            break
+        Xtr, ytr = X[:a0], y[:a0]
+        wtr = w[:a0] if w is not None else None
+        mvtr, uptr = y_move[:a0], y_up[:a0]
+
+        # --- size head (|move|) ---
+        ms = xgb.XGBRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.03, subsample=0.8,
+            colsample_bytree=0.5, min_child_weight=5, reg_alpha=0.1,
+            reg_lambda=1.5, n_jobs=-1, random_state=42)
+        ms.fit(Xtr, np.abs(ytr), sample_weight=wtr, verbose=False)
+        oos["size"][a0:a1] = np.clip(ms.predict(X[a0:a1]), 0.0, None)
+
+        # --- move head ---
+        npos = int(mvtr.sum())
+        if npos >= 20 and npos < len(mvtr):
+            mm = xgb.XGBClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.03,
+                subsample=0.8, colsample_bytree=0.5, min_child_weight=5,
+                objective='binary:logistic', eval_metric='auc',
+                scale_pos_weight=float((len(mvtr) - npos) / max(npos, 1)),
+                n_jobs=-1, random_state=42)
+            mm.fit(Xtr, mvtr, sample_weight=wtr, verbose=False)
+            oos["p_move"][a0:a1] = mm.predict_proba(X[a0:a1])[:, 1]
+
+        # --- direction head, event rows only ---
+        ev = np.where(mvtr == 1)[0]
+        if len(ev) >= DIR_MIN_N:
+            md = xgb.XGBClassifier(
+                n_estimators=250, max_depth=4, learning_rate=0.04,
+                subsample=0.8, colsample_bytree=0.6, min_child_weight=5,
+                objective='binary:logistic', eval_metric='logloss',
+                n_jobs=-1, random_state=42)
+            md.fit(Xtr[ev], uptr[ev],
+                   sample_weight=(wtr[ev] if wtr is not None else None),
+                   verbose=False)
+            oos["p_up"][a0:a1] = md.predict_proba(X[a0:a1])[:, 1]
+    oos["start"] = start
+    return oos
+
 # Gemma-3-4B encoder: mean + last-token pooling of the final hidden layer
 # (research 2026-07-17: decoder LLMs have no [CLS]; last-token = the
 # autoregressive summary but recency-biased, mean = robust on MTEB — concat
@@ -686,7 +775,8 @@ def main():
         _rm = _a_te >= 0.1
         size_mdape = float(np.median(np.abs(_sz_te[_rm] - _a_te[_rm]) / _a_te[_rm])) \
             if _rm.sum() >= 20 else float('nan')
-        m_size.save_model(f"{OUT_DIR}/{col}__size.json")
+        # (saved further down, AFTER the final all-rows refit — saving here
+        #  would ship the 70%-only model)
 
         # --- operating point chosen OUT-OF-SAMPLE on the calibration slice --
         # Sweep p_move thresholds and score each on "direction was right, on
@@ -727,6 +817,31 @@ def main():
             p_move_thr, prec_cal, n_cal_sel = 0.50, float('nan'), 0
             target_met = False
 
+        # --- WALK-FORWARD OOS: the honest evaluation surface ----------------
+        # Replaces the single 8% calibration slice for gate selection and the
+        # tradeable decision. ~3.3x more out-of-sample rows, spread across 8
+        # regimes instead of one — which is the actual fix for a "winner"
+        # chosen on ~150 events reverting in the backtest.
+        wf = None
+        if WALK_FORWARD:
+            wf = _wf_oos(X_i, y, w, y_move, y_up)
+            _s = wf["start"]
+            _m = ~np.isnan(wf["size"])
+            _ev_wf = (y_move == 1) & _m
+            _a = np.abs(y)
+            _rm = _m & (_a >= 0.1)
+            wf_size_corr = (float(np.corrcoef(wf["size"][_rm], _a[_rm])[0, 1])
+                            if _rm.sum() >= 50 else float('nan'))
+            _du = ~np.isnan(wf["p_up"])
+            _dev = _ev_wf & _du
+            wf_dir = (float(((wf["p_up"][_dev] > 0.5) == (y[_dev] > 0)).mean())
+                      if _dev.sum() >= 50 else float('nan'))
+            print(f"     🔁 WF({WF_FOLDS} folds, OOS n={int(_m.sum())}): "
+                  f"size-corr={wf_size_corr:+.3f}  dir-on-events={wf_dir:.1%} "
+                  f"(n={int(_dev.sum())})"
+                  if wf_dir == wf_dir else
+                  f"     🔁 WF: size-corr={wf_size_corr:+.3f}  dir n/a")
+
         # --- TRADEABLE: must hold on TWO independent windows ----------------
         # v1 flagged an instrument tradeable on the calibration slice alone —
         # about 150 events. Picking the best of 23 instruments on n=150 (SE ~
@@ -751,6 +866,67 @@ def main():
         _both = (dir_cal_acc == dir_cal_acc and dir_tp_acc == dir_tp_acc
                  and dir_cal_acc >= DIR_MIN_ACC and dir_tp_acc >= DIR_MIN_ACC)
         tradeable = bool(_both and m_dir is not None)
+
+        # ====================================================================
+        # TRADEABLE, JUDGED ON THE POPULATION WE ACTUALLY TRADE
+        # ====================================================================
+        # BUG FIXED 2026-08-02. Previous versions scored `dir-on-events`:
+        # direction accuracy over EVERY row that moved (~1,000/instrument).
+        # But we never trade every row that moved — the gate fires only when
+        # p_move clears its threshold AND the direction head has an edge. All
+        # the rows where the model has no opinion (p_up ~ 0.5) score ~50% by
+        # construction and swamped the measurement.
+        #
+        # The damage was not conservatism, it was ANTI-SELECTION. Backtest
+        # 20260802 shipped exactly one tradeable instrument, XLE, which then
+        # scored 45.5% — while BTC (58.3%), USD_CAD (57.1%), QQQ (55.2%),
+        # USD_MXN (54.4%) and GBP_USD (54.2%) sat in the SKIP column.
+        #
+        # Now: sweep the gate on the WALK-FORWARD out-of-sample predictions
+        # (9,295 rows over 8 regimes), score each candidate on the rows that
+        # gate would ACTUALLY have traded, and take the loosest one that
+        # clears DIR_MIN_ACC with at least WF_MIN_TRADES of them. Still fully
+        # out-of-sample — every wf prediction came from a model that saw only
+        # earlier rows.
+        wf_dir_acc = float('nan')
+        wf_gate_n = 0
+        if wf is not None:
+            _du = ~np.isnan(wf["p_up"]) & ~np.isnan(wf["p_move"])
+            _meaning = _du & (np.abs(y) >= 0.1)      # noise rows can't grade direction
+            _right = (wf["p_up"] > 0.5) == (y > 0)
+            _best = None
+            for _t in np.arange(0.30, 0.90, 0.05):
+                for _e in (0.05, 0.08, 0.12):
+                    _g = _meaning & (wf["p_move"] >= _t) & \
+                         (np.abs(wf["p_up"] - 0.5) >= _e)
+                    _n = int(_g.sum())
+                    if _n < WF_MIN_TRADES:
+                        continue
+                    _a = float(_right[_g].mean())
+                    if _best is None or _a > _best[2]:
+                        _best = (float(_t), float(_e), _a, _n)
+                    if _a >= DIR_MIN_ACC:
+                        _best = (float(_t), float(_e), _a, _n)
+                        break
+                if _best is not None and _best[2] >= DIR_MIN_ACC:
+                    break
+            if _best is not None:
+                p_move_thr, edge_min_i, wf_dir_acc, wf_gate_n = _best
+                target_met = wf_dir_acc >= DIR_MIN_ACC
+                tradeable = bool(target_met and m_dir is not None)
+                print(f"     🎯 {inst}: gate p>={p_move_thr:.2f} edge>={edge_min_i:.2f} "
+                      f"-> {wf_dir_acc:.1%} on {wf_gate_n} WF trades "
+                      f"({'TRADEABLE' if tradeable else 'below bar'})"
+                      + ("" if tradeable == _both else
+                         f"   [2-slice said {'pass' if _both else 'fail'} "
+                         f"on ~{int(ev_cal.sum())} rows]"))
+            else:
+                edge_min_i = 0.05
+                print(f"     ⚠️  {inst}: no gate reaches {WF_MIN_TRADES} trades "
+                      f"on the WF window — untradeable")
+                tradeable = False
+        else:
+            edge_min_i = 0.05
         move_gate[inst] = {
             "thr_ratio": round(thr_ratio, 4),
             "vol_median": round(_v_med, 4),
@@ -765,6 +941,13 @@ def main():
             "target_met": target_met,
             "dir_cal_acc": round(dir_cal_acc, 3) if dir_cal_acc == dir_cal_acc else None,
             "dir_tp_acc": round(dir_tp_acc, 3) if dir_tp_acc == dir_tp_acc else None,
+            "wf_dir_acc": round(wf_dir_acc, 3) if wf_dir_acc == wf_dir_acc else None,
+            "wf_gate_n": wf_gate_n,
+            "wf_folds": WF_FOLDS if wf is not None else 0,
+            # per-instrument edge threshold — backtest/predict must use THIS,
+            # not a single global --edge-min, because the sweep tuned them
+            # together with p_move_thr.
+            "edge_min": round(edge_min_i, 3),
             # SIZE head — Layer 2 sizes TP/SL from a PER-POST number now
             "size_corr": round(size_corr, 3) if size_corr == size_corr else None,
             "size_ratio": round(size_ratio, 3),
@@ -779,9 +962,63 @@ def main():
             "median_abs_move": round(float(np.median(np.abs(y[i_es:i_cal][ev_cal])))
                                      if ev_cal.sum() else 0.0, 4),
         }
+        # ====================================================================
+        # FINAL REFIT ON **ALL** ROWS  (2026-08-02)
+        # ====================================================================
+        # Every head above was fitted on X_i[:i_tr] — the first 70% — because
+        # the later slices are needed as honest holdouts for early stopping,
+        # calibration, the gate sweep and the TP quantile. That is correct for
+        # MEASURING. It is wrong for SHIPPING: it means the model that goes
+        # live has never seen the most recent ~30% of posts (~5,500 rows,
+        # roughly the last two years), which is exactly the period most like
+        # tomorrow. Walk-forward measured how much that costs — XLE 0.049 ->
+        # 0.163, COPPER 0.115 -> 0.201 — purely from training on more recent
+        # data.
+        #
+        # Standard practice, and what we do now: SELECT on holdouts, then
+        # REFIT on everything for deployment. Tree count is frozen to the
+        # early-stopped best_iteration, so there is no held-out set required
+        # and no risk of training longer than the honest fit justified.
+        #
+        # NOTE: this cannot leak. Calibration, gates, tradeable and every
+        # reported metric were all computed BEFORE this block from models that
+        # never saw the later rows. Refitting only changes what ships.
+        _n_full = len(y)
+        print(f"     🔄 {inst}: final refit on ALL {_n_full} rows "
+              f"(was {i_tr} = first 70%) — metrics above stay from the "
+              f"holdout fits")
+
+        def _refit(proto, Xf, yf, wf_, n_est):
+            p = proto.get_params()
+            p.pop("early_stopping_rounds", None)
+            p["n_estimators"] = max(int(n_est or 0), 50)
+            m2 = type(proto)(**p)
+            m2.fit(Xf, yf, sample_weight=wf_, verbose=False)
+            return m2
+
+        # Capture the honest tree counts BEFORE refitting. The refit drops
+        # early_stopping_rounds (there is no holdout left to stop on), so the
+        # refitted estimators have no .best_iteration at all — reading it
+        # afterwards raises AttributeError.
+        _bi_main = int(m.best_iteration or 0)
+        _bi_size = int(m_size.best_iteration or 0)
+        _bi_mv = int(m_mv.best_iteration or 0)
+        _bi_dir = int(m_dir.best_iteration or 0) if m_dir is not None else 0
+
+        _w_all = w if w is not None else np.ones(_n_full)
+        m = _refit(m, X_i, y, _w_all, _bi_main)
+        m_size = _refit(m_size, X_i, np.abs(y), _w_all, _bi_size)
+        m_mv = _refit(m_mv, X_i, y_move, _w_all, _bi_mv)
+        if m_dir is not None:
+            _ev_all = np.where(y_move == 1)[0]
+            if len(_ev_all) >= DIR_MIN_N:
+                m_dir = _refit(m_dir, X_i[_ev_all], y_up[_ev_all],
+                               _w_all[_ev_all], _bi_dir)
+
         m_mv.save_model(f"{OUT_DIR}/{col}__move.json")
         if m_dir is not None:
             m_dir.save_model(f"{OUT_DIR}/{col}__dir.json")
+        m_size.save_model(f"{OUT_DIR}/{col}__size.json")
 
         # honest head-B score: direction accuracy on REAL events in the test
         # window, which is the only number that maps to a tradeable decision
@@ -873,7 +1110,7 @@ def main():
                         "noise_pred":round(float(noise_pred),4),
                         "nlp_share":round(float(nlp_share),3),
                         "calibration_k":calibration[inst],
-                        "best_iter":int(m.best_iteration or 0),
+                        "best_iter":_bi_main,   # captured pre-refit (see above)
                         "auc_move":move_gate[inst]["auc_move"],
                         "f1_move":round(_f1,3) if _f1==_f1 else None,
                         "dir_acc_on_events":round(dir_ev,3) if dir_ev==dir_ev else None,

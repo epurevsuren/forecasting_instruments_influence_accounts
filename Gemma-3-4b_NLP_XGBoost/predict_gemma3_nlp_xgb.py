@@ -664,12 +664,152 @@ def load(model_dir=None):
         p = f"{model_dir}/{inst}_Impact.json"
         if os.path.exists(p):
             m = xgb.XGBRegressor(); m.load_model(p); models[inst]=m
+
+    # ------------------------------------------------------------------
+    # THE HEADS THAT ACTUALLY DECIDE (2026-08-02)
+    # ------------------------------------------------------------------
+    # Live prediction used to load ONLY the signed regressor above — the one
+    # measured at mean|pred| 0.001% vs mean|actual| 0.318%, MdAPE 100%, i.e.
+    # predicting zero. Everything that works lives in the three heads:
+    #   __size  |move| in %      corr 0.218, MdAPE 47%  -> the number
+    #   __dir   P(up)            -> the direction (sign(pred) scored 48.2%)
+    #   __move  P(abnormal move) -> the gate
+    # Loading them here is what puts backtest and production on the same model.
+    clf_move, clf_dir, reg_size = {}, {}, {}
+    for inst,_,_ in LABELS:
+        for suf, store, ctor in (("__move", clf_move, xgb.XGBClassifier),
+                                 ("__dir",  clf_dir,  xgb.XGBClassifier),
+                                 ("__size", reg_size, xgb.XGBRegressor)):
+            p = f"{model_dir}/{inst}_Impact{suf}.json"
+            if os.path.exists(p):
+                _m = ctor(); _m.load_model(p); store[inst] = _m
+    cfg["_clf_move"], cfg["_clf_dir"], cfg["_reg_size"] = clf_move, clf_dir, reg_size
+    if reg_size:
+        _tr = [i for i in reg_size
+               if cfg.get("move_gate", {}).get(i, {}).get("tradeable")]
+        print(f"  \U0001f3af Heads: {len(clf_move)} move + {len(clf_dir)} dir + "
+              f"{len(reg_size)} size | TRADEABLE: "
+              + (", ".join(_tr) if _tr else "NONE"))
+    else:
+        print("  ⚠️  No size/move/dir heads in this model dir — falling back "
+              "to the signed regressor (retrain to enable the real heads)")
     if model_dir != OUT_DIR:
         print(f"  \U0001f4c2 Models loaded from {model_dir} (non-default --model-dir)")
     nlp   = ss.load_spacy()
     sbert = ss.load_sbert()
     print(f"✅ Gemma-3-4B encoder + NLP scorer + {len(models)} XGBoost models\n")
     return cfg, models, nlp, sbert
+
+# ============================================================================
+# POST MEMORY — precedent lookup for the human in the loop
+# ============================================================================
+# "As a human, I can predict how much impact a post has from previous
+# historical movements." This shows exactly that: the most similar past posts
+# and what each instrument ACTUALLY did in the hour after them.
+#
+# Deliberately DECISION SUPPORT, not a feature. Measured 2026-08-02: feeding
+# neighbour outcomes to XGBoost adds +0.001 (noise). Showing them to a trader
+# is a different thing — it is evidence you can weigh, and it makes the
+# model's number auditable instead of oracular.
+_MEM = {"emb": None, "meta": None, "loaded": False}
+
+
+def load_memory(limit=40000):
+    """Cached past posts + their realised 1h moves, newest `limit` rows."""
+    if _MEM["loaded"]:
+        return _MEM
+    _MEM["loaded"] = True
+    try:
+        import db as _db
+        cols = ", ".join(f'"{i}_Impact"' for i, _, _ in LABELS)
+        meta = _db.query(
+            f"SELECT platform, id, date, text, {cols} "
+            f"FROM training_set_FINAL WHERE sample_weight >= 0.3 "
+            f"ORDER BY date DESC LIMIT {int(limit)}")
+        if meta is None or not len(meta):
+            return _MEM
+        keys = (meta["platform"].astype(str) + "_" + meta["id"].astype(str)).tolist()
+        lit = ",".join("'" + k.replace("'", "''") + "'" for k in keys)
+        emb = _db.query(f"SELECT platform_id, embedding FROM gemma3_embeddings_v1 "
+                        f"WHERE platform_id IN ({lit})")
+        if emb is None or not len(emb):
+            return _MEM
+        pos = {k: i for i, k in enumerate(keys)}
+        E = np.zeros((len(keys), len(emb["embedding"].iloc[0])), dtype=np.float32)
+        seen = np.zeros(len(keys), dtype=bool)
+        for pid, v in zip(emb["platform_id"], emb["embedding"]):
+            i = pos.get(pid)
+            if i is not None:
+                E[i] = np.asarray(v, dtype=np.float32)
+                seen[i] = True
+        E = E[seen]
+        E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-9)
+        _MEM["emb"] = E
+        _MEM["meta"] = meta[seen].reset_index(drop=True)
+        print(f"  \U0001f9e0 Post memory: {len(E)} precedents with realised moves")
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  ℹ️  post memory unavailable ({type(e).__name__}: {str(e)[:60]})")
+    return _MEM
+
+
+def find_precedents(emb, post_ts=None, k=5):
+    """k most similar PAST posts. If post_ts is given, only strictly earlier
+    ones are eligible — the same causality rule the trainer uses, so what you
+    see here is what a live system could have seen."""
+    M = load_memory()
+    if M["emb"] is None:
+        return []
+    q = np.asarray(emb, dtype=np.float32).ravel()
+    q = q / max(float(np.linalg.norm(q)), 1e-9)
+    sims = M["emb"] @ q
+    meta = M["meta"]
+    if post_ts is not None:
+        try:
+            older = pd.to_datetime(meta["date"], utc=True) < pd.Timestamp(post_ts).tz_convert("UTC")
+            sims = np.where(older.values, sims, -2.0)
+        except Exception:
+            pass
+    idx = np.argsort(-sims)[:k]
+    return [{"sim": float(sims[i]), "row": meta.iloc[i]}
+            for i in idx if sims[i] > -1.0]
+
+
+def show_precedents(precs, insts=None, top_n=6):
+    """Print precedents with what each instrument actually did."""
+    if not precs:
+        return
+    insts = insts or [i for i, _, _ in LABELS][:top_n]
+    print("\n" + "=" * 64)
+    print("POST MEMORY — most similar past posts and what ACTUALLY happened")
+    print("=" * 64)
+    for p in precs:
+        r = p["row"]
+        when = str(r["date"])[:16]
+        print(f"\n  [{p['sim']:.3f} similar]  {when}")
+        print(f"    \"{str(r['text'])[:110]}\"")
+        moves = []
+        for inst in insts:
+            v = r.get(f"{inst}_Impact")
+            if v is None or (isinstance(v, float) and v != v):
+                continue
+            v = float(v)
+            moves.append(f"{inst} {'+' if v >= 0 else ''}{v:.2f}%")
+        if moves:
+            print("    -> " + "  ".join(moves))
+    # consensus across precedents = the trader's "last N times, it went this way"
+    print("\n  CONSENSUS ACROSS PRECEDENTS")
+    for inst in insts:
+        vals = [float(p["row"][f"{inst}_Impact"]) for p in precs
+                if p["row"].get(f"{inst}_Impact") is not None
+                and float(p["row"][f"{inst}_Impact"]) == float(p["row"][f"{inst}_Impact"])]
+        if len(vals) < 2:
+            continue
+        up = sum(1 for v in vals if v > 0)
+        print(f"    {inst:<9} median |move| {np.median(np.abs(vals)):.2f}%   "
+              f"up {up}/{len(vals)}   "
+              f"{'agree UP' if up == len(vals) else ('agree DOWN' if up == 0 else 'split')}")
+    print("=" * 64)
+
 
 def gemma_embed(text):
     """Gemma-3-4B encoding (mean + last-token pooling, 5120 dims).
@@ -758,10 +898,62 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
 
     out = {}
     cal = cfg.get("calibration", {})   # per-instrument magnitude scale (train holdout fit)
+    # ---- per-instrument TA block, exactly as train/backtest build it -------
+    # cfg["tech_cols"] / ["global_tech"] freeze the recipe at train time. If
+    # live bars are unavailable the block is zero-filled and we say so, rather
+    # than silently feeding a different column layout than the model expects.
+    _tcols = cfg.get("tech_cols") or []
+    _gtech = cfg.get("global_tech") or []
+    _ta_src = cfg.get("_live_ta") or {}          # {f"{inst}_{col}": value}
+
+    def _X_for(inst):
+        if not _tcols:
+            return X
+        cols = [f'{inst}_{c}' for c in _tcols] + list(_gtech)
+        blk = np.array([[float(_ta_src.get(c, 0.0)) for c in cols]],
+                       dtype=np.float32)
+        return np.hstack([X, blk])
+
+    _mv, _dr, _sz = (cfg.get("_clf_move", {}), cfg.get("_clf_dir", {}),
+                     cfg.get("_reg_size", {}))
+    _gate_cfg = cfg.get("move_gate", {})
     for inst,_,_ in LABELS:
-        if inst in models:
-            raw = float(models[inst].predict(X)[0])
-            out[inst] = raw * cal.get(inst, 1.0) * mult
+        if inst not in models:
+            continue
+        Xi = _X_for(inst)
+        raw = float(models[inst].predict(Xi)[0])
+        rec = {"legacy_pred": raw * cal.get(inst, 1.0) * mult}
+        g = _gate_cfg.get(inst, {})
+        if inst in _sz:
+            # SIZE: the honest magnitude, scale-corrected exactly as trained.
+            sz = float(np.clip(_sz[inst].predict(Xi)[0], 0.0, None))
+            rec["size"] = sz * float(g.get("size_k", 1.0)) * mult
+        if inst in _mv:
+            rec["p_move"] = float(_mv[inst].predict_proba(Xi)[0, 1])
+        if inst in _dr:
+            pu = float(_dr[inst].predict_proba(Xi)[0, 1])
+            rec["p_up"] = pu
+            rec["dir"] = 1 if pu > 0.5 else -1
+            rec["edge"] = abs(pu - 0.5)
+        # TRADE decision — identical rule to backtest_simulator.py so live and
+        # backtest can never disagree: tradeable AND p_move over its gate AND
+        # the direction head has an edge AND the post was not damped.
+        rec["tradeable"] = bool(g.get("tradeable", False))
+        rec["trade"] = bool(
+            rec.get("tradeable")
+            and rec.get("p_move", 0.0) >= float(g.get("p_move_thr", 1.01))
+            and rec.get("edge", 0.0) >= float(g.get("edge_min", 0.05))
+            and mult == 1.0)
+        # signed expected move: size head for magnitude, dir head for sign
+        if "size" in rec and "dir" in rec:
+            rec["expected"] = rec["size"] * rec["dir"]
+        out[inst] = rec if _sz else rec["legacy_pred"]
+    # POST MEMORY: attach the precedents so the caller can show its work.
+    # Causal — only posts strictly older than this one are eligible.
+    try:
+        out["_precedents"] = find_precedents(emb, post_ts=post_ts, k=5)
+    except Exception:
+        out["_precedents"] = []
     return out, signal, gate, tfactor, tlabel
 
 
@@ -800,10 +992,25 @@ def show(text, r, signal, gate, tfactor, tlabel,
     damped = total_mult != 1.0
     print("PREDICTED 1-HOUR MARKET IMPACT (gemma+NLP->XGBoost):")
     for inst, emoji, name in LABELS:
-        v = r.get(inst, 0.0)
+        _rec = r.get(inst, 0.0)
+        # NEW: predict() returns a dict per instrument when the size/dir/move
+        # heads exist. Old float form still supported for pre-2026-08 models.
+        if isinstance(_rec, dict):
+            v = _rec.get("expected", _rec.get("legacy_pred", 0.0))
+            decision = "TRADE" if _rec.get("trade") else "SKIP"
+            _extra = ""
+            if "p_move" in _rec:
+                _extra = (f"  p_mv={_rec['p_move']:.2f}"
+                          f" p_up={_rec.get('p_up', float('nan')):.2f}"
+                          f" size={_rec.get('size', 0.0):.3f}%")
+                if not _rec.get("tradeable"):
+                    _extra += "  [untradeable: dir head failed OOS]"
+        else:
+            v = _rec
+            decision = "SKIP" if (damped or abs(v) < TRADE_THRESHOLD) else "TRADE"
+            _extra = ""
         arrow = "^" if v>0 else ("v" if v<0 else "-")
         bar = "#"*min(int(abs(v)*4),20)
-        decision = "SKIP" if (damped or abs(v) < TRADE_THRESHOLD) else "TRADE"
         hist = TRADE_ACCURACY.get(inst)
         hist_str = ""
         if hist:
@@ -815,8 +1022,18 @@ def show(text, r, signal, gate, tfactor, tlabel,
                     hist_str = f"  (hist TRADE acc {hist['trade_acc']*100:.1f}%, n={hist['trade_n']})"
             elif decision == "SKIP" and hist.get('skip_acc') is not None:
                 hist_str = f"  (hist SKIP acc {hist['skip_acc']*100:.1f}%, n={hist['skip_n']})"
-        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}  {decision}{hist_str}")
-    print("-"*64+"\n")
+        print(f"  {emoji}  {name:<12} {arrow} {v:+.4f}%  {bar}  "
+              f"{decision}{_extra}{hist_str}")
+    print("-"*64)
+    # What a trader would check next: has anything like this happened before,
+    # and what did it do? Shown for the instruments the model wants to trade,
+    # else the majors.
+    _precs = r.get("_precedents") if isinstance(r, dict) else None
+    if _precs:
+        _want = [i for i, _, _ in LABELS
+                 if isinstance(r.get(i), dict) and r[i].get("trade")]
+        show_precedents(_precs, insts=(_want or None))
+    print()
 
 
 def main():

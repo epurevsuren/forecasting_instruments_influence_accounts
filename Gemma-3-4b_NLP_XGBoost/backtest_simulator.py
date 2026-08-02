@@ -714,7 +714,10 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
                 # a coin flip with a spread is a guaranteed loss; better to run
                 # 4 instruments that work than 23 that don't.
                 _ok = _g.get("tradeable", True) or not require_tradeable
-                is_trade = (_ok and _pm >= _thr and dir_edge >= edge_min
+                # per-instrument edge from the WF sweep (it was tuned jointly
+                # with p_move_thr); --edge-min only acts as a floor.
+                _em = max(float(_g.get("edge_min", edge_min)), edge_min)
+                is_trade = (_ok and _pm >= _thr and dir_edge >= _em
                             and not damped)
             else:
                 is_trade = (abs(raw_pred) >= trade_threshold) and not damped

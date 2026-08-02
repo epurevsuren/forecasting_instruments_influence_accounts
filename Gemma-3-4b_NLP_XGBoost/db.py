@@ -23,3 +23,4 @@ table_exists   = _dp_db.table_exists
 read_table     = _dp_db.read_table
 write_table    = _dp_db.write_table
 append_table   = _dp_db.append_table
+query          = _dp_db.query   # needed by predict's post-memory lookup
