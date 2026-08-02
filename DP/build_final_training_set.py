@@ -720,7 +720,20 @@ def _intraday_moves_duckdb(con, name, after, before):
 
 
 def _tech_indicators(d):
-    """Classic TA indicators from DAILY bars, in the spirit of
+    """DEPRECATED 2026-08-02 — no longer called by the build.
+
+    This computed the seven indicators from DAILY bars, which was wrong twice
+    over for a 1-hour horizon: `mom5` was five DAYS of momentum, and the
+    values lived only in this table, so live prediction had no source and was
+    served zeros. Both are fixed by DP/build_indicators.py, which computes the
+    same seven on 1-MINUTE bars via `indicators_at()` — the identical function
+    live prediction calls — and stores them in `post_indicators`, joined above.
+
+    Kept only so an old model dir or an ad-hoc script that imports it still
+    resolves. Do not wire it back in.
+
+    Original docstring:
+    Classic TA indicators from DAILY bars, in the spirit of
     jiewwantan/XGBoost_stock_prediction (daily data + derived indicators as
     predictors). Gives the trees the market CONTEXT they currently lack —
     the placebo test showed post-window volatility depends heavily on the
@@ -781,6 +794,51 @@ def _tech_indicators(d):
 # vol_rat is intentionally NOT here: the daily source carries no Volume, so
 # requesting it would create 23 all-None columns. _tech_indicators still
 # computes it when a volume series is present.
+# ============================================================================
+# INTRADAY INDICATOR JOIN  (post_indicators, built by build_indicators.py)
+# ============================================================================
+POST_IND_TABLE = os.environ.get("POST_IND_TABLE", "post_indicators")
+_PI_CACHE: dict = {}
+_PI_LOADED = False
+
+
+def _post_indicator_map(inst):
+    """{(platform_id, col): value} for one instrument, loaded once.
+
+    The whole table is pulled on first call (one query, ~190k x 23 rows at
+    most) and sliced per instrument — 23 separate queries against a DuckDB
+    table would be slower than one scan.
+    """
+    global _PI_LOADED
+    if not _PI_LOADED:
+        _PI_LOADED = True
+        try:
+            if not db.table_exists(POST_IND_TABLE):
+                print(f"\n  ❌ {POST_IND_TABLE} not found — technical indicators "
+                      f"will be EMPTY.\n     Run: python build_indicators.py --full\n")
+                return {}
+            d = db.read_table(POST_IND_TABLE)
+            if d is None or d.empty:
+                print(f"\n  ❌ {POST_IND_TABLE} is empty — indicators will be EMPTY.\n")
+                return {}
+            print(f"  📈 {POST_IND_TABLE}: {len(d)} rows, "
+                  f"{d['instrument'].nunique()} instruments (1-min derived)")
+            for iname, g in d.groupby('instrument'):
+                m = {}
+                pids = g['platform_id'].tolist()
+                for cc in TECH_COLS:
+                    if cc in g.columns:
+                        for pid, v in zip(pids, g[cc].tolist()):
+                            if v is not None and pd.notna(v):
+                                m[(pid, cc)] = round(float(v), 5)
+                _PI_CACHE[iname] = m
+        except Exception as e:                                    # noqa: BLE001
+            print(f"\n  ❌ could not read {POST_IND_TABLE} ({type(e).__name__}: "
+                  f"{str(e)[:70]}) — indicators will be EMPTY.\n")
+            return {}
+    return _PI_CACHE.get(inst, {})
+
+
 TECH_COLS = ['mom5', 'mom20', 'sma_rat', 'rsi14', 'macd_h',
              'bb_pos', 'atr_pct']
 
@@ -810,6 +868,11 @@ def compute_impacts(scored):
     dates_list = scored['date'].tolist()
     sessions   = scored['session'].tolist()
     n          = len(scored)
+    # join key for post_indicators — same "{platform}_{id}" form build_indicators
+    # writes, so the indicator lookup is an exact per-post match rather than a
+    # date-based approximation.
+    pid_list   = (scored['platform'].astype(str) + '_'
+                  + scored['id'].astype(str)).tolist()
     impact_cols = []
     new_columns = {}   # collect all columns, add at once to avoid fragmentation
 
@@ -877,39 +940,30 @@ def compute_impacts(scored):
         else:
             new_columns[vcol] = [None] * n
 
-        # ---- TECHNICAL INDICATORS at post time (leak-guarded, see above) ----
-        if name in daily:
-            try:
-                ind = _tech_indicators(daily[name])
-                imaps = {cc: ind[cc].to_dict() for cc in ind.columns}
-                iidx = None
-                def _ind_at(dt, cc):
-                    d0 = dt.date()
-                    for back in range(0, 8):     # last session on/before post date
-                        key = d0 - timedelta(days=back)
-                        val = imaps[cc].get(key)
-                        if val is not None and pd.notna(val):
-                            return round(float(val), 5)
-                    return None
-                for cc in TECH_COLS:
-                    if cc in imaps:
-                        new_columns[f'{name}_{cc}'] = [_ind_at(dates_list[i], cc)
-                                                       for i in range(n)]
-                    else:
-                        new_columns[f'{name}_{cc}'] = [None] * n
-                _ok = sum(1 for cc in TECH_COLS
-                          if any(x is not None for x in new_columns[f'{name}_{cc}']))
-                if _ok < len(TECH_COLS):
-                    print(f"  ⚠️  {name}: only {_ok}/{len(TECH_COLS)} indicators "
-                          f"produced values — check the daily bars")
-            except Exception as e:                                  # noqa: BLE001
-                # LOUD: a silent all-None fill previously let a broken
-                # indicator block sail through a full rebuild unnoticed.
-                print(f"  ❌ {name}: INDICATORS FAILED ({type(e).__name__}: "
-                      f"{str(e)[:80]}) — columns will be EMPTY, features useless")
-                for cc in TECH_COLS:
-                    new_columns[f'{name}_{cc}'] = [None] * n
+        # ---- TECHNICAL INDICATORS at post time -----------------------------
+        # SOURCE CHANGED 2026-08-02: these used to be computed here from DAILY
+        # bars (mom5 = 5 DAYS of momentum, used to predict the next 60 min) and
+        # existed ONLY as columns in this table — so live prediction had
+        # nothing to read and was served zeros. They now come from
+        # `post_indicators`, built by DP/build_indicators.py on 1-MINUTE bars
+        # with windows in minutes, via the SAME indicators_at() function that
+        # live prediction calls. See [[intraday-indicators]].
+        _ind = _post_indicator_map(name)
+        if _ind:
+            got = 0
+            for cc in TECH_COLS:
+                vals = [_ind.get((pid, cc)) for pid in pid_list]
+                new_columns[f'{name}_{cc}'] = vals
+                got = max(got, sum(1 for v in vals if v is not None))
+            _cov = got / max(n, 1)
+            if _cov < 0.50:
+                print(f"  ⚠️  {name}: intraday indicators cover only {_cov:.0%} "
+                      f"of posts — 1-min cache may not reach back far enough")
         else:
+            # LOUD: a silent all-None fill previously let a broken indicator
+            # block sail through a full rebuild unnoticed.
+            print(f"  ❌ {name}: NO ROWS in post_indicators — columns EMPTY, "
+                  f"features useless. Run: python build_indicators.py --full")
             for cc in TECH_COLS:
                 new_columns[f'{name}_{cc}'] = [None] * n
 
