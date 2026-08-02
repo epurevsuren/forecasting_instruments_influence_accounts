@@ -1,5 +1,5 @@
 """
-db.py (shim) - Finbert_NLP_XGBoost
+db.py (shim) - Gemma-3-4b_NLP_XGBoost
 -----------------------------------
 The canonical db.py lives in DP/. This shim loads it under a distinct
 internal module name (avoiding a name collision between this file and

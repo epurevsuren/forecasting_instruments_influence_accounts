@@ -330,26 +330,25 @@ def temporal_factor(text, post_hour=None, post_ts=None, country=None):
 # They carry ZERO tradeable information — a biography of someone's positions
 # is not an action. Detected -> factor 0.0 -> never traded (hard skip).
 # ---------------------------------------------------------------------------
-ENDORSEMENT_PATTERNS = [
-    r"complete and total endorsement",
-    r"has my (?:complete|full|total|strong)[^.!?\n]{0,30}endorsement",
-    r"\b(?:congressman|congresswoman|senator|governor|sheriff|judge|mayor)\b"
-    r"[^.!?\n]{0,120}\b(?:tremendous|incredible|fantastic|phenomenal|wonderful|"
-    r"spectacular|outstanding|great)\b",
-    r"\b(?:tremendous|incredible|fantastic|phenomenal|wonderful|outstanding)\b"
-    r"[^.!?\n]{0,40}\b(?:champion|advocate|representative|leader|fighter|warrior)\b",
-    r"\bis doing (?:a |an |truly )*(?:incredible|fantastic|tremendous|great|"
-    r"amazing|outstanding)\b",
-    r"\brunning for (?:re-?election|congress|the senate|senate|governor|office)\b",
-    r"\b(?:get out and )?vote for\b",
-    # NOTE: bare "great honor" / "congratulations to" are TOO GREEDY — they
-    # also appear in real market news ("It is my Great Honor to announce our
-    # Trade Agreement with Indonesia", "CONGRATULATIONS TO EVERYONE! ...
-    # ceasefire"). Only the endorsement-specific forms are gated:
-    r"\b(?:great )?honor to endorse\b",
-    r"\bhappy birthday\b",
-]
-ENDORSEMENT_DAMP = 0.0   # hard skip — endorsements are never tradeable
+# SINGLE SOURCE OF TRUTH: the patterns now live in DP/scorer_config.json and
+# are applied by DP/signal_scorer.py at SCORING time, so endorsement posts
+# never enter training, the embedding cache, HIGH_SIGNAL or the Gemma analyst
+# run. This gate stays as the last line of defence for live posts, reading the
+# SAME list — a divergent local copy is how scoring and trading drift apart.
+ENDORSEMENT_PATTERNS = list(getattr(ss, "ENDORSEMENT_PATTERNS", []))
+if not ENDORSEMENT_PATTERNS:                 # older scorer_config.json
+    ENDORSEMENT_PATTERNS = [
+        r"complete and total endorsement",
+        r"has my (?:complete|full|total|strong)[^.!?\n]{0,30}endorsement",
+        r"\brunning for (?:re-?election|congress|the senate|senate|governor|office)\b",
+        r"\b(?:get out and )?vote for\b",
+        r"\b(?:great )?honor to endorse\b",
+        r"\bhappy birthday\b",
+    ]
+    print("  ⚠️  scorer_config.json has no endorsement_patterns — using the "
+          "built-in fallback list (add them to the config to keep scoring and "
+          "trading in sync)")
+ENDORSEMENT_DAMP = float(getattr(ss, "ENDORSEMENT_DAMP", 0.0))
 
 
 def endorsement_factor(text):

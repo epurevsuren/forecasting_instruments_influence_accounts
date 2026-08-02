@@ -382,7 +382,7 @@ def main():
     # BertForSequenceClassification: softmax(Wc·tanh(Wp·cls+bp)+bc)).
     # Head saved to gemma_sent_head.npz so predict/backtest match.
     # ------------------------------------------------------------------
-    # SENTIMENT HEAD: REMOVED for Gemma (2026-07-17). That block was FinBERT
+    # SENTIMENT HEAD: REMOVED (2026-07-17). That block was classifier-
     # anatomy (bert.pooler + a TRAINED 3-class classifier from the Financial
     # PhraseBank). Gemma is a decoder LLM with NO trained sentiment head —
     # AutoModelForSequenceClassification invents a RANDOM `score` layer
@@ -408,7 +408,7 @@ def main():
     EMB_PCA_DIM = 128
     from sklearn.decomposition import PCA
     _i70 = int(len(df) * 0.70)          # same boundary as the split below
-    # RAM guard: Gemma vectors are 5120-wide (3.3x FinBERT) — fit the PCA on
+    # RAM guard: Gemma vectors are 5120-wide — fit the PCA on
     # a stride subsample of the train slice (<=60k rows: components are
     # statistically identical, workspace is a third). Transform still maps
     # ALL rows through the fitted projection.

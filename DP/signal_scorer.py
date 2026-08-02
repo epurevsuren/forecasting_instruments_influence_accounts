@@ -161,6 +161,35 @@ GEOPOLITICAL_TERMS = set(CONFIG["geopolitical_terms"])
 POLICY_FLAGS       = CONFIG["policy_flags"]
 FINANCIAL_REFS     = CONFIG["financial_refs"]
 NOISE_REFS         = CONFIG["noise_refs"]
+
+# ---------------------------------------------------------------------------
+# ENDORSEMENT HARD-SKIP (moved here from predict, 2026-08-02)
+# ---------------------------------------------------------------------------
+# Political endorsement / ceremonial posts are stuffed with policy buzzwords —
+# "Strong on Crime, Borders, the Military, our Vets, Tax Cuts, the 2nd
+# Amendment" — so score_policy rates them highly and NOISE_REFS (only 0.3 of
+# the composite) cannot pull them back down. They were reaching training,
+# the embedding cache, HIGH_SIGNAL, and the Gemma analyst run, which spends
+# ~1.5s per post generating market impacts for things like:
+#   ".@Troy_Balderson of Ohio is running for Congress ... He has my full and
+#    total Endorsement!"  ->  GOLD +0.10%, SPY +0.20%, VIX +0.10%
+# The gate existed ONLY in predict_gemma3_nlp_xgb.py, i.e. it fired after all
+# of that had already happened. Scoring it here kills them at the source.
+ENDORSEMENT_PATTERNS = CONFIG.get("endorsement_patterns", [])
+_ENDORSEMENT_RE = [re.compile(p, re.I) for p in ENDORSEMENT_PATTERNS]
+ENDORSEMENT_DAMP = float(os.environ.get("ENDORSEMENT_DAMP", "0.0"))
+
+
+def is_endorsement(text):
+    """True when the post is a political endorsement / ceremonial message."""
+    t = str(text or "")
+    return any(r.search(t) for r in _ENDORSEMENT_RE)
+
+
+def endorsement_damp(texts):
+    """Vectorised multiplier: ENDORSEMENT_DAMP for endorsements, else 1.0."""
+    return np.array([ENDORSEMENT_DAMP if is_endorsement(t) else 1.0
+                     for t in texts], dtype=float)
 FALLBACK_FIN_KW    = CONFIG["fallback_financial_keywords"]
 FALLBACK_NOISE_KW  = CONFIG["fallback_noise_keywords"]
 
@@ -462,6 +491,11 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
         + 0.2 * out.get("score_novelty", 1.0)
         + 0.1 * out.get("score_burst",   1.0),
         0, 1))
+    # ENDORSEMENT HARD-SKIP — same rule as the batch path, so a live single
+    # post and a bulk rescore agree.
+    out["is_endorsement"] = int(is_endorsement(text))
+    if out["is_endorsement"]:
+        out["raw_score"] = out["raw_score"] * ENDORSEMENT_DAMP
 
     # domain risk = the STRONGER of war (hawkish) and non-war (macro: crypto/
     # covid/Fed/banking) impact — either domain can carry a post to full weight
@@ -620,6 +654,16 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
         + 0.2 * batch["score_novelty"]
         + 0.1 * batch["score_burst"],
         0, 1)
+    # ENDORSEMENT HARD-SKIP — applied to raw_score so it propagates into
+    # score_relative, sample_weight and everything downstream.
+    _end = endorsement_damp(texts)
+    _n_end = int((_end < 1.0).sum())
+    if _n_end:
+        batch["raw_score"] = batch["raw_score"] * _end
+        print(f"  🚫 {_n_end}/{len(texts)} endorsement/ceremonial post(s) "
+              f"zeroed at scoring ({_n_end / max(len(texts), 1):.1%}) — "
+              f"they never reach training, embeddings or the analyst")
+    batch["is_endorsement"] = (_end < 1.0).astype(int)
 
     # — Layer 7: Relative signal strength —
     if ctx_raw is None:

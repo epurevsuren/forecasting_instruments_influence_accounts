@@ -5,12 +5,12 @@ Shared DuckDB helper for database.db at the project root
 (D:\\Coding\\forecasting_instruments_influence_accounts\\database.db).
 
 Replaces the old intermediate CSV/NPY/JSON artifacts (posts_scored.csv,
-truth_training_set_TEST/FINAL.csv, finbert_embeddings_v2.npy, eval_report.json)
+truth_training_set_TEST/FINAL.csv, embedding .npy caches, eval_report.json)
 with tables in a single local DuckDB file. truth_social.csv (raw TruthSocial
 posts) and IBKR/market_data_cache/*.csv stay as plain files — they are the
 raw inputs that feed into the DuckDB pipeline.
 
-This is the canonical copy (DP/db.py). Finbert_NLP_XGBoost/db.py is a thin
+This is the canonical copy (DP/db.py). Gemma-3-4b_NLP_XGBoost/db.py is a thin
 shim that imports this file, same pattern as signal_scorer.py.
 
 Usage:
