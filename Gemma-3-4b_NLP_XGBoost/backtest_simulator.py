@@ -303,8 +303,10 @@ def embed_texts(texts):
     return _ge(texts)
 
 
-def gate_multiplier(row):
-    """Same NLP-gate + temporal-gate formula as predict_gemma_nlp_xgb.predict()."""
+def gate_multiplier(row, emb=None):
+    """Same NLP-gate + temporal-gate formula as predict_gemma_nlp_xgb.predict().
+    `emb` = this post's Gemma vector, forwarded to the semantic chain guard so
+    backtest and live make the identical restatement-vs-new-info call."""
     import math
     # DOMAIN-WEIGHTED signal — SAME formula as predict_gemma_nlp_xgb.predict()
     pis = min(float(row.get('policy_intensity_score') or 0.0) / 8.0, 1.0) \
@@ -336,7 +338,7 @@ def gate_multiplier(row):
         tfactor, tlabel = sfactor, slabel
     # chain guard: SAME production code path as live prediction
     # (predict_gemma_nlp_xgb.chain_factor — in-process state, chronological)
-    cfactor, clabel = PR.chain_factor(_account, row['date_ny'], signal)
+    cfactor, clabel = PR.chain_factor(_account, row['date_ny'], signal, emb=emb)
     if cfactor < tfactor:            # chain guard overrides everything
         tfactor, tlabel = cfactor, clabel
     # reiteration + commentary damps (production code path) — reiteration uses
@@ -613,8 +615,11 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     # every instrument, so all instruments for a post are visible side-by-side.
     csv_rows = []
 
+    _emb_raw = cfg.get("_emb_raw")
     for row_i, (idx, row) in enumerate(df.iterrows()):
-        signal, gate, tfactor, tlabel, mult = gate_multiplier(row)
+        _e = (_emb_raw[row_i] if _emb_raw is not None
+              and row_i < len(_emb_raw) else None)
+        signal, gate, tfactor, tlabel, mult = gate_multiplier(row, emb=_e)
         near_tag = " [NEAR-CUTOFF, recomputed]" if row.get('is_near') else ""
 
         # Source / account metadata — pulled from the merged df (HS + scored columns)
@@ -1190,6 +1195,9 @@ def main():
             accounts=df['account'].tolist() if 'account' in df.columns else None)
         for _c in _acols:
             X_nlp[:, use_nlp.index(_c)] = _A[:, GA.ANALYST_COLS.index(_c)]
+    # Keep the RAW (pre-PCA) embeddings for the semantic chain guard. PCA drops
+    # 31.3% of the variance, and the restatement test wants the full vector.
+    cfg["_emb_raw"] = X_emb
     X_emb = PR.project_emb(X_emb, cfg)   # PCA projection if model was trained compressed
     X = np.hstack([X_emb, X_nlp])
     print(f"\n  Feature matrix: {X.shape} "

@@ -575,9 +575,81 @@ def _db_last_post_signal(account, before_ts):
         return None
 
 
-def chain_factor(account, post_ts, signal):
-    """(0.0, label) when this post is a chain-follower; else (1.0, '').
-    Updates the in-process chain state either way."""
+# ---------------------------------------------------------------------------
+# SEMANTIC CHAIN DAMP — the chain decision moved INSIDE Gemma
+# ---------------------------------------------------------------------------
+# The old rule was (same account) AND (<=60 min) AND (signal <= leader + 0.10)
+# -> hard 0.0. It never read the text. It cannot tell
+#     "25% tariff on China"  ->  "and on Mexico too"     (NEW, market-moving)
+# from
+#     "Great meeting today"  ->  "Really great meeting"  (pure restatement)
+# and zeroes BOTH. Measured on the corpus: 69,496 posts — 36.6% of everything —
+# are damped to zero by that text-blind rule.
+#
+# Semantic novelty is exactly what an encoder is FOR, and Gemma already
+# embedded every post. NOTE the distinction from the failed memory experiment:
+# using neighbour OUTCOMES to predict a move was dead (+0.001), because
+# semantic similarity is not market impact. Using cosine to detect whether two
+# posts SAY THE SAME THING is the encoder's core competence — a different
+# question with a different answer.
+#
+# Graded, not binary:
+#     cos >= CHAIN_REPEAT_HI  -> 0.0   true restatement, already priced
+#     cos <= CHAIN_NOVEL_LO   -> 1.0   new content, trade it normally
+#     between                 -> linear ramp
+# Falls back to the old signal-delta rule when no embedding is available, so
+# nothing breaks on a cold start or a pre-embedding model dir.
+CHAIN_REPEAT_HI = float(os.environ.get("CHAIN_REPEAT_HI", "0.93"))
+CHAIN_NOVEL_LO  = float(os.environ.get("CHAIN_NOVEL_LO", "0.78"))
+
+# Prefer the thresholds CALIBRATED BY THE BUILD on real chain pairs. Gemma is a
+# decoder and its embeddings are anisotropic — cosines bunch into a narrow band
+# whose location depends on the encoder, so absolute cutoffs are guesswork.
+# Measured on synthetic anisotropic data: fixed 0.93/0.78 damped 0 of 399 real
+# pairs, i.e. silently disabled the guard. Training labels and live trading
+# MUST use the same numbers or they disagree about what a restatement is.
+def _load_chain_thresholds():
+    global CHAIN_REPEAT_HI, CHAIN_NOVEL_LO
+    if os.environ.get("CHAIN_REPEAT_HI"):
+        return
+    p = os.path.normpath(os.path.join(_HERE, "..", "DP", "chain_thresholds.json"))
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        hi, lo = float(d["repeat_hi"]), float(d["novel_lo"])
+        if hi - lo >= 0.02:
+            CHAIN_REPEAT_HI, CHAIN_NOVEL_LO = hi, lo
+            print(f"  🎚️  chain thresholds from build calibration: "
+                  f"repeat≥{hi:.3f} novel≤{lo:.3f} (n={d.get('n_pairs','?')} pairs)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  ⚠️  chain_thresholds.json unreadable ({e}) — using defaults")
+
+
+_load_chain_thresholds()
+
+
+def _cos(a, b):
+    if a is None or b is None:
+        return None
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    if a.shape != b.shape or not a.size:
+        return None
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na < 1e-9 or nb < 1e-9:
+        return None
+    return float(a @ b / (na * nb))
+
+
+def chain_factor(account, post_ts, signal, emb=None):
+    """Damp factor for a post that lands inside another post's reaction window.
+
+    `emb` = this post's Gemma embedding. When the leader's embedding is also
+    known, GEMMA decides whether this is a restatement or new information;
+    otherwise we fall back to the old signal-delta heuristic.
+    """
     if account is None or post_ts is None:
         return 1.0, ""
     key = str(account).lower()
@@ -585,16 +657,38 @@ def chain_factor(account, post_ts, signal):
     if prev is None:
         hit = _db_last_post_signal(account, post_ts)
         if hit is not None:
-            prev = {"ts": hit[0], "sig": hit[1]}
+            prev = {"ts": hit[0], "sig": hit[1], "emb": None}
     if prev is not None:
         gap = (post_ts - prev["ts"]).total_seconds()
-        if 0 <= gap <= CHAIN_WINDOW_MIN * 60 and signal <= prev["sig"] + CHAIN_SIGNAL_DELTA:
-            # follower: EXTEND the chain, keep the leader's signal on record
-            _CHAIN_STATE[key] = {"ts": post_ts, "sig": prev["sig"]}
-            return 0.0, (f"chain-follower ({gap/60:.0f}min after leader, "
-                         f"Δsignal {signal - prev['sig']:+.2f} < +{CHAIN_SIGNAL_DELTA}) "
-                         f"-- same reaction window, move already priced")
-    _CHAIN_STATE[key] = {"ts": post_ts, "sig": signal}
+        if 0 <= gap <= CHAIN_WINDOW_MIN * 60:
+            cos = _cos(emb, prev.get("emb"))
+            if cos is not None:
+                if cos >= CHAIN_REPEAT_HI:
+                    f, why = 0.0, "restates the leader"
+                elif cos <= CHAIN_NOVEL_LO:
+                    f, why = 1.0, "NEW information despite the window"
+                else:
+                    f = float((CHAIN_REPEAT_HI - cos) /
+                              max(CHAIN_REPEAT_HI - CHAIN_NOVEL_LO, 1e-9))
+                    why = "partial overlap"
+                # a genuinely new post becomes the new chain leader
+                _CHAIN_STATE[key] = {
+                    "ts": post_ts,
+                    "sig": prev["sig"] if f < 0.5 else signal,
+                    "emb": prev.get("emb") if f < 0.5 else emb}
+                if f >= 0.999:
+                    return 1.0, ""
+                return f, (f"chain x{f:.2f} ({gap/60:.0f}min after leader, "
+                           f"gemma cos={cos:.3f} — {why})")
+            # --- fallback: no embedding for the leader -> old rule ---------
+            if signal <= prev["sig"] + CHAIN_SIGNAL_DELTA:
+                _CHAIN_STATE[key] = {"ts": post_ts, "sig": prev["sig"],
+                                     "emb": prev.get("emb")}
+                return 0.0, (f"chain-follower ({gap/60:.0f}min after leader, "
+                             f"Δsignal {signal - prev['sig']:+.2f} < "
+                             f"+{CHAIN_SIGNAL_DELTA}, no embedding — "
+                             f"signal-delta fallback)")
+    _CHAIN_STATE[key] = {"ts": post_ts, "sig": signal, "emb": emb}
     return 1.0, ""
 
 
@@ -880,7 +974,10 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
     sfactor, slabel = self_news_share_factor(text, account=account)
     if sfactor < tfactor:            # self-news-share gate overrides both
         tfactor, tlabel = sfactor, slabel
-    cfactor, clabel = chain_factor(account, post_ts, signal)
+    # emb is this post's Gemma vector — hand it to the chain guard so the
+    # restatement-vs-new-information call is made by the model, not by a
+    # signal-delta proxy.
+    cfactor, clabel = chain_factor(account, post_ts, signal, emb=emb)
     if cfactor < tfactor:            # chain guard overrides everything
         tfactor, tlabel = cfactor, clabel
     # reiteration + commentary damps: ONLY for temporally-neutral posts (a

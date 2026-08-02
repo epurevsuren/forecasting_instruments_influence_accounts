@@ -939,6 +939,60 @@ def apply_caps(scored, impact_cols):
 
 
 CHAIN_LABEL_DAMP       = 0.3   # training trust multiplier for chain followers
+# Semantic chain thresholds — MUST match predict_gemma3_nlp_xgb.py so training
+# labels and live trading make the same restatement-vs-new-information call.
+CHAIN_REPEAT_HI = float(os.environ.get("CHAIN_REPEAT_HI", "0.93"))  # >= : restatement
+CHAIN_NOVEL_LO  = float(os.environ.get("CHAIN_NOVEL_LO", "0.78"))   # <= : new info
+# Percentile split used when thresholds are NOT forced via env (default path).
+CHAIN_REPEAT_PCT = float(os.environ.get("CHAIN_REPEAT_PCT", "40"))  # top X% = repeats
+CHAIN_NOVEL_PCT  = float(os.environ.get("CHAIN_NOVEL_PCT", "30"))   # bottom X% = novel
+CHAIN_EMB_TABLE = os.environ.get("CHAIN_EMB_TABLE", "gemma3_embeddings_v1")
+
+
+def _load_chain_embeddings(scored):
+    """{platform_id: unit-norm embedding} for posts that could be chain
+    followers — i.e. any post within CHAIN_LABEL_WINDOW_MIN of the same
+    account's previous post, plus those leaders. Loading only the pairs keeps
+    this to a few % of the corpus instead of all 190k vectors.
+
+    Returns {} on any failure; the caller then falls back to the old rule and
+    says so, rather than silently changing behaviour.
+    """
+    try:
+        import duckdb
+        s = scored[['platform', 'id', 'date', 'account']].sort_values('date')
+        prev_ts = s.groupby('account')['date'].shift(1)
+        gap = (s['date'] - prev_ts).dt.total_seconds()
+        near = (gap >= 0) & (gap <= CHAIN_LABEL_WINDOW_MIN * 60)
+        pid = s['platform'].astype(str) + '_' + s['id'].astype(str)
+        prev_pid = pid.groupby(s['account']).shift(1)
+        keys = sorted(set(pid[near.fillna(False)]) |
+                      set(prev_pid[near.fillna(False)].dropna()))
+        if not keys:
+            return {}
+        print(f"  🧠 loading {len(keys)} embeddings for semantic chain damp "
+              f"(of {len(scored)} posts)...")
+        con = duckdb.connect(db.DB_PATH, read_only=True)
+        out, CH = {}, 4000
+        for i in range(0, len(keys), CH):
+            kd = pd.DataFrame({'k': keys[i:i + CH]})
+            con.register('kd', kd)
+            d = con.execute(
+                f'SELECT k.k, e.embedding FROM kd k '
+                f'JOIN "{CHAIN_EMB_TABLE}" e ON e.platform_id = k.k').df()
+            for kk, vv in zip(d['k'], d['embedding']):
+                a = np.asarray(vv, dtype=np.float32)
+                n = float(np.linalg.norm(a))
+                if n > 1e-9:
+                    out[kk] = a / n
+            del d
+        con.close()
+        print(f"     found {len(out)}/{len(keys)}")
+        return out
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  ⚠️  semantic chain damp unavailable ({type(e).__name__}: "
+              f"{str(e)[:70]}) — falling back to the signal-delta rule")
+        return {}
 CHAIN_LABEL_WINDOW_MIN = 60
 DAILY_LABEL_DAMP       = 0.7   # trust multiplier when the core label is
                                # daily-fallback (post while market closed —
@@ -1060,24 +1114,129 @@ def finalize(scored, impact_cols):
     # carrying the actual content (the July-2019 bitcoin tweet: signal 0.47
     # x0.3 = 0.14) could never reach HIGH_SIGNAL no matter what it said.
     scored = scored.sort_values('date')
-    _last: dict = {}          # account -> {'ts': date, 'sig': leader nlp_signal}
-    _damp = []
+    # SEMANTIC UPGRADE (2026-08-02): the signal-delta test below is a scalar
+    # proxy for a question that is fundamentally about MEANING — "is this post
+    # restating the leader, or saying something new?". It cannot tell
+    #   "25% tariff on China" -> "and on Mexico too"   (NEW, market-moving)
+    # from
+    #   "Great meeting today" -> "Really great meeting" (pure restatement)
+    # and damps both. That mattered: 69,496 posts (36.6% of the corpus) were
+    # flagged by it, and because the damp drops them under the HIGH_SIGNAL
+    # threshold they never reached training OR the backtest at all — which is
+    # why fixing only the production guard changed nothing downstream.
+    #
+    # Gemma already embedded every post. Cosine between a follower and its
+    # leader answers the question directly, and unlike the outcome-prediction
+    # experiment (measured dead, +0.001) near-duplicate detection is exactly
+    # what an encoder is good at.
+    _emb = _load_chain_embeddings(scored)
+
+    # ---- SELF-CALIBRATING THRESHOLDS -----------------------------------
+    # Gemma is a DECODER; its embeddings are anisotropic (they occupy a narrow
+    # cone, so cosine similarities bunch up around 0.7-0.9 and absolute cutoffs
+    # are unreliable). Fixed thresholds risk damping everything or nothing.
+    # Instead: measure the actual chain-pair distribution, then split it by
+    # PERCENTILE — the top CHAIN_REPEAT_PCT are restatements, the bottom
+    # CHAIN_NOVEL_PCT are new information, regardless of the encoder's scale.
+    # Set CHAIN_REPEAT_HI / CHAIN_NOVEL_LO in the env to force absolutes.
+    _hi, _lo = CHAIN_REPEAT_HI, CHAIN_NOVEL_LO
+    if _emb and not os.environ.get("CHAIN_REPEAT_HI"):
+        _probe, _pl = [], {}
+        for _, r in scored.iterrows():
+            k = str(r.get('account', '')).lower()
+            p = _pl.get(k)
+            v = _emb.get(f"{r.get('platform')}_{r.get('id')}")
+            if (p is not None and v is not None and p[1] is not None and
+                    (r['date'] - p[0]) <= pd.Timedelta(minutes=CHAIN_LABEL_WINDOW_MIN)):
+                _probe.append(float(np.dot(v, p[1])))
+            _pl[k] = (r['date'], v)
+        if len(_probe) >= 200:
+            _pr = np.array(_probe)
+            _hi = float(np.percentile(_pr, 100 - CHAIN_REPEAT_PCT))
+            _lo = float(np.percentile(_pr, CHAIN_NOVEL_PCT))
+            if _hi - _lo < 0.02:            # degenerate spread -> keep absolutes
+                _hi, _lo = CHAIN_REPEAT_HI, CHAIN_NOVEL_LO
+                print(f"  ⚠️  chain cosines too tightly clustered "
+                      f"({_lo:.3f}-{_hi:.3f}) — using absolute thresholds")
+            else:
+                print(f"  🎚️  chain thresholds calibrated on {len(_pr)} real "
+                      f"pairs: repeat≥{_hi:.3f} (top {CHAIN_REPEAT_PCT}%), "
+                      f"novel≤{_lo:.3f} (bottom {CHAIN_NOVEL_PCT}%)")
+                # Freeze them where LIVE PREDICTION can read them. Without
+                # this, training labels would be damped on calibrated
+                # thresholds while production used the absolute defaults —
+                # and with an anisotropic encoder those disagree completely
+                # (measured: fixed cutoffs damped 0 of 399 real pairs).
+                try:
+                    _tp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "chain_thresholds.json")
+                    with open(_tp, "w", encoding="utf-8") as _f:
+                        json.dump({"repeat_hi": round(_hi, 4),
+                                   "novel_lo": round(_lo, 4),
+                                   "n_pairs": int(len(_pr)),
+                                   "window_min": CHAIN_LABEL_WINDOW_MIN,
+                                   "emb_table": CHAIN_EMB_TABLE,
+                                   "calibrated_at": pd.Timestamp.utcnow().isoformat()},
+                                  _f, indent=2)
+                    print(f"     💾 frozen -> {os.path.basename(_tp)} "
+                          f"(predict/backtest read this)")
+                except Exception as _e:                       # noqa: BLE001
+                    print(f"     ⚠️  could not write chain_thresholds.json ({_e})")
+
+    _last: dict = {}   # account -> {'ts', 'sig', 'emb'}
+    _damp, _cos_seen, _rescued = [], [], 0
     for _, r in scored.iterrows():
         k = str(r.get('account', '')).lower()
         sig = float(r.get('nlp_signal') or 0.0)
+        pid = f"{r.get('platform')}_{r.get('id')}"
+        vec = _emb.get(pid)
         prev = _last.get(k)
         in_chain = (prev is not None and
                     (r['date'] - prev['ts']) <= pd.Timedelta(minutes=CHAIN_LABEL_WINDOW_MIN))
-        if in_chain and sig <= prev['sig'] + 0.10:
-            _damp.append(CHAIN_LABEL_DAMP)          # true recap/continuation
-            _last[k] = {'ts': r['date'], 'sig': prev['sig']}   # extend chain
+        if not in_chain:
+            _damp.append(1.0)
+            _last[k] = {'ts': r['date'], 'sig': sig, 'emb': vec}
+            continue
+        cos = None
+        if vec is not None and prev.get('emb') is not None:
+            cos = float(np.dot(vec, prev['emb']))     # both pre-normalised
+            _cos_seen.append(cos)
+        if cos is not None:
+            # graded: 1.0 = fully novel, CHAIN_LABEL_DAMP = pure restatement
+            if cos >= _hi:
+                d = CHAIN_LABEL_DAMP
+            elif cos <= _lo:
+                d = 1.0
+            else:
+                _t = (_hi - cos) / max(_hi - _lo, 1e-9)
+                d = CHAIN_LABEL_DAMP + (1.0 - CHAIN_LABEL_DAMP) * _t
+            # the old rule would have damped anything with sig <= leader+0.10;
+            # count how many Gemma rescues as genuinely new information
+            if sig <= prev['sig'] + 0.10 and d > 0.9:
+                _rescued += 1
         else:
-            _damp.append(1.0)                        # leader OR stronger follower
-            _last[k] = {'ts': r['date'], 'sig': sig}
+            # no embedding for this pair -> old signal-delta rule
+            d = CHAIN_LABEL_DAMP if sig <= prev['sig'] + 0.10 else 1.0
+        _damp.append(d)
+        if d < 0.5:      # still a follower: chain continues under the leader
+            _last[k] = {'ts': r['date'], 'sig': prev['sig'], 'emb': prev.get('emb')}
+        else:            # new information: this post becomes the new leader
+            _last[k] = {'ts': r['date'], 'sig': sig, 'emb': vec}
     n_damped = sum(1 for d in _damp if d < 1.0)
     if n_damped:
-        print(f"  🔗 {n_damped} chain-follower post(s): sample_weight ×{CHAIN_LABEL_DAMP} "
-              f"(label carries the leader's move)")
+        _full = sum(1 for d in _damp if d <= CHAIN_LABEL_DAMP + 1e-9)
+        print(f"  🔗 {n_damped} chain post(s) damped "
+              f"({_full} full ×{CHAIN_LABEL_DAMP}, {n_damped - _full} partial)")
+        if _cos_seen:
+            _cs = np.array(_cos_seen)
+            print(f"     🧠 gemma cosine to leader: p10={np.percentile(_cs,10):.3f} "
+                  f"p50={np.percentile(_cs,50):.3f} p90={np.percentile(_cs,90):.3f} "
+                  f"(repeat≥{_hi:.3f} / novel≤{_lo:.3f})")
+            print(f"     ✅ {_rescued} post(s) the OLD rule would have damped are "
+                  f"kept at full weight — Gemma says they carry NEW information")
+        else:
+            print(f"     ⚠️  no embeddings available — fell back to the "
+                  f"signal-delta rule for every pair")
     scored['sample_weight'] = (scored['sample_weight']
                                * pd.Series(_damp, index=scored.index)).round(4)
 
