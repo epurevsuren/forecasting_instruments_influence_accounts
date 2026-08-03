@@ -8,6 +8,7 @@ REM   2. x_tweets_retriever.py       — fetch new geopolitical tweets (last 7 d
 REM   3. filter_english_tweets.py    — rebuild x_tweets_en.csv from x_tweets.csv
 REM   4. sync_unified_feed.py        — merge both sources → unified_feed (DuckDB)
 REM   5. signal_scorer.py            — NLP score new posts → posts_scored (DuckDB)
+REM   5.5 build_indicators.py        — intraday 1-min TA at each post → post_indicators
 REM   6. build_final_training_set.py — label with market impact → training tables
 REM
 REM SCHEDULE: once per day at your local equivalent of 22:00 UTC
@@ -105,6 +106,21 @@ powershell -NoProfile -Command ^
   "uv run python signal_scorer.py ^
    2>>'logs\signal_scorer_%TS%.err' ^
    | Tee-Object -FilePath 'logs\signal_scorer_%TS%.log'"
+
+REM ---------------------------------------------------------------------------
+REM Step 5.5: Intraday technical indicators for the NEW posts.
+REM   INCREMENTAL by default — only posts missing from post_indicators, so a
+REM   daily run handles ~2.5k posts, not 190k. Bars are read in place from
+REM   IBKR\market_data_cache (never stored in the DB) and each instrument is
+REM   saved as it finishes, so an interrupt costs one instrument, not the run.
+REM   MUST run BEFORE build_final_training_set.py, which joins this table.
+REM   Full rebuild (only after changing the indicator windows):
+REM     uv run python build_indicators.py --rebuild
+REM ---------------------------------------------------------------------------
+powershell -NoProfile -Command ^
+  "uv run python build_indicators.py ^
+   2>>'logs\build_indicators_%TS%.err' ^
+   | Tee-Object -FilePath 'logs\build_indicators_%TS%.log'"
 
 REM ---------------------------------------------------------------------------
 REM Step 6: Label new posts with market impact (deferred if data not yet ready)

@@ -49,6 +49,7 @@ import os
 import sys
 import json
 import argparse
+import time
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -197,46 +198,117 @@ def indicators_at(inst, when, bars=None):
     return _from_frame(bars)
 
 
+# ------------------------------------------------------- vectorised engine ---
+def _indicator_frame(b):
+    """All 7 indicators as SERIES over the whole 1-min frame, in ONE pass.
+
+    This replaces a per-post `_from_frame()` call. The old loop ran
+    `.tail()/.resample()/.ewm()` once PER POST PER INSTRUMENT — ~190k x 23 =
+    4.4M pandas pipelines, which is why a rebuild took hours. Rolling/ewm are
+    causal by construction (each row uses only rows at or before it), so
+    computing the series once and reading the value at the post's cutoff gives
+    an identical answer for a fraction of the work.
+    """
+    c, h, l = b['close'], b['high'], b['low']
+    out = pd.DataFrame(index=b.index)
+    out['mom5'] = (c / c.shift(W['mom5']) - 1.0) * 100.0
+    out['mom20'] = (c / c.shift(W['mom20']) - 1.0) * 100.0
+    out['sma_rat'] = c / c.rolling(W['sma_rat'], min_periods=10).mean()
+    _m = c.rolling(W['bb_pos'], min_periods=10).mean()
+    _s = c.rolling(W['bb_pos'], min_periods=10).std(ddof=0)
+    out['bb_pos'] = (((c - _m) / (2 * _s)) + 0.5).clip(-1.0, 2.0)
+
+    # 5-min oscillators — resampled ONCE for the whole series.
+    #
+    # LEAK GUARD: label='right' stamps each bin with its CLOSE time, so the bin
+    # covering [10:00, 10:05) is labelled 10:05. A later ffill onto the 1-min
+    # index then gives a post at 10:03 the bar that closed at 10:00 — strictly
+    # past. With the default label='left' that bin is stamped 10:00 and ffill
+    # hands back a bar containing 10:03 and 10:04, i.e. up to 4 minutes of the
+    # reaction being predicted. (Caught by a diff against the per-post path,
+    # which never saw this because it only ever held a partial trailing bin.)
+    r = b.resample(f"{RESAMPLE_MIN}min", label='right', closed='left').agg(
+        {'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    if len(r) >= 20:
+        d = r['close'].diff()
+        up = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        dn = (-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = 100 - 100 / (1 + up / dn.replace(0, np.nan))
+        e12 = r['close'].ewm(span=12, adjust=False).mean()
+        e26 = r['close'].ewm(span=26, adjust=False).mean()
+        macd = e12 - e26
+        hist = (macd - macd.ewm(span=9, adjust=False).mean()) / r['close'] * 100.0
+        pc = r['close'].shift(1)
+        tr = pd.concat([r['high'] - r['low'], (r['high'] - pc).abs(),
+                        (r['low'] - pc).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / 14, adjust=False).mean() / r['close'] * 100.0
+        # ffill the 5-min values onto the 1-min index: at any minute the latest
+        # COMPLETED 5-min bar is the correct reading, never a future one.
+        out['rsi14'] = rsi.reindex(out.index, method='ffill')
+        out['macd_h'] = hist.reindex(out.index, method='ffill')
+        out['atr_pct'] = atr.reindex(out.index, method='ffill')
+    else:
+        out['rsi14'] = out['macd_h'] = out['atr_pct'] = np.nan
+    return out
+
+
 # ------------------------------------------------------------------ batch ---
-def build(posts, instruments, verbose=True):
-    """Indicators for every (post, instrument). Loads each instrument's bars
-    ONCE over the whole post span, then walks posts chronologically."""
-    rows = []
+def build(posts, instruments, verbose=True, on_instrument=None):
+    """Indicators for every (post, instrument), vectorised + ASOF-joined.
+
+    `on_instrument(df)` is called after EACH instrument so the caller can
+    persist incrementally — a Ctrl+C then costs one instrument, not the run.
+    """
+    all_rows = []
+    lo = posts['date'].min() - pd.Timedelta(minutes=LOOKBACK_MIN * 2)
+    hi = posts['date'].max() + pd.Timedelta(minutes=1)
     for n_i, inst in enumerate(instruments, 1):
         if not has_bars(inst):
             if verbose:
-                print(f"  [{n_i}/{len(instruments)}] ⏭️  {inst}: no 1-min cache")
+                print(f"  [{n_i}/{len(instruments)}] ⏭️  {inst}: no 1-min cache",
+                      flush=True)
             continue
-        lo = posts['date'].min() - pd.Timedelta(minutes=LOOKBACK_MIN)
-        hi = posts['date'].max() + pd.Timedelta(minutes=1)
-        if verbose:
-            print(f"  [{n_i}/{len(instruments)}] 📥 {inst}: loading bars "
-                  f"{lo:%Y-%m-%d} -> {hi:%Y-%m-%d}...", flush=True)
+        t0 = time.time()
         b = _load_window(inst, lo, hi)
         if b is None or b.empty:
             if verbose:
-                print(f"       ⚠️  no bars in span — skipped")
+                print(f"  [{n_i}/{len(instruments)}] ⚠️  {inst}: no bars in span",
+                      flush=True)
             continue
-        idx = b.index
-        n_ok = 0
-        for pid, when in zip(posts['platform_id'], posts['date']):
-            # strict: everything before the post, never the bar it landed in
-            # (bar_cutoff floors to the minute — see its docstring)
-            j = idx.searchsorted(bar_cutoff(when), side='left')
-            if j < 30:
-                continue
-            k = max(0, j - LOOKBACK_MIN)
-            v = _from_frame(b.iloc[k:j])
-            if not np.isfinite(v.get('atr_pct', np.nan)):
-                continue
-            rows.append({"platform_id": pid, "instrument": inst,
-                         "date": when, **{c: v[c] for c in TECH_COLS}})
-            n_ok += 1
-        if verbose:
-            print(f"       ✅ {n_ok}/{len(posts)} posts covered "
-                  f"({n_ok / max(len(posts), 1):.0%})")
+        ind = _indicator_frame(b)
         del b
-    return pd.DataFrame(rows)
+
+        # ---- ASOF: last bar STRICTLY BEFORE each post's minute boundary ----
+        cut = pd.DatetimeIndex([bar_cutoff(w) for w in posts['date']])
+        j = ind.index.searchsorted(cut, side='left') - 1     # strict '<'
+        ok = j >= 0
+        if not ok.any():
+            if verbose:
+                print(f"  [{n_i}/{len(instruments)}] ⚠️  {inst}: no post is "
+                      f"inside the bar range", flush=True)
+            del ind
+            continue
+        vals = ind.iloc[j[ok]].reset_index(drop=True)
+        df = pd.DataFrame({
+            "platform_id": np.asarray(posts['platform_id'])[ok],
+            "instrument": inst,
+            "date": np.asarray(posts['date'])[ok],
+        })
+        for cc in TECH_COLS:
+            df[cc] = vals[cc].values
+        df = df[np.isfinite(df['atr_pct'].astype(float))]
+        del ind, vals
+
+        if verbose:
+            print(f"  [{n_i}/{len(instruments)}] ✅ {inst}: {len(df)}/{len(posts)} "
+                  f"posts ({len(df) / max(len(posts), 1):.0%})  "
+                  f"{time.time() - t0:.1f}s", flush=True)
+        if on_instrument is not None and len(df):
+            on_instrument(df)          # persist NOW — Ctrl+C safe
+        else:
+            all_rows.append(df)
+    return (pd.concat(all_rows, ignore_index=True) if all_rows
+            else pd.DataFrame(columns=["platform_id", "instrument", "date"] + TECH_COLS))
 
 
 def main():
@@ -245,14 +317,37 @@ def main():
                     "Bars stay in CSV; only indicators are stored.")
     ap.add_argument("--full", action="store_true", help="every post")
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--table", default="training_set_FINAL")
-    ap.add_argument("--instrument", default=None, help="probe a single instrument")
+    # posts_scored, NOT training_set_FINAL. training_set_FINAL is written BY
+    # build_final_training_set.py, which JOINS post_indicators — reading it here
+    # is circular: new posts can never get indicators because they only enter
+    # training_set_FINAL after the build that needs them. Measured 2026-08-03:
+    # posts_scored 192,548 (to 08-03) vs training_set_FINAL 189,993 (to 07-11),
+    # so 2,555 posts were permanently indicator-less. posts_scored is upstream
+    # (signal_scorer, step 5) and always current at step 5.5.
+    ap.add_argument("--table", default="posts_scored",
+                    help="Source of post timestamps (default posts_scored — "
+                         "upstream of build_final_training_set, so new posts "
+                         "get indicators BEFORE the build that consumes them).")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="Ignore existing rows and rebuild the whole table "
+                         "(default: INCREMENTAL — only posts not yet present).")
+    ap.add_argument("--instrument", default=None,
+                    help="Limit to ONE instrument (works for the build too, "
+                         "not just --at). Was previously ignored during a "
+                         "build, so --instrument SPY still ran all 23.")
     ap.add_argument("--at", default=None,
                     help="probe: indicators at this UTC timestamp, print and exit")
     args = ap.parse_args()
 
     reg = json.load(open(os.path.join(_HERE, "instruments.json"), encoding="utf-8"))
     instruments = list(reg["instruments"].keys())
+    if args.instrument:
+        _want = [i.strip() for i in args.instrument.split(",") if i.strip()]
+        _bad = [i for i in _want if i not in instruments]
+        if _bad:
+            sys.exit(f"❌ unknown instrument(s): {', '.join(_bad)}\n"
+                     f"   known: {', '.join(instruments)}")
+        instruments = _want
 
     # ---- probe mode: prove the live path works, annotate nothing ----------
     if args.at:
@@ -271,11 +366,33 @@ def main():
     posts['date'] = pd.to_datetime(posts['date'], utc=True)
     posts['platform_id'] = posts['platform'].astype(str) + '_' + posts['id'].astype(str)
 
+    # ---- INCREMENTAL: only posts not already in post_indicators -----------
+    # A daily run has ~2.5k new posts, not 190k. Rebuilding everything each
+    # time is what made this unusable (and a Ctrl+C mid-rebuild left the table
+    # in an unknown state). --rebuild forces the full pass.
+    n_all = len(posts)
+    already = 0
+    if not args.rebuild and db.table_exists(OUT_TABLE):
+        try:
+            done = db.query(f'SELECT DISTINCT platform_id FROM "{OUT_TABLE}"')
+            if done is not None and len(done):
+                have = set(done['platform_id'].astype(str))
+                already = len(have)
+                posts = posts[~posts['platform_id'].isin(have)].reset_index(drop=True)
+        except Exception as e:                                # noqa: BLE001
+            print(f"  ⚠️  could not read {OUT_TABLE} ({e}) — doing a full pass")
+    if posts.empty:
+        print(f"✅ nothing to do — all {n_all} posts already have indicators "
+              f"({OUT_TABLE} covers {already}).")
+        return 0
+
     print("=" * 74)
     print("  INTRADAY INDICATORS (1-min bars) SYNCED TO POST TIMES")
     print("=" * 74)
-    print(f"  posts       : {len(posts)}  "
+    print(f"  posts TODO  : {len(posts)} of {n_all}  "
           f"({posts['date'].min():%Y-%m-%d} -> {posts['date'].max():%Y-%m-%d})")
+    print(f"  already done: {already}"
+          + ("   [--rebuild: ignoring, full pass]" if args.rebuild else ""))
     print(f"  instruments : {len(instruments)}")
     print(f"  windows     : mom5={W['mom5']}m  mom20={W['mom20']}m  "
           f"sma={W['sma_rat']}m  rsi/atr={RESAMPLE_MIN}m x14  bb={W['bb_pos']}m")
@@ -283,16 +400,39 @@ def main():
     print(f"  bars        : read in place from {CACHE_DIR} (never stored in the DB)")
     print("=" * 74, flush=True)
 
-    out = build(posts, instruments)
-    if out.empty:
+    # Persist per instrument so an interrupt costs one instrument, not the run.
+    written = {"rows": 0, "insts": 0, "first": not db.table_exists(OUT_TABLE)}
+    if args.rebuild and db.table_exists(OUT_TABLE):
+        if args.instrument:
+            # SCOPED rebuild: replacing the whole table would delete the other
+            # 22 instruments. Drop only the rows for the instrument(s) asked
+            # for, then append — so `--instrument SPY --rebuild` refreshes SPY
+            # and leaves everything else intact.
+            _lst = ",".join("'" + i.replace("'", "''") + "'" for i in instruments)
+            db.query(f'DELETE FROM "{OUT_TABLE}" WHERE instrument IN ({_lst})')
+            print(f"  🧹 --rebuild --instrument: dropped existing rows for "
+                  f"{', '.join(instruments)} only (other instruments kept)")
+            written["first"] = False   # append into the surviving table
+        else:
+            written["first"] = True    # full rebuild replaces the table
+
+    def _persist(df):
+        if written["first"]:
+            db.write_table(OUT_TABLE, df)
+            written["first"] = False
+        else:
+            db.append_table(OUT_TABLE, df)
+        written["rows"] += len(df)
+        written["insts"] += 1
+        print(f"       💾 saved ({written['rows']} rows so far)", flush=True)
+
+    t_all = time.time()
+    build(posts, instruments, on_instrument=_persist)
+    if not written["rows"]:
         print("\n❌ nothing produced — check the 1-min cache")
         return 1
-    db.write_table(OUT_TABLE, out)
-    print(f"\n💾 {OUT_TABLE}: {len(out)} rows "
-          f"({out['instrument'].nunique()} instruments)")
-    cov = out.groupby('instrument').size().sort_values()
-    print(f"   thinnest coverage: " +
-          ", ".join(f"{i}={n}" for i, n in cov.head(4).items()))
+    print(f"\n💾 {OUT_TABLE}: +{written['rows']} rows across "
+          f"{written['insts']} instrument(s) in {time.time() - t_all:.0f}s")
     print(f"   next: build_final_training_set.py --full  (ASOF-joins this table)")
     return 0
 
