@@ -227,8 +227,11 @@ def month_has_gap(handle, mkey, lo, hi, max_gap_days):
     """
     have = sorted(d for d in _COV_DAYS.get(str(handle).lower(), set())
                   if lo.strftime("%Y-%m-%d") <= d < hi.strftime("%Y-%m-%d"))
+    # None (not a fake day count) = "no rows anywhere inside the requested
+    # window". The month may still hold rows OUTSIDE it — e.g. --since 20260707
+    # on an account whose only July tweets are from the 1st-6th.
     if not have:
-        return True, 999, lo              # nothing at all in range -> fetch
+        return True, None, lo
     days = [datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=UTC) for d in have]
     edges = [lo] + days + [min(hi, datetime.now(UTC))]
     worst, at = 0, None
@@ -854,9 +857,14 @@ async def retrieve(handles_filter=None, since=None, until=None,
                             print(f"  [{handle}] {mkey}: skip (already have {have})")
                             ci += 1
                             continue
-                        print(f"  [{handle}] {mkey}: have {have} but a "
-                              f"{_worst}-day GAP from "
-                              f"{_at:%Y-%m-%d} — refetching this month")
+                        if _worst is None:
+                            print(f"  [{handle}] {mkey}: have {have} in the "
+                                  f"month but NONE in the requested window "
+                                  f"({cs:%Y-%m-%d}..{ce:%Y-%m-%d}) — fetching")
+                        else:
+                            print(f"  [{handle}] {mkey}: have {have} but a "
+                                  f"{_worst}-day GAP from "
+                                  f"{_at:%Y-%m-%d} — refetching this month")
                     try:
                         chunk_rows, rate_limited = await fetch_search_page(page, handle, cs, ce)
                     except Exception as e:
