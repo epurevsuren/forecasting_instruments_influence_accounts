@@ -90,6 +90,159 @@
     "insurgency",
     "coup"
   ],
+  "_country_note": "SPEAKER x SUBJECT. A country word means different things depending on who says it: the Chinese Embassy posting about China is routine self-promotion ('a herder helped a stuck car in Xinjiang' was scoring USD_CNY -0.30%); the US President posting about China is cross-border friction. When EVERY country a post mentions is the SPEAKER'S OWN and no policy flag fired, raw_score is multiplied by country_self_damp. A post naming a FOREIGN country is left alone. country_policy_guard: flags that make a post market-moving even when self-referential (a Chinese official announcing retaliation tariffs is NOT routine), so the damp never fires on them.",
+  "country_terms": {
+    "CN": [
+      "china",
+      "chinese",
+      "beijing",
+      "prc",
+      "xi jinping",
+      "renminbi",
+      "yuan",
+      "shanghai",
+      "taiwan strait"
+    ],
+    "US": [
+      "united states",
+      "america",
+      "american",
+      "washington",
+      "white house",
+      "u.s.",
+      "usa",
+      "dollar"
+    ],
+    "RU": [
+      "russia",
+      "russian",
+      "moscow",
+      "kremlin",
+      "putin",
+      "rouble",
+      "ruble"
+    ],
+    "MX": [
+      "mexico",
+      "mexican",
+      "sheinbaum",
+      "peso",
+      "tijuana"
+    ],
+    "IR": [
+      "iran",
+      "iranian",
+      "tehran",
+      "persian gulf",
+      "irgc"
+    ],
+    "IL": [
+      "israel",
+      "israeli",
+      "jerusalem",
+      "idf",
+      "netanyahu"
+    ],
+    "UA": [
+      "ukraine",
+      "ukrainian",
+      "kyiv",
+      "kiev",
+      "zelensky"
+    ],
+    "IN": [
+      "india",
+      "indian",
+      "new delhi",
+      "modi",
+      "rupee"
+    ],
+    "JP": [
+      "japan",
+      "japanese",
+      "tokyo",
+      "yen",
+      "boj"
+    ],
+    "GB": [
+      "britain",
+      "british",
+      "uk",
+      "london",
+      "sterling",
+      "downing street"
+    ],
+    "DE": [
+      "germany",
+      "german",
+      "berlin",
+      "bundesbank"
+    ],
+    "FR": [
+      "france",
+      "french",
+      "paris",
+      "macron"
+    ],
+    "SA": [
+      "saudi",
+      "riyadh",
+      "aramco",
+      "opec"
+    ],
+    "TR": [
+      "turkey",
+      "turkish",
+      "ankara",
+      "erdogan",
+      "lira"
+    ],
+    "CA": [
+      "canada",
+      "canadian",
+      "ottawa",
+      "carney",
+      "loonie"
+    ],
+    "BR": [
+      "brazil",
+      "brazilian",
+      "brasilia",
+      "lula",
+      "real"
+    ],
+    "KP": [
+      "north korea",
+      "pyongyang",
+      "dprk",
+      "kim jong"
+    ],
+    "VE": [
+      "venezuela",
+      "venezuelan",
+      "caracas",
+      "maduro"
+    ],
+    "QA": [
+      "qatar",
+      "doha",
+      "emir of qatar"
+    ],
+    "AU": [
+      "australia",
+      "australian",
+      "canberra",
+      "aussie"
+    ]
+  },
+  "country_self_damp": 0.35,
+  "country_policy_guard": [
+    "flag_tariff_trade",
+    "flag_sanctions",
+    "flag_escalation",
+    "flag_interest_rate",
+    "flag_peace_deescalation"
+  ],
   "policy_flags": {
     "flag_peace_deescalation": [
       "ceasefire",

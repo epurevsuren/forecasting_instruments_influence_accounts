@@ -180,6 +180,92 @@ _ENDORSEMENT_RE = [re.compile(p, re.I) for p in ENDORSEMENT_PATTERNS]
 ENDORSEMENT_DAMP = float(os.environ.get("ENDORSEMENT_DAMP", "0.0"))
 
 
+# ---------------------------------------------------------------------------
+# COUNTRY CONTEXT — the SPEAKER x SUBJECT interaction
+# ---------------------------------------------------------------------------
+# "china" is not a signal by itself. The Chinese Embassy posting about China is
+# routine self-promotion; the US President posting about China is cross-border
+# friction. Before this, both scored the same, and the embassy's tourism and
+# human-interest posts were generating real USD_CNY predictions:
+#   "When a visitor's car became stuck in the mud in Xinjiang, #China, a local
+#    herder stepped in to help..."            -> USD_CNY -0.30%
+# The mechanism was score_embedding: financial_refs contains "tariffs on China
+# will double...", so ANY China post sits close to it in SBERT space.
+#
+# RULE: if every country a post names is the SPEAKER'S OWN, it is self-
+# reference -> damp. Name a FOREIGN country and nothing happens. A policy flag
+# (tariffs, sanctions, escalation, rates) overrides the damp entirely, because
+# a Chinese official announcing retaliation IS market-moving even though it is
+# self-referential.
+COUNTRY_TERMS   = CONFIG.get("country_terms", {})
+COUNTRY_SELF_DAMP = float(CONFIG.get("country_self_damp", 0.35))
+COUNTRY_POLICY_GUARD = list(CONFIG.get("country_policy_guard", []))
+_COUNTRY_RE = {cc: re.compile(r"\b(" + "|".join(re.escape(t) for t in terms) + r")\b", re.I)
+               for cc, terms in COUNTRY_TERMS.items() if terms}
+
+
+_COUNTRY_OF_HANDLE = {}
+
+
+def _load_country_map():
+    """{handle_lower: ISO} from influence_accounts.json. The feed carries no
+    country column, so the speaker's country is resolved by handle — same
+    source predict._country_for uses, so scoring and trading agree."""
+    if _COUNTRY_OF_HANDLE:
+        return _COUNTRY_OF_HANDLE
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "influence_accounts.json")
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        secs = [d.get("entities", []),
+                d.get("institutions", {}).get("entries", []),
+                d.get("archives", {}).get("entries", []),
+                d.get("primary_accounts", [])]
+        for sec in secs:
+            for e in (sec or []):
+                h = (e.get("account") or e.get("twitter_handle") or "")
+                cc = e.get("country")
+                if h and cc:
+                    _COUNTRY_OF_HANDLE[str(h).lstrip("@").lower()] = str(cc).upper()
+    except Exception:
+        pass
+    return _COUNTRY_OF_HANDLE
+
+
+def country_of(handle):
+    return _load_country_map().get(str(handle or "").lstrip("@").lower())
+
+
+def countries_mentioned(text):
+    """ISO codes whose terms appear in the text."""
+    t = str(text or "")
+    return {cc for cc, rx in _COUNTRY_RE.items() if rx.search(t)}
+
+
+def country_context_factor(text, speaker_country, feats=None):
+    """(factor, label). COUNTRY_SELF_DAMP when the post only talks about the
+    speaker's OWN country and no policy flag fired; else 1.0."""
+    if not speaker_country or not _COUNTRY_RE:
+        return 1.0, ""
+    cc = str(speaker_country).strip().upper()
+    seen = countries_mentioned(text)
+    if not seen or cc not in seen:
+        return 1.0, ""                      # foreign subject, or none named
+    foreign = seen - {cc}
+    if foreign:
+        return 1.0, ""                      # cross-border -> leave alone
+    if feats:
+        for f in COUNTRY_POLICY_GUARD:
+            try:
+                if float(feats.get(f) or 0.0) > 0:
+                    return 1.0, ""          # real policy content -> protected
+            except (TypeError, ValueError):
+                pass
+    return COUNTRY_SELF_DAMP, (
+        f"self-referential ({cc} account talking only about {cc}, no policy flag)")
+
+
 def is_endorsement(text):
     """True when the post is a political endorsement / ceremonial message."""
     t = str(text or "")
@@ -654,6 +740,29 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
         + 0.2 * batch["score_novelty"]
         + 0.1 * batch["score_burst"],
         0, 1)
+    # COUNTRY CONTEXT — self-referential posts (a CN account talking only
+    # about CN, no policy flag) are routine, not signal. Applied before the
+    # endorsement gate so both land on raw_score.
+    if _COUNTRY_RE and "account" in batch:
+        _accs = list(batch["account"])
+        _cf, _n_self, _by = [], 0, {}
+        for _i, _t in enumerate(texts):
+            _cc = country_of(_accs[_i] if _i < len(_accs) else None)
+            _feats = {f: batch[f][_i] for f in COUNTRY_POLICY_GUARD
+                      if f in batch} if COUNTRY_POLICY_GUARD else None
+            _f, _ = country_context_factor(_t, _cc, _feats)
+            _cf.append(_f)
+            if _f < 1.0:
+                _n_self += 1
+                _by[_cc] = _by.get(_cc, 0) + 1
+        if _n_self:
+            batch["raw_score"] = batch["raw_score"] * np.array(_cf)
+            print(f"  🌏 {_n_self}/{len(texts)} self-referential post(s) "
+                  f"×{COUNTRY_SELF_DAMP} (own country only, no policy flag): "
+                  + ", ".join(f"{k}={v}" for k, v in
+                              sorted(_by.items(), key=lambda x: -x[1])[:6]))
+        batch["is_self_country"] = (np.array(_cf) < 1.0).astype(int)
+
     # ENDORSEMENT HARD-SKIP — applied to raw_score so it propagates into
     # score_relative, sample_weight and everything downstream.
     _end = endorsement_damp(texts)
