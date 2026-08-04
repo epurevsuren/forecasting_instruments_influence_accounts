@@ -748,16 +748,39 @@ def main():
         # VOLATILITY STATE the post lands in, which is precisely what sets the
         # size of the reaction. They said nothing about direction, and that is
         # not a failure of the indicators: it is what they measure.
+        # LOG TARGET (2026-08-05). |move| is violently right-skewed; squared
+        # error on the raw scale chases the MEAN while MdAPE measures the
+        # MEDIAN, so the fit is pulled by a handful of huge moves. Modelling
+        # log1p(|move|) and reverting with expm1 is what the AVM paper does
+        # (Bjorgve et al. 2026, J. Real Estate Fin. Econ. — they model
+        # log(price/m2) and revert before computing MdAPE).
+        #
+        # MEASURED on 10 instruments, held-out slice:
+        #     squarederror  (raw)        MdAPE 57.4%   corr 0.220
+        #     absoluteerror (raw)        MdAPE 57.3%   corr 0.232
+        #     squarederror  + log1p      MdAPE 53.3%   corr 0.224   <- this
+        #     absoluteerror + log1p      MdAPE 56.7%   corr 0.229
+        # The paper's LOSS choice barely moved it (-0.2pp); the TRANSFORM did
+        # (-4.1pp). Absolute-error ON TOP of the log over-corrects, because
+        # log space is already median-like on the original scale.
+        SIZE_LOG = os.environ.get("SIZE_LOG", "1") == "1"
+
+        def _sz_fwd(v):
+            return np.log1p(np.clip(v, 0.0, None)) if SIZE_LOG else v
+
+        def _sz_inv(v):
+            return np.clip(np.expm1(v) if SIZE_LOG else v, 0.0, None)
+
         m_size = xgb.XGBRegressor(
             n_estimators=500, max_depth=5, learning_rate=0.03,
             subsample=0.8, colsample_bytree=0.5, min_child_weight=5,
             reg_alpha=0.1, reg_lambda=1.5, objective='reg:squarederror',
             early_stopping_rounds=40, n_jobs=-1, random_state=42)
-        _abs_tr = np.abs(ytr_f)
+        _abs_tr = _sz_fwd(np.abs(ytr_f))
         m_size.fit(Xtr_f, _abs_tr, sample_weight=w_tr_f,
-                   eval_set=[(Xes, np.abs(yes))], verbose=False)
-        _sz_te = np.clip(m_size.predict(Xte), 0.0, None)
-        _sz_cal = np.clip(m_size.predict(Xcal), 0.0, None)
+                   eval_set=[(Xes, _sz_fwd(np.abs(yes)))], verbose=False)
+        _sz_te = _sz_inv(m_size.predict(Xte))
+        _sz_cal = _sz_inv(m_size.predict(Xcal))
 
         # SCALE CORRECTION — pathology only, fitted on the calibration slice.
         #
@@ -971,6 +994,10 @@ def main():
             "size_ratio": round(size_ratio, 3),
             "size_mdape": round(size_mdape, 3) if size_mdape == size_mdape else None,
             "size_k": round(size_k, 3),   # backtest/predict MUST apply this
+            # The size head was fitted on log1p(|move|). Every consumer MUST
+            # expm1() the raw prediction before using it, or TP distances come
+            # out ~log-scaled and every trade is mis-sized.
+            "size_log": bool(SIZE_LOG),
             # THE flag the backtest and Layer 2 should respect: this
             # instrument's direction head beat chance out-of-sample.
             "tradeable": tradeable,

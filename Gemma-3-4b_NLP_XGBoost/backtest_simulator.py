@@ -574,9 +574,14 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     _reg_sz = cfg.get("_reg_size", {})
     # size_k = the out-of-sample scale correction fitted at train time. Skipping
     # it would systematically under-size every TP by ~20%.
-    p_size = {inst: np.clip(_reg_sz[inst].predict(_X_for(inst)), 0.0, None)
-                     * float(_gate.get(inst, {}).get("size_k", 1.0))
-              for inst in _reg_sz}
+    # size_log: the head was fitted on log1p(|move|) — revert BEFORE size_k.
+    def _size_pred(inst):
+        raw = _reg_sz[inst].predict(_X_for(inst))
+        if _gate.get(inst, {}).get("size_log"):
+            raw = np.expm1(raw)
+        return np.clip(raw, 0.0, None) * float(_gate.get(inst, {}).get("size_k", 1.0))
+
+    p_size = {inst: _size_pred(inst) for inst in _reg_sz}
     if p_size:
         _sk = {i: _gate.get(i, {}).get("size_k", 1.0) for i in list(p_size)[:5]}
         print("  📏 Size head scale-corrected: " +

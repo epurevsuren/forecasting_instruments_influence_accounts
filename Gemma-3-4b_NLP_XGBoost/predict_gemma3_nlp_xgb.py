@@ -1022,7 +1022,11 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
         g = _gate_cfg.get(inst, {})
         if inst in _sz:
             # SIZE: the honest magnitude, scale-corrected exactly as trained.
-            sz = float(np.clip(_sz[inst].predict(Xi)[0], 0.0, None))
+            # size_log => the head was fitted on log1p(|move|); revert first.
+            sz = float(_sz[inst].predict(Xi)[0])
+            if g.get("size_log"):
+                sz = float(np.expm1(sz))
+            sz = max(sz, 0.0)
             rec["size"] = sz * float(g.get("size_k", 1.0)) * mult
         if inst in _mv:
             rec["p_move"] = float(_mv[inst].predict_proba(Xi)[0, 1])
