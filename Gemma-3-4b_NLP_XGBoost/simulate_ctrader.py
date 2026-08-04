@@ -68,6 +68,32 @@ MAX_TOTAL_MARGIN_PCT = 80.0   # % of equity as margin across all open trades
 STOPOUT_BUFFER_PP    = 20.0   # worst-case margin level >= stop-out + this (pp)
 RISK_PCT             = 2.0    # only used with --sizing risk (conservative mode)
 
+# ---------------------------------------------------------------------------
+# DRAWDOWN FSM  (Algothon 2023 winner, CookieAlgorists — their one idea that
+# belongs at Layer 3 rather than in the predictor)
+# ---------------------------------------------------------------------------
+# Their observation: every model in the stack is STATELESS. It has no memory of
+# how it has been doing lately, so a regime it can no longer read produces a
+# run of losses and nothing in the system notices. Their fix was a finite state
+# machine over recent performance — count consecutive losing days, and on a
+# streak switch to a defensive state.
+#
+# They left the hard part open on stage: once you are IN the drawdown state,
+# what do you do — liquidate, pause, or attenuate? We attenuate. Liquidating
+# realises the loss and forfeits the recovery; pausing means a strategy that
+# stops exactly when the streak was about to end. Cutting size keeps you in the
+# game at reduced exposure, which is also what a real desk does.
+#
+#   NORMAL   --(DD_TRIGGER consecutive losses)-->  DEFENSIVE   (size x DD_SIZE)
+#   DEFENSIVE --(DD_RECOVER consecutive wins)-->   NORMAL
+#
+# States are counted over TRADES, not days — our trades are 60-minute event
+# windows and several can close in one session.
+DD_ENABLED  = True
+DD_TRIGGER  = 4      # consecutive losing trades that flip us defensive
+DD_RECOVER  = 2      # consecutive winners that restore full size
+DD_SIZE     = 0.40   # size multiplier while defensive
+
 # ------------------------------------------------- cTrader contract specs ----
 # Loaded DYNAMICALLY from DP/instruments.json "ctrader" blocks — values synced
 # from the broker's own Open API (fetch_ctrader_symbols.py). Correct any
@@ -133,6 +159,16 @@ def main():
                     help="TP-ONLY mode: positions carry no stop-loss (exit = TP limit or "
                          "60-min timeout). Risk is UNDEFINED per trade, so the stop-out "
                          "solve is skipped — margin caps are the only protection.")
+    ap.add_argument("--no-drawdown-guard", action="store_true",
+                    help="Disable the drawdown FSM (default: ON). It cuts size "
+                         f"to x{DD_SIZE} after {DD_TRIGGER} consecutive losing "
+                         f"trades and restores after {DD_RECOVER} wins.")
+    ap.add_argument("--dd-trigger", type=int, default=DD_TRIGGER,
+                    help=f"consecutive losses that flip to DEFENSIVE (default {DD_TRIGGER})")
+    ap.add_argument("--dd-recover", type=int, default=DD_RECOVER,
+                    help=f"consecutive wins that restore full size (default {DD_RECOVER})")
+    ap.add_argument("--dd-size", type=float, default=DD_SIZE,
+                    help=f"size multiplier while DEFENSIVE (default {DD_SIZE})")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -165,6 +201,10 @@ def main():
               f"trade at full class leverage (CFD style)")
     else:
         print(f"  Sizing: RISK mode — {args.risk_pct}% of equity risked per trade")
+    dd_enabled = DD_ENABLED and not args.no_drawdown_guard
+    dd_trigger, dd_recover, dd_size = args.dd_trigger, args.dd_recover, args.dd_size
+    print(f"  Drawdown FSM: " + (f"ON — {dd_trigger} losses -> size x{dd_size}, "
+          f"{dd_recover} wins -> full" if dd_enabled else "OFF (--no-drawdown-guard)"))
     print(f"  Guards: total margin <= {args.max_margin_total}% of equity; per-entry "
           f"stop-out solve keeps worst-case margin level >= "
           f"{STOP_OUT_LEVEL + args.stopout_buffer:.0f}% even if ALL open SLs hit")
@@ -178,6 +218,10 @@ def main():
     min_ml_seen = float("inf")
     min_worst_ml = [float("inf")]   # worst-case projected margin level (all SLs hit)
 
+    # ---- drawdown FSM state (see the DD_* block at the top) ---------------
+    fsm = {"state": "NORMAL", "losses": 0, "wins": 0,
+           "entered": 0, "trades_defensive": 0}
+
     def close_expired(now):
         nonlocal balance, peak, max_dd
         for p in [p for p in open_pos if p["exit_time"] <= now]:
@@ -186,6 +230,25 @@ def main():
             peak = max(peak, balance)
             max_dd = max(max_dd, (peak - balance) / peak * 100)
             ledger.append(p["row"])
+            # ---- FSM transitions, driven by REALISED outcomes only --------
+            if not dd_enabled:
+                continue
+            if p["pnl_usd"] < 0:
+                fsm["losses"] += 1
+                fsm["wins"] = 0
+                if fsm["state"] == "NORMAL" and fsm["losses"] >= dd_trigger:
+                    fsm["state"] = "DEFENSIVE"
+                    fsm["entered"] += 1
+                    print(f"    🛡️  DRAWDOWN: {fsm['losses']} losses in a row "
+                          f"at {now:%Y-%m-%d %H:%M} — size x{dd_size:.2f} "
+                          f"until {dd_recover} wins")
+            else:
+                fsm["wins"] += 1
+                fsm["losses"] = 0
+                if fsm["state"] == "DEFENSIVE" and fsm["wins"] >= dd_recover:
+                    fsm["state"] = "NORMAL"
+                    print(f"    ✅ RECOVERED: {fsm['wins']} wins in a row "
+                          f"at {now:%Y-%m-%d %H:%M} — full size restored")
 
     for _, t in df.iterrows():
         inst = t["instrument"]
@@ -233,10 +296,16 @@ def main():
         risk_per_lot   = 0.0 if trade_no_sl else sl_dist * contract * usd_conv
 
         # ---- target lots per sizing mode ----
+        # DRAWDOWN FSM: while DEFENSIVE, commit less. Applied to the TARGET so
+        # every downstream guard (margin budget, stop-out solve, lot caps) still
+        # binds normally — this can only ever make a position smaller.
+        _dd_mult = dd_size if (dd_enabled and fsm["state"] == "DEFENSIVE") else 1.0
+        if _dd_mult < 1.0:
+            fsm["trades_defensive"] += 1
         if args.sizing == "margin":
-            lots_target = (equity * args.margin_per_trade / 100) / margin_per_lot
+            lots_target = (equity * args.margin_per_trade * _dd_mult / 100) / margin_per_lot
         else:
-            lots_target = (equity * args.risk_pct / 100) / max(risk_per_lot, 1e-9)
+            lots_target = (equity * args.risk_pct * _dd_mult / 100) / max(risk_per_lot, 1e-9)
 
         # ---- total-margin budget ----
         margin_budget = equity * args.max_margin_total / 100 - used_margin
@@ -346,6 +415,14 @@ def main():
     print(f"  Start balance   : ${args.balance:,.2f}")
     print(f"  Final balance   : ${balance:,.2f}   ({(balance/args.balance-1)*100:+.1f}%)")
     print(f"  Max drawdown    : {max_dd:.1f}%")
+    if dd_enabled:
+        _n = len(ledger) or 1
+        print(f"  Drawdown FSM    : entered DEFENSIVE {fsm['entered']}x; "
+              f"{fsm['trades_defensive']} of {_n} trades sized down "
+              f"({fsm['trades_defensive'] / _n:.0%})"
+              + ("   [never triggered]" if not fsm["entered"] else ""))
+        print(f"                    compare with --no-drawdown-guard to see "
+              f"whether it actually helped")
     print(f"  Min margin level at entry     : "
           f"{'n/a' if min_ml_seen == float('inf') else f'{min_ml_seen:.0f}%'}"
           f"  (stop-out at {STOP_OUT_LEVEL:.0f}%)")

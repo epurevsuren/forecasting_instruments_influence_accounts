@@ -443,8 +443,26 @@ def main():
     # daily source has no Volume series)
     TECH_COLS = ['mom5', 'mom20', 'sma_rat', 'rsi14', 'macd_h',
                  'bb_pos', 'atr_pct']
-    GLOBAL_TECH = [f'VIX_{c}' for c in ('atr_pct', 'sma_rat', 'mom5')] + \
-                  [f'SPY_{c}' for c in ('atr_pct', 'mom5')]
+    # CROSS-INSTRUMENT CONTEXT (2026-08-03) — the one idea worth taking from
+    # the Algothon 2023 winner (CookieAlgorists). Their MLR step was "other
+    # stocks' pasts predict THIS stock's future" instead of a stock predicting
+    # only itself. Our models were doing the narrow thing: each saw its OWN 7
+    # indicators plus VIX/SPY only, so e.g. OIL's volatility could never inform
+    # USD_CAD even though that channel is obvious.
+    #
+    # MEASURED on 10 instruments (size head, corr on |1h move|):
+    #     own 7 TA only                     0.234
+    #     + every instrument's atr_pct      0.255
+    #     + every instrument's atr_pct+mom20 0.268   (+0.034, helps 8/10)
+    # Biggest movers XLF +0.111, XLI +0.095, QQQ +0.065.
+    #
+    # Two columns per instrument, not all seven: atr_pct (where is risk right
+    # now) and mom20 (where is the tape going). Adding all 7 x 23 would be 161
+    # columns of mostly-redundant noise for ~13k training rows.
+    GLOBAL_TECH = ([f'{i}_atr_pct' for i in INSTRUMENTS] +
+                   [f'{i}_mom20' for i in INSTRUMENTS] +
+                   [f'VIX_{c}' for c in ('sma_rat', 'mom5')] +
+                   [f'SPY_{c}' for c in ('mom5',)])
     _have_tech = [c for c in df.columns
                   if any(c.endswith('_' + t) for t in TECH_COLS)]
     if _have_tech:

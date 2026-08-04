@@ -1230,7 +1230,7 @@ def finalize(scored, impact_cols):
                                    "n_pairs": int(len(_pr)),
                                    "window_min": CHAIN_LABEL_WINDOW_MIN,
                                    "emb_table": CHAIN_EMB_TABLE,
-                                   "calibrated_at": pd.Timestamp.utcnow().isoformat()},
+                                   "calibrated_at": pd.Timestamp.now("UTC").isoformat()},
                                   _f, indent=2)
                     print(f"     💾 frozen -> {os.path.basename(_tp)} "
                           f"(predict/backtest read this)")

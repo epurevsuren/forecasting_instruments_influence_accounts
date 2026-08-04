@@ -39,7 +39,7 @@ CLI
 import os
 import json
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 _HERE        = os.path.dirname(os.path.abspath(__file__))
@@ -300,7 +300,7 @@ class EventManager:
                 raise ValueError(f"Unknown priority {val!r}. Valid: {list(PRIORITY_MULTIPLIERS)}")
             ev[key] = val
 
-        ev["updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        ev["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._save()
         return ev
 
