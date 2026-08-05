@@ -565,8 +565,59 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     _gate = cfg.get("move_gate", {})
     p_move = {inst: _clf_mv[inst].predict_proba(_X_for(inst))[:, 1]
               for inst in _clf_mv}
-    p_up = {inst: _clf_dr[inst].predict_proba(_X_for(inst))[:, 1]
-            for inst in _clf_dr}
+    # ---- head B runs on a LEAN matrix, not the full feature block ---------
+    # The direction head is trained on [dir_prior | flags | own TA] because the
+    # 128 embedding dims and 59 unsigned NLP scores DILUTE the one signed
+    # feature (measured: full NLP 50.4%, prior+flags 53.0%). Feeding it
+    # _X_for() here would be a feature-count mismatch — XGBoost either raises
+    # or silently scores garbage. Rebuild it exactly as the trainer did.
+    def _X_dir_for(inst):
+        g = _gate.get(inst, {})
+        spec = g.get("dir_features")
+        if not spec:
+            return _X_for(inst)          # pre-2026-08-05 model dir
+        lift = g.get("dir_prior_lift", {}) or {}
+        fl = spec.get("flags", []) or []
+        blocks = []
+        # 1) directional prior = sum of the train-fitted lift of each fired flag
+        if spec.get("prior"):
+            pr = np.zeros((len(df), 1), dtype=np.float32)
+            for f, L in lift.items():
+                if f in df.columns:
+                    pr[:, 0] += (pd.to_numeric(df[f], errors='coerce')
+                                 .fillna(0.0).values.astype(np.float32) > 0) * float(L)
+            blocks.append(pr)
+        # 2) raw flags, in the trainer's order
+        if fl:
+            fb = np.zeros((len(df), len(fl)), dtype=np.float32)
+            for j, f in enumerate(fl):
+                if f in df.columns:
+                    fb[:, j] = pd.to_numeric(df[f], errors='coerce').fillna(0.0).values
+            blocks.append(fb)
+        # 3) this instrument's TA block, same columns the trainer used
+        tcols = spec.get("tech", []) or []
+        if tcols:
+            tb = np.zeros((len(df), len(tcols)), dtype=np.float32)
+            for j, cname in enumerate(tcols):
+                if cname in df.columns:
+                    tb[:, j] = pd.to_numeric(df[cname], errors='coerce').fillna(0.0).values
+            blocks.append(tb)
+        return np.hstack(blocks).astype(np.float32) if blocks else _X_for(inst)
+
+    p_up = {}
+    for inst in _clf_dr:
+        Xd = _X_dir_for(inst)
+        try:
+            p_up[inst] = _clf_dr[inst].predict_proba(Xd)[:, 1]
+        except Exception as e:                                # noqa: BLE001
+            print(f"  ⚠️  {inst}: direction head expects "
+                  f"{getattr(_clf_dr[inst], 'n_features_in_', '?')} features, "
+                  f"got {Xd.shape[1]} — retrain or check config['dir_features'] "
+                  f"({str(e)[:60]})")
+    if p_up:
+        _n = _X_dir_for(list(p_up)[0]).shape[1]
+        print(f"  🧭 Direction head on lean matrix: {_n} cols "
+              f"(prior + flags + own TA), not the {X.shape[1]}-col block")
     # SIZE head: per-post |move| in %, replacing the single per-instrument
     # median. This is what Layer 2 needs for a reachable TP — the simulate log
     # showed TIMEOUT on 148/158 QQQ and 112/115 XLE trades because every trade
@@ -576,10 +627,17 @@ def run_backtest(df, X, cfg, models, impact_cols, dir_threshold, trade_threshold
     # it would systematically under-size every TP by ~20%.
     # size_log: the head was fitted on log1p(|move|) — revert BEFORE size_k.
     def _size_pred(inst):
+        g = _gate.get(inst, {})
+        # No measurable skill -> a per-post number is noise. Use the empirical
+        # median |move| on real events instead (NATGAS shipped MdAPE 124% by
+        # trusting a head with corr -0.081).
+        if g.get("size_reliable") is False:
+            flat = float(g.get("median_abs_move") or 0.0)
+            return np.full(len(df), flat, dtype=float)
         raw = _reg_sz[inst].predict(_X_for(inst))
-        if _gate.get(inst, {}).get("size_log"):
+        if g.get("size_log"):
             raw = np.expm1(raw)
-        return np.clip(raw, 0.0, None) * float(_gate.get(inst, {}).get("size_k", 1.0))
+        return np.clip(raw, 0.0, None) * float(g.get("size_k", 1.0))
 
     p_size = {inst: _size_pred(inst) for inst in _reg_sz}
     if p_size:

@@ -418,17 +418,25 @@ def fetch_one(ib, name, contract, what_to_show, manifest,
             got_new = True
 
         # Path A: fetch recent data via ContFuture (endDateTime="" = now).
-        # Skip if cache is already fresh (within 10 days of now).
-        cache_is_fresh = (
-            len(existing) > 0 and
-            existing["date"].max() >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)
-        )
+        # Skip only if the cache already reaches ~now.
+        #
+        # BUG FIXED 2026-08-05: this window was 10 DAYS, so on a daily run the
+        # futures (OIL, GOLD, COPPER, NATGAS, US10Y, US2Y) could NEVER update —
+        # a cache 2 days old counted as "fresh" and the fetch was skipped, while
+        # the stock/FX path updated normally. The futures would have to rot for
+        # 10+ days before the fetcher touched them. Cost of the fix is one
+        # ContFuture request per instrument per run (~11s each).
+        FRESH_DAYS = float(os.environ.get("IBKR_FRESH_DAYS", "1"))
+        _cut = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=FRESH_DAYS)
+        cache_is_fresh = (len(existing) > 0 and existing["date"].max() >= _cut)
         if cache_is_fresh or refetch:
             if refetch:
                 print(f"     ♻️  {name}: --refetch → refilling [{since.date()} .. {until.date()}] "
                       f"from dated contracts (skipping the recent ContFuture fetch)")
             else:
-                print(f"     💾 {name}: cached up to {existing['date'].max().date()}, skipping recent fetch")
+                _age = (pd.Timestamp.now(tz="UTC") - existing["date"].max()).total_seconds() / 86400
+                print(f"     💾 {name}: cached to {existing['date'].max().date()} "
+                      f"({_age:.1f}d old, within {FRESH_DAYS:g}d) — skipping recent fetch")
         else:
             for dur in contfut_durations:
                 print(f"     → {name} ({suffix}) ContFuture {dur} ...", end="", flush=True)

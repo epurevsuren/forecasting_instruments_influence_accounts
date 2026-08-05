@@ -1031,7 +1031,31 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
         if inst in _mv:
             rec["p_move"] = float(_mv[inst].predict_proba(Xi)[0, 1])
         if inst in _dr:
-            pu = float(_dr[inst].predict_proba(Xi)[0, 1])
+            # head B runs on the LEAN matrix [prior | flags | own TA] — see
+            # backtest_simulator._X_dir_for. Rebuild it identically here, or
+            # the feature count will not match what the head was trained on.
+            _spec = g.get("dir_features")
+            if _spec:
+                _lift = g.get("dir_prior_lift", {}) or {}
+                _bl = []
+                if _spec.get("prior"):
+                    _p = 0.0
+                    for _f, _L in _lift.items():
+                        if float(feats.get(_f) or 0.0) > 0:
+                            _p += float(_L)
+                    _bl.append(np.array([[_p]], dtype=np.float32))
+                _fl = _spec.get("flags", []) or []
+                if _fl:
+                    _bl.append(np.array([[float(feats.get(f) or 0.0)
+                                          for f in _fl]], dtype=np.float32))
+                _tc = _spec.get("tech", []) or []
+                if _tc:
+                    _bl.append(np.array([[float(_ta_src.get(cn, 0.0))
+                                          for cn in _tc]], dtype=np.float32))
+                Xd = np.hstack(_bl).astype(np.float32) if _bl else Xi
+            else:
+                Xd = Xi
+            pu = float(_dr[inst].predict_proba(Xd)[0, 1])
             rec["p_up"] = pu
             rec["dir"] = 1 if pu > 0.5 else -1
             rec["edge"] = abs(pu - 0.5)

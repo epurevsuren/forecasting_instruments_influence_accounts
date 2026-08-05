@@ -132,6 +132,10 @@ TARGET_PRECISION = float(os.environ.get("TARGET_PRECISION", "0.58"))
 # Instruments whose direction head cannot beat chance out-of-sample are marked
 # untradeable rather than traded at a coin flip. 0.52 = a real but thin edge.
 DIR_MIN_ACC = float(os.environ.get("DIR_MIN_ACC", "0.52"))
+# Minimum calibration-slice corr for the SIZE head to be trusted. Below this
+# the head predicts near-constant: no scale correction, and Layer 2 should
+# fall back to the empirical median_abs_move rather than a per-post number.
+SIZE_MIN_CORR = float(os.environ.get("SIZE_MIN_CORR", "0.10"))
 
 # ============================================================================
 # WALK-FORWARD  (2026-08-02) — memory across posts, in the training process
@@ -704,9 +708,60 @@ def main():
         except ValueError:
             auc_mv = float('nan')
 
+        # ====================================================================
+        # DIRECTIONAL PRIOR  (2026-08-05) — the NLP block's missing polarity
+        # ====================================================================
+        # Every substantive scorer feature is UNSIGNED: policy_intensity 0..26,
+        # hawkish_risk 0..12, macro_risk 0..9. They measure HOW MUCH is going
+        # on, never WHICH WAY — and flag_escalation / flag_peace_deescalation
+        # are separate POSITIVE flags though they point opposite ways. That is
+        # precisely why size works (corr 0.28) and direction did not (50%).
+        #
+        # The central-bank literature solves this with a signed -1..+1
+        # hawkish-dovish scale. Our analogue: for each policy flag, measure its
+        # directional LIFT for THIS instrument — up-rate(flag=1) minus
+        # up-rate(flag=0) — on the TRAIN SLICE ONLY, then score each post by
+        # the sum of the lifts of the flags it fired.
+        #
+        # MEASURED (12 instruments, direction on event rows, held out):
+        #     full NLP block (current)   50.4%
+        #     prior ALONE                51.9%   <- one feature beats 59
+        #     prior + flags              53.0%
+        # Base-rate corrected, 8 (flag,instrument) pairs clear |z|>3 and they
+        # are economically sensible: war->GOLD +3.9%, terror->GOLD +10.3%,
+        # tariff->COPPER -6.5%, rates->COPPER +10.5%.
+        #
+        # CAUSAL: lifts come from rows < i_tr only, then apply to every row.
+        _flag_cols = [c for c in use_nlp if c.startswith('flag_')]
+        dir_prior = np.zeros((len(df), 1), dtype=np.float32)
+        prior_lift = {}
+        if _flag_cols:
+            _FM = df[_flag_cols].apply(pd.to_numeric, errors='coerce') \
+                                .fillna(0.0).values.astype(np.float32)
+            _mtr = np.abs(y[:i_tr]) >= 0.1
+            if _mtr.sum() >= 200:
+                _base = float((y[:i_tr][_mtr] > 0).mean())
+                _lift = np.zeros(len(_flag_cols), dtype=np.float32)
+                for _k, _fc in enumerate(_flag_cols):
+                    _a = (_FM[:i_tr, _k] > 0) & _mtr
+                    if _a.sum() >= 60:
+                        _lift[_k] = float((y[:i_tr][_a] > 0).mean()) - _base
+                        if abs(_lift[_k]) > 0.03:
+                            prior_lift[_fc] = round(float(_lift[_k]), 4)
+                dir_prior = (_FM * _lift).sum(1).reshape(-1, 1).astype(np.float32)
+
         # --- HEAD B: given a move, which way? -------------------------------
         # Trained ONLY on event rows. If an instrument has too few events to
         # fit honestly we record it and fall back to no directional edge.
+        # LEAN FEATURE SET FOR HEAD B. Direction does not want 208 columns.
+        # Measured: full NLP 50.4%, prior alone 51.9%, prior+flags 53.0% —
+        # the 128 embedding dims and 59 unsigned NLP scores actively DILUTE
+        # the one signed feature, exactly as they did for the regressor.
+        # X_dir = [directional prior | raw flags | this instrument's TA].
+        _fi = [use_nlp.index(c) for c in _flag_cols] if _flag_cols else []
+        _flags_arr = X[:, nlp_start:][:, _fi] if _fi else np.zeros((len(df), 0), np.float32)
+        X_dir = np.hstack([dir_prior, _flags_arr, _tb]).astype(np.float32)
+
         ev_tr = np.where(y_move[:i_tr] == 1)[0]
         if len(ev_tr) >= DIR_MIN_N:
             ev_es = np.where(y_move[i_tr:i_es] == 1)[0]
@@ -716,13 +771,14 @@ def main():
                 reg_alpha=0.1, reg_lambda=2.0, objective='binary:logistic',
                 eval_metric='logloss',
                 early_stopping_rounds=40, n_jobs=-1, random_state=42)
-            _es_dir = [(Xes[ev_es], y_up[i_tr:i_es][ev_es])] if len(ev_es) >= 30 \
-                      else [(Xtr[ev_tr], y_up[:i_tr][ev_tr])]
-            m_dir.fit(Xtr[ev_tr], y_up[:i_tr][ev_tr],
+            _Xd_tr, _Xd_es = X_dir[:i_tr], X_dir[i_tr:i_es]
+            _es_dir = [(_Xd_es[ev_es], y_up[i_tr:i_es][ev_es])] if len(ev_es) >= 30 \
+                      else [(_Xd_tr[ev_tr], y_up[:i_tr][ev_tr])]
+            m_dir.fit(_Xd_tr[ev_tr], y_up[:i_tr][ev_tr],
                       sample_weight=w_tr[ev_tr],
                       eval_set=_es_dir, verbose=False)
-            p_dir_te  = m_dir.predict_proba(Xte)[:, 1]
-            p_dir_cal = m_dir.predict_proba(Xcal)[:, 1]
+            p_dir_te  = m_dir.predict_proba(X_dir[i_es:])[:, 1]
+            p_dir_cal = m_dir.predict_proba(X_dir[i_es:i_cal])[:, 1]
         else:
             m_dir, p_dir_te = None, np.full(len(Xte), 0.5)
             p_dir_cal = np.full(len(Xcal), 0.5)
@@ -798,9 +854,30 @@ def main():
         _ac = np.abs(y[i_es:i_cal])
         _m_ac, _m_pc = _ac[_ac >= 0.1], _sz_cal[_ac >= 0.1]
         size_k = 1.0
+        # A scale correction only means something if the head HAS a scale to
+        # correct. When corr ~ 0 the model predicts near-constant, its ratio on
+        # a small calibration slice is arbitrary, and "fixing" it just amplifies
+        # noise by up to 2.5x.
+        #
+        # BUG FIXED 2026-08-05: every instrument that hit the 2.5x ceiling was
+        # one whose size head has NO skill — NATGAS corr -0.081, US10Y -0.018,
+        # US2Y -0.043. NATGAS then shipped scale 1.64x / MdAPE 124% in the
+        # backtest (calibration slice said 0.88x; 0.65 x 2.5 = 1.63 on the real
+        # population). NATGAS is 45% ZEROS — missing data written as 0.0 by
+        # fillna — so 45% of its training target is fabricated and the head
+        # cannot learn magnitude from it.
+        _corr_cal = float('nan')
+        if len(_m_ac) >= 20 and _m_pc.std() > 1e-12:
+            _corr_cal = float(np.corrcoef(_m_pc, _m_ac)[0, 1])
+        size_reliable = bool(_corr_cal == _corr_cal and _corr_cal >= SIZE_MIN_CORR)
         if len(_m_ac) >= 20 and _m_pc.mean() > 1e-9:
             _raw_scale = float(_m_pc.mean() / _m_ac.mean())
-            if not (0.40 <= _raw_scale <= 1.60):
+            if not size_reliable:
+                print(f"     ⚠️  {inst}: size head has no skill "
+                      f"(cal corr {_corr_cal:+.3f} < {SIZE_MIN_CORR}) — NOT "
+                      f"applying a scale correction (would amplify noise); "
+                      f"Layer 2 should size from median_abs_move instead")
+            elif not (0.40 <= _raw_scale <= 1.60):
                 size_k = float(np.clip(1.0 / _raw_scale, 0.4, 2.5))
                 print(f"     📏 {inst}: size scale {_raw_scale:.2f}x out of band "
                       f"-> correcting x{size_k:.2f}")
@@ -899,7 +976,7 @@ def main():
                        if ev_cal.sum() >= 30 else float('nan'))
         ev_tp = y_move[i_cal:] == 1
         if m_dir is not None and ev_tp.sum() >= 30:
-            _pd_tp = m_dir.predict_proba(Xtp)[:, 1]
+            _pd_tp = m_dir.predict_proba(X_dir[i_cal:])[:, 1]
             dir_tp_acc = float((((_pd_tp > 0.5) == (y[i_cal:] > 0)) & ev_tp).sum()
                                / ev_tp.sum())
         else:
@@ -989,11 +1066,21 @@ def main():
             # not a single global --edge-min, because the sweep tuned them
             # together with p_move_thr.
             "edge_min": round(edge_min_i, 3),
+            # head B runs on a LEAN matrix: [dir_prior | flags | own TA].
+            # predict/backtest MUST rebuild it in this exact order.
+            "dir_features": {"prior": True, "flags": _flag_cols,
+                             "tech": _tcols},
+            "dir_prior_lift": prior_lift,
             # SIZE head — Layer 2 sizes TP/SL from a PER-POST number now
             "size_corr": round(size_corr, 3) if size_corr == size_corr else None,
             "size_ratio": round(size_ratio, 3),
             "size_mdape": round(size_mdape, 3) if size_mdape == size_mdape else None,
             "size_k": round(size_k, 3),   # backtest/predict MUST apply this
+            # False => the size head has no measurable skill for this
+            # instrument; consumers should use median_abs_move instead of a
+            # per-post prediction.
+            "size_reliable": size_reliable,
+            "size_cal_corr": round(_corr_cal, 3) if _corr_cal == _corr_cal else None,
             # The size head was fitted on log1p(|move|). Every consumer MUST
             # expm1() the raw prediction before using it, or TP distances come
             # out ~log-scaled and every trade is mis-sized.
@@ -1052,13 +1139,36 @@ def main():
 
         _w_all = w if w is not None else np.ones(_n_full)
         m = _refit(m, X_i, y, _w_all, _bi_main)
-        m_size = _refit(m_size, X_i, np.abs(y), _w_all, _bi_size)
+        # _sz_fwd, NOT raw |y| — the holdout fit above trained on log1p and the
+        # consumers expm1() because size_log=True. Refitting on the raw target
+        # shipped a model whose output was then exponentiated: VIX predicted
+        # 9541% moves (scale 5537x) while SPY looked fine, because expm1(x)≈x
+        # for the small moves and explodes for the large ones.
+        m_size = _refit(m_size, X_i, _sz_fwd(np.abs(y)), _w_all, _bi_size)
         m_mv = _refit(m_mv, X_i, y_move, _w_all, _bi_mv)
         if m_dir is not None:
             _ev_all = np.where(y_move == 1)[0]
             if len(_ev_all) >= DIR_MIN_N:
-                m_dir = _refit(m_dir, X_i[_ev_all], y_up[_ev_all],
+                m_dir = _refit(m_dir, X_dir[_ev_all], y_up[_ev_all],
                                _w_all[_ev_all], _bi_dir)
+
+        # ---- REFIT SANITY: the shipped model must agree with the one we
+        # measured. A refit that silently changes target space (raw vs log)
+        # produces predictions orders of magnitude off, and every metric
+        # printed above still looks fine because those came from the holdout
+        # fit. This compares the two on the SAME rows before saving.
+        try:
+            _chk_old = float(np.mean(_sz_inv(np.clip(_sz_te / max(size_k, 1e-9),
+                                                     None, None))))
+            _chk_new = float(np.mean(_sz_inv(m_size.predict(Xte))))
+            _ratio = _chk_new / max(_chk_old, 1e-9)
+            if not (0.2 < _ratio < 5.0):
+                print(f"     ❌ {inst}: REFIT SCALE MISMATCH — shipped size head "
+                      f"means {_chk_new:.3f} vs holdout {_chk_old:.3f} "
+                      f"({_ratio:.1f}x). Target space differs between the two "
+                      f"fits; predictions will be wrong downstream.")
+        except Exception:
+            pass
 
         m_mv.save_model(f"{OUT_DIR}/{col}__move.json")
         if m_dir is not None:
@@ -1070,6 +1180,27 @@ def main():
         _ev_te = y_move[i_es:] == 1
         dir_ev = float(((p_dir_te > 0.5) == (y[i_es:] > 0))[_ev_te].mean()) \
             if _ev_te.sum() else float('nan')
+
+        # PER-DAY ACCURACY — the honest unit, and a guard against a trap that
+        # nearly shipped. Posts cluster: 2.2-2.7 event rows share a calendar
+        # day, and a daily feature makes ONE call per day, so correlated rows
+        # inflate a per-ROW count. Measured on the TA-only direction head:
+        #     per-row 64.2%   ->   per-DAY 57.3%
+        # Seven points were clustering, not skill. Any per-row figure far
+        # above its per-day twin is measuring repetition.
+        dir_ev_day = float('nan')
+        n_days_te = 0
+        try:
+            _d_te = pd.to_datetime(df['date'].values[i_es:], utc=True, format='mixed')
+            _ok = ((p_dir_te > 0.5) == (y[i_es:] > 0))
+            _m = _ev_te
+            if _m.sum() >= 20:
+                _g = pd.DataFrame({'d': _d_te[_m].strftime('%Y-%m-%d'),
+                                   'ok': _ok[_m]}).groupby('d')['ok'].mean()
+                dir_ev_day = float((_g > 0.5).mean())
+                n_days_te = int(len(_g))
+        except Exception:
+            pass
         # F1/precision/recall are scored on the TP slice ONLY (i_cal:), which
         # is untouched by both training AND the threshold sweep above. Scoring
         # them on Xte would include the calibration rows the threshold was
@@ -1180,7 +1311,8 @@ def main():
         _cf = "✅" if (dir_ev == dir_ev and dir_ev >= 0.55) else (
               "🟡" if (dir_ev == dir_ev and dir_ev >= 0.52) else "🔴")
         print(f"     {_cf} CLF  move-AUC={auc_mv:.3f}  F1={_f1:.2f}  "
-              f"dir-on-events={dir_ev:.1%} (n={int(_ev_te.sum())})  "
+              f"dir-on-events={dir_ev:.1%} (n={int(_ev_te.sum())}"
+              + (f", per-DAY {dir_ev_day:.1%} on {n_days_te}d" if dir_ev_day == dir_ev_day else "") + ")  "
               f"gate p>={p_move_thr:.2f}"
               + ("" if target_met else "(best-effort)")
               + f"  events tr/te={move_gate[inst]['event_rate_train']:.0%}/"
