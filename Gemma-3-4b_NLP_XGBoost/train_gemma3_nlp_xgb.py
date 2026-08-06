@@ -61,7 +61,30 @@ with open(_INSTRUMENTS_FILE, encoding="utf-8") as _f:
 # Pipeline order matters: run signal_scorer --full BEFORE training after a
 # config change, or the new flag columns won't exist in posts_scored yet
 # (they'd be 0-filled with a warning).
-_FLAG_FEATURES = list(ss.CONFIG["policy_flags"].keys())      # e.g. flag_peace_deescalation
+# e.g. flag_peace_deescalation. Keys starting with '_' are annotations/notes in
+# the config (e.g. _event_flags_note), NOT flags — feeding them in as numeric
+# features ships a constant column that only dilutes the split search.
+_FLAG_FEATURES = [k for k in ss.CONFIG["policy_flags"].keys() if not k.startswith("_")]
+
+
+def safe_corr(x, y, min_n: int = 2):
+    """Pearson r that can never emit a RuntimeWarning.
+
+    np.corrcoef divides by the std of EACH input, so a constant vector on
+    either side -> "invalid value encountered in divide" + nan. NATGAS/US10Y
+    calibration slices are largely fabricated 0.0 labels (missing 2021-22 bars
+    that fillna turned into fake flat moves), so this fires on every run.
+    Returns nan when r is undefined, without touching numpy's global state.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < max(2, min_n) or x.std() <= 1e-12 or y.std() <= 1e-12:
+        return float('nan')
+    with np.errstate(invalid='ignore', divide='ignore'):
+        r = np.corrcoef(x, y)[0, 1]
+    return float(r) if np.isfinite(r) else float('nan')
 _NER_FEATURES  = list(ss.canonical._NER_KEYS)                # num_gpe, num_org, ...
 
 NLP_FEATURES = [
@@ -866,13 +889,23 @@ def main():
         # population). NATGAS is 45% ZEROS — missing data written as 0.0 by
         # fillna — so 45% of its training target is fabricated and the head
         # cannot learn magnitude from it.
-        _corr_cal = float('nan')
-        if len(_m_ac) >= 20 and _m_pc.std() > 1e-12:
-            _corr_cal = float(np.corrcoef(_m_pc, _m_ac)[0, 1])
+        # BOTH sides need variance: np.corrcoef divides by each std, so a
+        # constant ACTUAL vector (NATGAS/US10Y calibration slices are mostly
+        # fabricated 0.0 labels) yields nan + "invalid value encountered in
+        # divide". nan is then indistinguishable from "measured, no skill".
+        _corr_cal = safe_corr(_m_pc, _m_ac, min_n=20)
+        _corr_undefined = not (_corr_cal == _corr_cal)   # nan => undefined
         size_reliable = bool(_corr_cal == _corr_cal and _corr_cal >= SIZE_MIN_CORR)
         if len(_m_ac) >= 20 and _m_pc.mean() > 1e-9:
             _raw_scale = float(_m_pc.mean() / _m_ac.mean())
-            if not size_reliable:
+            if _corr_undefined:
+                print(f"     ⚠️  {inst}: size skill UNDEFINED — the calibration "
+                      f"slice has no variance (n={len(_m_ac)}, pred std="
+                      f"{_m_pc.std():.2e}, actual std={_m_ac.std():.2e}). This is a "
+                      f"LABEL defect, not a model verdict: mostly-constant actuals "
+                      f"mean the 1h moves were written as fabricated 0.0. Sizing "
+                      f"from median_abs_move; fix the bar coverage for {inst}.")
+            elif not size_reliable:
                 print(f"     ⚠️  {inst}: size head has no skill "
                       f"(cal corr {_corr_cal:+.3f} < {SIZE_MIN_CORR}) — NOT "
                       f"applying a scale correction (would amplify noise); "
@@ -884,8 +917,7 @@ def main():
         _sz_te = _sz_te * size_k
         _sz_cal = _sz_cal * size_k
         _a_te = np.abs(y[i_es:])
-        size_corr = float(np.corrcoef(_sz_te, _a_te)[0, 1]) \
-            if _sz_te.std() > 1e-12 else float('nan')
+        size_corr = safe_corr(_sz_te, _a_te)
         # scale check: predictions should average the same as reality, not
         # 1/300th of it. Ratio far from 1.0 means the head is mis-scaled.
         size_ratio = float(_sz_te.mean() / max(_a_te.mean(), 1e-9))
@@ -948,8 +980,7 @@ def main():
             _ev_wf = (y_move == 1) & _m
             _a = np.abs(y)
             _rm = _m & (_a >= 0.1)
-            wf_size_corr = (float(np.corrcoef(wf["size"][_rm], _a[_rm])[0, 1])
-                            if _rm.sum() >= 50 else float('nan'))
+            wf_size_corr = safe_corr(wf["size"][_rm], _a[_rm], min_n=50)
             _du = ~np.isnan(wf["p_up"])
             _dev = _ev_wf & _du
             wf_dir = (float(((wf["p_up"][_dev] > 0.5) == (y[_dev] > 0)).mean())
@@ -1091,8 +1122,19 @@ def main():
             # conditional magnitude: median |move| GIVEN an event, from the
             # calibration slice. This is what Layer-2 should size TP from —
             # an empirical number, not the regressor's collapsed output.
-            "median_abs_move": round(float(np.median(np.abs(y[i_es:i_cal][ev_cal])))
-                                     if ev_cal.sum() else 0.0, 4),
+            # BUG FIXED 2026-08-06: this was median |move| GIVEN AN EVENT
+            # (ev_cal = top ~10% by rolling quantile, MOVE_Q=90). But Layer 2
+            # applies it as a FLAT prediction to every GATED trade, a far
+            # broader population — so it over-predicted by ~2.5x on exactly the
+            # instruments that depend on it (size_reliable=False). NATGAS
+            # shipped 1.7522 against a traded mean |actual| of 0.720:
+            # scale 2.54, MdAPE 296%, and it dragged the whole size table down.
+            # Calibrate on _m_ac (calibration rows with a meaningful move,
+            # |move| >= 0.1) — the population the fallback is actually used on.
+            "median_abs_move": round(
+                float(np.median(_m_ac)) if len(_m_ac)
+                else (float(np.median(np.abs(y[i_es:i_cal][ev_cal])))
+                      if ev_cal.sum() else 0.0), 4),
         }
         # ====================================================================
         # FINAL REFIT ON **ALL** ROWS  (2026-08-02)

@@ -4,5 +4,5 @@
   "n_pairs": 79014,
   "window_min": 60,
   "emb_table": "gemma3_embeddings_v1",
-  "calibrated_at": "2026-08-05T07:06:14.461044+00:00"
+  "calibrated_at": "2026-08-06T12:49:31.742786+00:00"
 }

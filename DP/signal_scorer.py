@@ -243,9 +243,18 @@ def countries_mentioned(text):
     return {cc for cc, rx in _COUNTRY_RE.items() if rx.search(t)}
 
 
-def country_context_factor(text, speaker_country, feats=None):
+def country_context_factor(text, speaker_country, feats=None, is_primary=False):
     """(factor, label). COUNTRY_SELF_DAMP when the post only talks about the
-    speaker's OWN country and no policy flag fired; else 1.0."""
+    speaker's OWN country and no policy flag fired; else 1.0.
+
+    Rank-0 PRIMARY speakers are never damped. The damp exists to mute routine
+    embassy self-promotion (a CN mission posting about CN culture). A head of
+    state talking about their OWN economy — tariffs, the Fed, US energy — is
+    the single highest-value signal in the feed, i.e. the exact opposite case.
+    Damping it suppressed ~6.2k rank-0 posts and made them 3.9x less likely
+    to survive into training."""
+    if is_primary:
+        return 1.0, ""
     if not speaker_country or not _COUNTRY_RE:
         return 1.0, ""
     cc = str(speaker_country).strip().upper()
@@ -523,7 +532,8 @@ def _apply_entity_event_weight(df: pd.DataFrame) -> pd.DataFrame:
 def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
                       entity_weight: float = 1.0,
                       event_weight:  float = 1.0,
-                      is_primary:    bool  = True):
+                      is_primary:    bool  = True,
+                      account:       str   = None):
     """
     Score ONE post → dict of all numeric features.
     Used by prediction scripts (they share the exact training config).
@@ -577,6 +587,19 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
         + 0.2 * out.get("score_novelty", 1.0)
         + 0.1 * out.get("score_burst",   1.0),
         0, 1))
+    # COUNTRY CONTEXT — must run BEFORE the endorsement gate, exactly as in
+    # score_batch, otherwise a geo post is scored one way in training and a
+    # different way live. `account` resolves the speaker's country; without it
+    # the damp cannot apply and the post is left undamped (same as batch when
+    # the handle is unknown).
+    _cf, _ = country_context_factor(
+        tc, country_of(account),
+        {f: out.get(f, 0.0) for f in COUNTRY_POLICY_GUARD} or None,
+        is_primary=is_primary)
+    out["is_self_country"] = int(_cf < 1.0)
+    if _cf < 1.0:
+        out["raw_score"] = out["raw_score"] * _cf
+
     # ENDORSEMENT HARD-SKIP — same rule as the batch path, so a live single
     # post and a bulk rescore agree.
     out["is_endorsement"] = int(is_endorsement(text))
@@ -745,12 +768,27 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
     # endorsement gate so both land on raw_score.
     if _COUNTRY_RE and "account" in batch:
         _accs = list(batch["account"])
+        # The guard flags are written by Layer 1 above. If a future refactor
+        # reorders the layers they silently vanish, `feats` goes empty, and
+        # every real policy post gets damped as "self-referential". Fail loud.
+        _missing = [f for f in COUNTRY_POLICY_GUARD if f not in batch]
+        if COUNTRY_POLICY_GUARD and _missing:
+            raise RuntimeError(
+                f"country_policy_guard flags missing from batch: {_missing}. "
+                "Layer 1 (policy flags) must run before the country damp, "
+                "otherwise genuine policy posts are damped as self-referential.")
+        # positional lookup: batch.index may not be a clean RangeIndex
+        _gv = {f: pd.to_numeric(batch[f], errors="coerce").fillna(0.0).values
+               for f in COUNTRY_POLICY_GUARD}
+        _prim = (batch["is_primary"].astype(bool).values
+                 if "is_primary" in batch else np.zeros(len(texts), dtype=bool))
         _cf, _n_self, _by = [], 0, {}
         for _i, _t in enumerate(texts):
             _cc = country_of(_accs[_i] if _i < len(_accs) else None)
-            _feats = {f: batch[f][_i] for f in COUNTRY_POLICY_GUARD
-                      if f in batch} if COUNTRY_POLICY_GUARD else None
-            _f, _ = country_context_factor(_t, _cc, _feats)
+            _feats = ({f: _gv[f][_i] for f in COUNTRY_POLICY_GUARD}
+                      if COUNTRY_POLICY_GUARD else None)
+            _f, _ = country_context_factor(_t, _cc, _feats,
+                                          is_primary=bool(_prim[_i]))
             _cf.append(_f)
             if _f < 1.0:
                 _n_self += 1

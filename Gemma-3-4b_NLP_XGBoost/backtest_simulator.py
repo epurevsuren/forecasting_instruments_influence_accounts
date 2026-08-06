@@ -413,11 +413,48 @@ def load_embeddings(df):
     return np.vstack([cache[pid] for pid in platform_ids])
 
 
+def _assert_consumer_matches_models(cfg):
+    """Fail fast on trainer/consumer version skew.
+
+    The size head may be fitted on log1p(|move|) (config: size_log) and MUST be
+    reverted with expm1 before size_k is applied. A stale consumer that lacks
+    the expm1 revert reads log-space numbers as percent moves, silently
+    compressing every large prediction — TP/SL distances are derived from
+    |pred|, so the whole risk calculation is then wrong (this is how a run
+    ended up with a 54% worst-case margin level against a 70% guard floor).
+    Likewise a trainer with the SIZE_MIN_CORR guard emits size_reliable; if it
+    is absent, no-skill heads silently keep their size_k amplification.
+    """
+    gate = cfg.get("move_gate", {}) or {}
+    per  = [(k, v) for k, v in gate.items() if isinstance(v, dict)]
+    if not per:
+        return
+    log_insts = [k for k, v in per if v.get("size_log")]
+    if log_insts and not _CONSUMER_REVERTS_SIZE_LOG:
+        sys.exit(
+            "❌ MODEL/CONSUMER MISMATCH: config.json marks size_log=true for "
+            f"{len(log_insts)} instrument(s) ({', '.join(log_insts[:4])}...), but this "
+            "backtest_simulator.py has no expm1 revert. Predictions would be read "
+            "in log space and every TP/SL distance would be wrong.\n"
+            "   Fix: use the backtest_simulator.py that matches your trainer.")
+    missing = [k for k, v in per if "size_reliable" not in v]
+    if missing:
+        print(f"  ⚠️  {len(missing)} instrument(s) have no 'size_reliable' in config "
+              f"({', '.join(missing[:4])}...) — trained by a pre-SIZE_MIN_CORR trainer. "
+              "No-skill size heads keep their size_k amplification; NATGAS/US10Y/US2Y "
+              "are the usual casualties. Retrain to restore the guard.")
+
+
+# this module reverts log1p size predictions with expm1 in _size_pred()
+_CONSUMER_REVERTS_SIZE_LOG = True
+
+
 def load_models(model_dir, instruments):
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
         sys.exit(f"❌ {cfg_path} not found — train models first (train_gemma_nlp_xgb.py).")
     cfg = json.load(open(cfg_path))
+    _assert_consumer_matches_models(cfg)
     # attach the training-time embedding PCA (see PR.project_emb) if present
     if cfg.get("emb_pca"):
         _z = np.load(os.path.join(model_dir, "emb_pca.npz"))
@@ -851,7 +888,8 @@ def print_size_summary(csv_rows, instruments, dir_threshold):
         if len(p) < 8:
             continue
         p, a = _np.array(p), _np.array(a)
-        corr = float(_np.corrcoef(p, a)[0, 1]) if p.std() > 1e-12 else float('nan')
+        corr = (float(_np.corrcoef(p, a)[0, 1])
+                if (p.std() > 1e-12 and a.std() > 1e-12) else float('nan'))
         rows.append((inst, len(p), corr, p.mean() / max(a.mean(), 1e-9),
                      float(_np.median(_np.abs(p - a) / _np.maximum(a, 1e-9))),
                      p.mean(), a.mean()))
@@ -908,8 +946,13 @@ def print_magnitude_summary(csv_rows, instruments, dir_threshold):
             continue
         p, a = _np.array(p), _np.array(a)
         k = float((p * a).sum() / max((p * p).sum(), 1e-9))
-        corr = float(_np.corrcoef(p, a)[0, 1])
-        mdape = float(_np.median(_np.abs(p - a) / _np.abs(a)))
+        # both sides need variance, else corrcoef divides by zero -> nan
+        corr = (float(_np.corrcoef(p, a)[0, 1])
+                if (p.std() > 1e-12 and a.std() > 1e-12) else float('nan'))
+        _den = _np.abs(a)
+        _ok = _den > 1e-12          # zero actuals make MdAPE infinite
+        mdape = (float(_np.median(_np.abs(p[_ok] - a[_ok]) / _den[_ok]))
+                 if _ok.any() else float('nan'))
         agg_p.append(p); agg_a.append(a)
         flag = "✅" if 0.7 <= k <= 1.4 else ("🟡" if 0.5 <= k <= 2.0 else "🔴")
         print(f"  {flag} {inst:<8} {len(p):>5} {k:>10.2f} {corr:>6.2f} "
@@ -918,9 +961,15 @@ def print_magnitude_summary(csv_rows, instruments, dir_threshold):
         P, A = _np.concatenate(agg_p), _np.concatenate(agg_a)
         K = float((P * A).sum() / max((P * P).sum(), 1e-9))
         print("-" * 78)
+        _C = (float(_np.corrcoef(P, A)[0, 1])
+              if (P.std() > 1e-12 and A.std() > 1e-12) else float('nan'))
+        _D = _np.abs(A); _OK = _D > 1e-12
+        _M = (float(_np.median(_np.abs(P[_OK] - A[_OK]) / _D[_OK]))
+              if _OK.any() else float('nan'))
         print(f"  OVERALL   n={len(P)}  k={K:.2f} (want ~1.0)  "
-              f"corr={_np.corrcoef(P, A)[0, 1]:.3f}  "
-              f"MdAPE={_np.median(_np.abs(P - A) / _np.abs(A)):.0%}")
+              f"corr={_C:.3f}  MdAPE={_M:.0%}"
+              + ("" if _OK.all() else
+                 f"   [{(~_OK).sum()} zero-actual rows excluded from MdAPE]"))
     print("=" * 78)
 
 

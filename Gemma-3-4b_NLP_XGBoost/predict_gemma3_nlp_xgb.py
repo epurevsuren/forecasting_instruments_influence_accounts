@@ -932,6 +932,8 @@ def predict(text, cfg, models, nlp, sbert, post_ts=None,
         entity_weight=entity_weight,
         event_weight=event_weight,
         is_primary=is_primary,
+        account=account,          # lets the country damp resolve the speaker,
+                                  # so live scoring matches the training batch
     )
     emb = gemma_embed(text)
     _sent = gemma_sentiment_from_emb(emb, cfg)

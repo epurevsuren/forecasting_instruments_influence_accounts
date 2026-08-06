@@ -241,7 +241,23 @@
     "flag_sanctions",
     "flag_escalation",
     "flag_interest_rate",
-    "flag_peace_deescalation"
+    "flag_peace_deescalation",
+    "flag_war_geopolitics",
+    "flag_armed_conflict",
+    "flag_terror_attack",
+    "flag_tax_policy",
+    "flag_stimulus",
+    "flag_immigration_policy",
+    "flag_industrial_policy",
+    "flag_energy_policy",
+    "flag_supply_chain",
+    "flag_ai_chip_policy",
+    "flag_crypto_policy",
+    "flag_financial_system",
+    "flag_deregulation",
+    "flag_public_health",
+    "flag_pandemic_relief",
+    "flag_natural_disaster"
   ],
   "policy_flags": {
     "flag_peace_deescalation": [
@@ -443,13 +459,6 @@
       "no nuclear"
     ],
     "flag_war_geopolitics": [
-      "iran",
-      "ukraine",
-      "russia",
-      "china",
-      "taiwan",
-      "israel",
-      "gaza",
       "missile",
       "attack",
       "military",
@@ -471,11 +480,8 @@
       "kim jong un",
       "rocket man",
       "fire and fury",
-      "syria",
       "isis",
       "soleimani",
-      "afghanistan",
-      "kabul",
       "withdrawal of troops"
     ],
     "_event_flags_note": "EXOGENOUS SHOCKS (v2.1). Multi-word/specific keywords ONLY — unified_feed showed bare words are noisy: 'invasion' -> 'cultural invasion', 'tsunami' -> '@gravytsunami'/'National Preparedness Month', 'kidnap' -> local news, 'ied' -> 4577 false hits, 'relief/recovery' -> economic. Disaster+terror route to macro_risk_score (risk-off/safe-haven, non-trade-war); armed_conflict routes to hawkish_risk_score (war escalation). The COUNTERACTION is captured by flag_stimulus (emergency relief/repatriation/reconstruction = the reversal, e.g. yen back up) and flag_peace_deescalation (ceasefire = conflict reversal).",
