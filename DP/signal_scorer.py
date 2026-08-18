@@ -285,6 +285,70 @@ def endorsement_damp(texts):
     """Vectorised multiplier: ENDORSEMENT_DAMP for endorsements, else 1.0."""
     return np.array([ENDORSEMENT_DAMP if is_endorsement(t) else 1.0
                      for t in texts], dtype=float)
+
+
+# ---------------------------------------------------------------- norm divisors
+# score_policy = policy_intensity_score / divisor, and it carries the LARGEST
+# weight in raw_score (0.4). The divisors used to be frozen constants (8/5/4)
+# while policy_intensity_score is a COUNT of matched flag terms — so its scale
+# moves every time the flag set changes. Measured 2026-08-19 with divisor 8.0:
+# median pis = 1.0, p99 = 6.0, and only 0.16% of posts ever saturated. The most
+# informative NLP component was compressed into the bottom eighth of its range,
+# and every scorer_config edit silently shifted the scale under training,
+# prediction AND backtest at once.
+#
+# Calibrating to a corpus percentile makes the score invariant to flag-set
+# changes: add or remove terms and the normalised signal keeps the same shape.
+# Same self-calibrating pattern as DP/chain_thresholds.json.
+NORM_DIV_PCT  = float(os.environ.get("NORM_DIV_PCT", "99"))
+NORM_DIV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "norm_divisors.json")
+NORM_BASES = ["policy_intensity_score", "hawkish_risk_score",
+              "growth_policy_score", "macro_risk_score"]
+_NORM_DEFAULTS = {"policy_intensity_score": 8.0, "hawkish_risk_score": 5.0,
+                  "growth_policy_score": 4.0}
+
+
+def load_norm_divisors():
+    """Calibrated divisors if they exist, else the config/static defaults."""
+    base = dict(CONFIG.get("norm_divisors", _NORM_DEFAULTS))
+    try:
+        with open(NORM_DIV_PATH, encoding="utf-8") as f:
+            base.update({k: float(v) for k, v in json.load(f).items()
+                         if isinstance(v, (int, float)) and float(v) > 0})
+    except Exception:
+        pass
+    return base
+
+
+def calibrate_norm_divisors(batch, path=NORM_DIV_PATH):
+    """Recompute divisors as the NORM_DIV_PCT percentile of each composite over
+    the corpus and persist them. Full-rescore only — on an incremental batch the
+    percentile would be estimated from a non-representative slice."""
+    out = {}
+    for c in NORM_BASES:
+        if c not in batch:
+            continue
+        v = pd.to_numeric(pd.Series(batch[c]), errors="coerce").dropna()
+        if len(v) < 500:
+            continue
+        d = float(np.percentile(v, NORM_DIV_PCT))
+        if d >= 1.0:                      # a divisor below 1 would amplify noise
+            out[c] = round(d, 4)
+    if not out:
+        return load_norm_divisors()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1)
+        _old = load_norm_divisors()
+        print(f"  📐 norm divisors calibrated to p{NORM_DIV_PCT:g} of the corpus: "
+              + ", ".join(f"{k.replace('_score', '')} {_old.get(k, 0):g}->{v:g}"
+                          for k, v in out.items()))
+    except Exception as e:
+        print(f"  ⚠️  could not persist norm divisors: {str(e)[:60]}")
+    merged = load_norm_divisors()
+    merged.update(out)
+    return merged
 FALLBACK_FIN_KW    = CONFIG["fallback_financial_keywords"]
 FALLBACK_NOISE_KW  = CONFIG["fallback_noise_keywords"]
 
@@ -543,10 +607,7 @@ def score_single_post(text, nlp=None, sbert=None, feature_cols=None,
     geo-context so sample_weight is accurate even for prediction-path geo posts.
     Defaults (1.0, 1.0, True) match rank-0 primary account (US President / TruthSocial).
     """
-    norm_div = CONFIG.get("norm_divisors",
-                          {"policy_intensity_score": 8.0,
-                           "hawkish_risk_score": 5.0,
-                           "growth_policy_score": 4.0})
+    norm_div = load_norm_divisors()
 
     tc  = re.sub(r"https?://\S+", "", str(text)).strip()
     row = {
@@ -683,10 +744,7 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
     for novelty / burst / relative. If None, context = batch itself (full mode).
     Returns batch with all score columns added in-place.
     """
-    norm_div = CONFIG.get("norm_divisors",
-                          {"policy_intensity_score": 8.0,
-                           "hawkish_risk_score": 5.0,
-                           "growth_policy_score": 4.0})
+    norm_div = load_norm_divisors()
 
     texts = batch["text_clean"].fillna("").tolist()
 
@@ -753,6 +811,13 @@ def _score_batch(batch: pd.DataFrame, nlp, sbert,
     # — caps score —
     caps_max = batch["num_all_caps_words"].max()
     batch["score_caps"] = batch["num_all_caps_words"] / caps_max if caps_max > 0 else 0.0
+
+    # FULL-REBUILD ONLY: ctx_texts is None means this batch IS the whole corpus,
+    # so the composites now exist and the percentile is representative. On an
+    # incremental batch we keep the persisted divisors — recalibrating from a
+    # daily slice would move the scale every single day.
+    if ctx_texts is None:
+        norm_div = calibrate_norm_divisors(batch)
 
     # — raw_score —
     pi_div = max(norm_div.get("policy_intensity_score", 8.0), 1)

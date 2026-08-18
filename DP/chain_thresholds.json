@@ -1,8 +1,8 @@
 {
   "repeat_hi": 0.3884,
   "novel_lo": 0.1977,
-  "n_pairs": 79014,
+  "n_pairs": 79018,
   "window_min": 60,
   "emb_table": "gemma3_embeddings_v1",
-  "calibrated_at": "2026-08-06T12:49:31.742786+00:00"
+  "calibrated_at": "2026-08-18T15:03:35.601378+00:00"
 }
