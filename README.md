@@ -19,6 +19,7 @@ posts ──► NLP scoring ──► labelling ──► Gemma-3 embed + XGBoos
 ## Table of contents
 
 - [Architecture](#architecture)
+- [Results](#results)
 - [Quick start](#quick-start)
 - [Repository layout](#repository-layout)
 - [DP/ — data pipeline](#dp--data-pipeline)
@@ -56,6 +57,83 @@ now decomposes the problem:
 Trade gate = `P(move) × P(direction)`, and the TP/SL distance is sized from the
 size head. Consumers **must** apply `expm1()` to the size prediction before use —
 see [Known issues](#known-issues).
+
+---
+
+## Results
+
+Backtest window 2016-11 to 2026-08, 23 instruments, walk-forward validated with
+strict point-in-time loading. Direction and magnitude are scored separately
+because they are predicted by separate heads.
+
+### Direction
+
+| population | n | accuracy |
+|---|---|---|
+| TRADE — gate fires | 15,691 | **60.3%** |
+| TRADE and `\|actual\| >= 0.1%` | 10,449 | **66.4%** |
+| SKIP — gate declines | 32,563 | 49.1% |
+
+SKIP sitting at chance is the load-bearing result: the gate **separates**
+tradeable from untradeable rather than riding market state. Macro accuracy
+(mean over instruments) 64.0%; mean move-head AUC 0.665; 21 of 23 instruments
+clear the tradeable threshold.
+
+Strongest instruments on the filtered population: USD_CNY 85.5%, USD_JPY 77.0%,
+USD_CHF 75.9%, EUR_USD 74.7%, USD_CAD 74.2%, GBP_USD 71.4%, GOLD 71.4%.
+
+### Magnitude — size head
+
+`mean corr +0.760`, `mean scale 0.70x`, 20 of 23 instruments at MdAPE 32–49%.
+
+| instrument | n | corr | scale | MdAPE |
+|---|---|---|---|---|
+| XLE | 1155 | 0.863 | 0.76 | 39% |
+| AUD_USD | 564 | 0.860 | 0.68 | 32% |
+| OIL | 1296 | 0.850 | 0.83 | 42% |
+| DIA | 893 | 0.849 | 0.71 | 37% |
+| USD_MXN | 701 | 0.836 | 0.71 | 33% |
+| SPY | 916 | 0.814 | 0.64 | 35% |
+| XLF | 1034 | 0.813 | 0.69 | 35% |
+| VIX | 1460 | 0.789 | 0.75 | 41% |
+| GOLD | 936 | 0.698 | 0.65 | 34% |
+
+For reference, the signed regressor this replaced scored **corr 0.031 at scale
+0.003x, MdAPE 100%** — the decomposition, not tuning, is what moved the number.
+
+### Feature contribution — move head
+
+| group | gain share |
+|---|---|
+| cross-instrument TA | 41.5% |
+| Gemma embeddings | 33.5% |
+| NLP composite scores | 14.9% |
+| own TA | 7.7% |
+| policy flags | 2.4% |
+
+`atr_pct` is the single strongest feature. Volatility clustering, not post
+content, drives most of *whether* a move happens; the post content contributes
+mainly to direction and size.
+
+### Measured and rejected
+
+Kept here so they are not retried:
+
+| idea | result |
+|---|---|
+| Warm-start walk-forward | loses 8/8 folds vs cold refit |
+| kNN semantic memory | +0.001 (median precedent 291 days old) |
+| Stream-state memory | −0.004 (only 3% of posts are bursts) |
+| Gemma as direction predictor | 50.5% encoder / 50.9% analyst |
+| VIX-up volatility bet | AUC 0.50–0.52 |
+| Tail tightening `MOVE_Q` 70→90 | +0.2% |
+| Conditioning on `sample_weight` | −1.0% |
+| Stacking per AVM paper | 5.24% → 5.17%, marginal |
+
+Confirmed wins: intraday TA over daily (corr 0.006 → 0.283), OLS-slope momentum
+over 2-point difference (better at every noise level), `log1p` target (MdAPE
+57.4% → 53.3%), cross-instrument features (+0.034 on 8/10), walk-forward over a
+fixed split (0.231 vs 0.203).
 
 ---
 
